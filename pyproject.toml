@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chatgpt-web-images"
+version = "0.2.0"
+description = "Local Windows MCP for ChatGPT web image generation, without image base64 in tool responses"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "TianLin0509"}]
+dependencies = ["mcp==1.27.0", "Pillow==12.2.0", "pydantic==2.12.5", "pydantic-settings==2.13.1"]
+classifiers = ["Operating System :: Microsoft :: Windows", "Programming Language :: Python :: 3"]
+
+[project.scripts]
+chatgpt-web-images = "web_images:main"
+
+[project.urls]
+Repository = "https://github.com/TianLin0509/chatgpt-web-images"
+Issues = "https://github.com/TianLin0509/chatgpt-web-images/issues"
+
+[tool.setuptools]
+py-modules = ["web_images", "web_images_setup"]
+package-dir = {"" = "scripts"}

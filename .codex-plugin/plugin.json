@@ -1,0 +1,17 @@
+{
+  "name": "chatgpt-web-images",
+  "version": "0.2.0",
+  "description": "ChatGPT web image generation with local original files and compact text-only MCP responses.",
+  "author": {"name": "TianLin0509"},
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ChatGPT 网页生图",
+    "shortDescription": "一次制作多张图片，原图保存到本机。",
+    "longDescription": "独立浏览器登录，多图下载、内部等待和请求去重。只回传文字状态与文件信息。",
+    "developerName": "TianLin0509",
+    "category": "Productivity",
+    "capabilities": ["Write"],
+    "defaultPrompt": ["使用我的 ChatGPT 网页账号制作图片，按需求选择张数并保存原图。"]
+  }
+}
