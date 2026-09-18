@@ -1,0 +1,23 @@
+{
+  "name": "chatgpt-web-images",
+  "version": "0.3.0+codex.20260917011912",
+  "description": "Agent-neutral ChatGPT image MCP with durable queue and isolated account workers.",
+  "author": {
+    "name": "TianLin0509"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ChatGPT \u7f51\u9875\u751f\u56fe",
+    "shortDescription": "\u591a agent \u5171\u7528\u961f\u5217\uff0c\u53cc\u8d26\u53f7\u72ec\u7acb\u6267\u884c\uff0c\u540e\u53f0\u4fdd\u5b58\u539f\u56fe\u3002",
+    "longDescription": "\u6807\u51c6 stdio MCP\uff1b\u63d0\u4ea4\u7acb\u5373\u5165\u961f\uff0c\u540e\u53f0\u751f\u6210\u3001\u4e0b\u8f7d\u548c\u6536\u5c3e\u3002\u72ec\u7acb\u8d26\u53f7 Profile\u3001\u6301\u4e45\u53bb\u91cd\u3001\u9519\u8bef\u9694\u79bb\u548c\u539f\u4efb\u52a1\u6062\u590d\u3002",
+    "developerName": "TianLin0509",
+    "category": "Productivity",
+    "capabilities": [
+      "Write"
+    ],
+    "defaultPrompt": [
+      "\u4f7f\u7528\u6211\u7684 ChatGPT \u7f51\u9875\u8d26\u53f7\u5236\u4f5c\u56fe\u7247\uff0c\u6309\u9700\u6c42\u9009\u62e9\u5f20\u6570\u5e76\u4fdd\u5b58\u539f\u56fe\u3002"
+    ]
+  }
+}

@@ -1,0 +1,326 @@
+"""Durable local queue shared by all stdio clients; no listening network port."""
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+
+import web_images as w
+
+TERMINAL = w.TERMINAL | {'cancelled'}
+LIVE = ('dispatching', 'running', 'needs_attention')
+
+
+def pool_root():
+    return Path(os.environ.get('CHATGPT_WEB_IMAGES_POOL') or
+                w.SETTINGS.get('pool_dir') or w.DATA.parent / 'ChatGPTWebImagesPool').resolve()
+
+
+def identifier(value):
+    if not re.fullmatch(r'[a-z][a-z0-9_-]{0,39}', value):
+        raise w.ImageError('invalid_account_id', 'Use a short lowercase account alias, such as primary or secondary.')
+    return value
+
+
+class Pool:
+    def __init__(self, root=None):
+        self.root = Path(root or pool_root()).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.db = self.root / 'queue.sqlite3'
+        with self.connect() as db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id TEXT PRIMARY KEY, data_dir TEXT UNIQUE NOT NULL, config_dir TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 0, ready INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL DEFAULT 'not_checked', error TEXT,
+                    heartbeat REAL NOT NULL DEFAULT 0, pid INTEGER, updated REAL NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id TEXT PRIMARY KEY, request_id TEXT UNIQUE NOT NULL, request_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL, preferred TEXT NOT NULL DEFAULT 'auto', account_id TEXT,
+                    status TEXT NOT NULL, runtime_id TEXT, result TEXT, error TEXT,
+                    failures INTEGER NOT NULL DEFAULT 0, cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    created REAL NOT NULL, updated REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS jobs_schedule ON jobs(status, created);
+                CREATE UNIQUE INDEX IF NOT EXISTS account_active ON jobs(account_id)
+                    WHERE status IN ('dispatching','running','needs_attention');
+                CREATE TABLE IF NOT EXISTS controls (
+                    id TEXT PRIMARY KEY, account_id TEXT NOT NULL, action TEXT NOT NULL,
+                    args TEXT NOT NULL, status TEXT NOT NULL, result TEXT, created REAL NOT NULL,
+                    updated REAL NOT NULL);
+            ''')
+
+    def connect(self):
+        db = sqlite3.connect(self.db, timeout=10, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        db.execute('PRAGMA busy_timeout=10000')
+        return contextlib.closing(db)
+
+    @contextlib.contextmanager
+    def transaction(self):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                yield db
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+
+    def account(self, account_id):
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM accounts WHERE id=?', (identifier(account_id),)).fetchone()
+        if row is None:
+            raise w.ImageError('account_not_found', 'Register the account with account-add before using it.')
+        return dict(row)
+
+    def add_account(self, account_id, data_dir, config_dir, enabled=False):
+        identifier(account_id)
+        data, config = Path(data_dir), Path(config_dir)
+        if not data.is_absolute() or not config.is_absolute():
+            raise w.ImageError('invalid_directory', 'Account directories must be absolute.')
+        settings = json.loads((config / 'settings.json').read_text(encoding='utf-8-sig'))
+        if Path(settings.get('data_dir', '')).resolve() != data.resolve():
+            raise w.ImageError('account_config_mismatch', 'Account config must point at its own data directory.')
+        with self.transaction() as db:
+            old = db.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
+            if old:
+                if old['data_dir'] != str(data.resolve()) or old['config_dir'] != str(config.resolve()):
+                    raise w.ImageError('account_exists', 'Do not change directories of an existing account.')
+            else:
+                for peer in db.execute('SELECT data_dir FROM accounts'):
+                    if os.path.normcase(str(data.resolve())) == os.path.normcase(peer['data_dir']):
+                        raise w.ImageError('duplicate_profile', 'Two accounts must not share a browser data directory.')
+                try:
+                    db.execute('INSERT INTO accounts(id,data_dir,config_dir,enabled) VALUES(?,?,?,?)',
+                               (account_id, str(data.resolve()), str(config.resolve()), int(enabled)))
+                except sqlite3.IntegrityError as exc:
+                    raise w.ImageError('duplicate_profile', 'Two accounts must not share a browser data directory.') from exc
+        return self.account(account_id)
+
+    def enable(self, account_id, enabled):
+        self.account(account_id)
+        with self.connect() as db:
+            db.execute('UPDATE accounts SET enabled=?,updated=? WHERE id=?', (int(enabled), time.time(), account_id))
+        return {'ok': True, 'account_id': account_id, 'enabled': bool(enabled)}
+
+    def submit(self, account_id='auto', **kwargs):
+        with self.connect() as db:
+            if not db.execute('SELECT 1 FROM accounts LIMIT 1').fetchone():
+                raise w.ImageError('no_accounts', 'Register and log in to at least one isolated account before submitting.')
+        if account_id != 'auto':
+            self.account(account_id)
+        payload, digest = w.validate_request(**kwargs)
+        digest = hashlib.sha256((digest + '\n' + account_id).encode()).hexdigest()
+        request_id = payload['request_id'] or 'auto-' + uuid.uuid4().hex
+        with self.transaction() as db:
+            old = db.execute('SELECT * FROM jobs WHERE request_id=?', (request_id,)).fetchone()
+            if old:
+                if old['request_hash'] != digest:
+                    raise w.ImageError('request_id_conflict', 'This request_id belongs to different input; do not resend an uncertain job.')
+                job_id, reused = old['id'], True
+            else:
+                job_id = time.strftime('%Y%m%d') + '-' + uuid.uuid4().hex[:12]
+                payload['request_id'] = 'pool-' + job_id
+                now = time.time()
+                db.execute('INSERT INTO jobs(id,request_id,request_hash,payload,preferred,status,created,updated) VALUES(?,?,?,?,?,?,?,?)',
+                           (job_id, request_id, digest, json.dumps(payload, ensure_ascii=False), account_id, 'queued', now, now))
+                reused = False
+        result = self.get(job_id)
+        result['reused_request'] = reused
+        return result
+
+    def import_legacy(self, account_id):
+        account = self.account(account_id)
+        data = Path(account['data_dir'])
+        pointer = data / 'active.json'
+        if not pointer.exists():
+            return {'ok': True, 'imported': False}
+        legacy_id = json.loads(pointer.read_text(encoding='utf-8'))['job_id']
+        if not re.fullmatch(r'\d{8}-[a-f0-9]{12}', legacy_id):
+            raise w.ImageError('invalid_job_id', 'Invalid legacy active job identifier.')
+        legacy = json.loads((data / 'jobs' / (legacy_id + '.json')).read_text(encoding='utf-8'))
+        if legacy['status'] in TERMINAL:
+            raise w.ImageError('stale_legacy_pointer', 'The legacy pointer references a finished job; inspect it before migration.')
+        # Import only observation ownership. The original prompt is never reconstructed/resubmitted.
+        payload = {'count': legacy.get('requested_count', 1)}
+        now = time.time()
+        with self.transaction() as db:
+            old = db.execute('SELECT * FROM jobs WHERE id=?', (legacy_id,)).fetchone()
+            if old and (old['account_id'] != account_id or old['runtime_id'] != legacy_id):
+                raise w.ImageError('legacy_conflict', 'This job ID already belongs to another queued request.')
+            if not old:
+                db.execute('INSERT INTO jobs(id,request_id,request_hash,payload,preferred,account_id,status,runtime_id,result,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                           (legacy_id, 'legacy-' + account_id + '-' + legacy_id, 'legacy-observe-only', json.dumps(payload),
+                            account_id, account_id, 'running', legacy_id, json.dumps(legacy), legacy.get('created_at', now), now))
+        return {**self.get(legacy_id), 'imported': True}
+
+    def row(self, job_id):
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if row is None:
+            raise w.ImageError('job_not_found', 'Unknown pool job_id. Legacy jobs use the original account CLI.')
+        return dict(row)
+
+    def get(self, job_id, detail=False):
+        row = self.row(job_id)
+        payload = json.loads(row['payload'])
+        result = json.loads(row['result'] or '{}')
+        if row['status'] in TERMINAL and result.get('files'):
+            w.verify_outputs(result)
+        result.update(job_id=row['id'], request_id=row['request_id'], account_id=row['account_id'],
+                      status=row['status'], created_at=row['created'], updated_at=row['updated'],
+                      requested_count=payload['count'], provider='chatgpt-web', image_model_verified=False)
+        result['phase'] = json.loads(row['result'] or '{}').get('status', row['status'])
+        result['downloaded_count'] = len(result.get('files', []))
+        result['missing_count'] = max(0, payload['count'] - result['downloaded_count'])
+        result['cancel_requested'] = bool(row['cancel_requested'])
+        if row['error']:
+            result['error'] = json.loads(row['error'])
+        result['ok'] = row['status'] not in {'failed', 'preparation_failed', 'partial', 'count_mismatch'}
+        result['retryable'] = row['status'] in {'queued', 'dispatching', 'running'}
+        result['next_action'] = ('inspect_account_then_resume' if row['status'] == 'needs_attention' else
+                                 'poll_same_job' if row['status'] not in TERMINAL else 'deliver_saved_files')
+        if row['status'] == 'queued':
+            with self.connect() as db:
+                result['queue_position'] = db.execute("SELECT COUNT(*) FROM jobs WHERE status='queued' AND created<=?", (row['created'],)).fetchone()[0]
+        if detail:
+            result['runtime_job_id'] = row['runtime_id']
+        return result
+
+    def poll(self, job_id, wait_seconds=0, detail=False):
+        if type(wait_seconds) is not int or not 0 <= wait_seconds <= 45:
+            raise w.ImageError('invalid_wait', 'wait_seconds must be an integer from 0 to 45.')
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            result = self.get(job_id, detail)
+            if result['status'] in TERMINAL | {'needs_attention'} or time.monotonic() >= deadline:
+                return result
+            time.sleep(min(0.5, max(0, deadline-time.monotonic())))
+
+    def cancel(self, job_id):
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None:
+                raise w.ImageError('job_not_found', 'Unknown job_id.')
+            if row['status'] == 'queued':
+                db.execute("UPDATE jobs SET status='cancelled',updated=? WHERE id=?", (time.time(), job_id))
+            elif row['status'] not in TERMINAL:
+                db.execute('UPDATE jobs SET cancel_requested=1,updated=? WHERE id=?', (time.time(), job_id))
+        return self.get(job_id)
+
+    def resume(self, job_id):
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None or row['status'] != 'needs_attention':
+                raise w.ImageError('not_paused', 'Resume only a needs_attention job after inspecting its account.')
+            # Never move an uncertain submission to another account or allocate a new request ID.
+            state = 'running' if row['runtime_id'] else 'dispatching'
+            db.execute('UPDATE jobs SET status=?,failures=0,error=NULL,updated=? WHERE id=?', (state, time.time(), job_id))
+        return self.get(job_id)
+
+    def claim(self, account_id):
+        with self.transaction() as db:
+            active = db.execute("SELECT * FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')", (account_id,)).fetchone()
+            if active:
+                return dict(active)
+            account = db.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
+            if not account or not account['enabled'] or not account['ready']:
+                return None
+            queued = db.execute("SELECT * FROM jobs WHERE status='queued' AND preferred IN ('auto',?) ORDER BY created,id LIMIT 1", (account_id,)).fetchone()
+            if not queued:
+                return None
+            db.execute("UPDATE jobs SET status='dispatching',account_id=?,updated=? WHERE id=?", (account_id, time.time(), queued['id']))
+            return dict(db.execute('SELECT * FROM jobs WHERE id=?', (queued['id'],)).fetchone())
+
+    def account_state(self, account_id, state, ready=False, error=None):
+        with self.connect() as db:
+            db.execute('UPDATE accounts SET state=?,ready=?,error=?,updated=? WHERE id=?',
+                       (state, int(ready), json.dumps(error) if error else None, time.time(), account_id))
+
+    def heartbeat(self, account_id):
+        with self.connect() as db:
+            db.execute('UPDATE accounts SET heartbeat=?,pid=? WHERE id=?', (time.time(), os.getpid(), account_id))
+
+    def save_result(self, job_id, result, runtime_id=None):
+        phase = result.get('status', 'running')
+        state = phase if phase in TERMINAL | {'needs_attention'} else 'running'
+        with self.connect() as db:
+            db.execute('UPDATE jobs SET status=?,runtime_id=COALESCE(?,runtime_id),result=?,error=?,failures=0,updated=? WHERE id=?',
+                       (state, runtime_id, json.dumps(result, ensure_ascii=False),
+                        json.dumps(result['error']) if result.get('error') else None, time.time(), job_id))
+
+    def failure(self, job_id, error):
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            failures = row['failures'] + 1
+            pause = failures >= 3 or error['code'] in {'conversation_changed', 'job_not_active', 'output_changed', 'reference_changed'}
+            db.execute('UPDATE jobs SET failures=?,status=?,error=?,updated=? WHERE id=?',
+                       (failures, 'needs_attention' if pause else row['status'], json.dumps(error), time.time(), job_id))
+
+    def control(self, account_id, action, **args):
+        self.account(account_id)
+        if action not in {'open', 'check', 'select'}:
+            raise w.ImageError('invalid_action', 'Unsupported account action.')
+        control_id = uuid.uuid4().hex
+        now = time.time()
+        with self.connect() as db:
+            db.execute('INSERT INTO controls(id,account_id,action,args,status,created,updated) VALUES(?,?,?,?,?,?,?)',
+                       (control_id, account_id, action, json.dumps(args), 'queued', now, now))
+        return {'ok': True, 'account_id': account_id, 'control_id': control_id, 'status': 'queued',
+                'next_action': 'image_status_for_control_result'}
+
+    def status(self):
+        with self.connect() as db:
+            accounts = []
+            for row in db.execute('SELECT * FROM accounts ORDER BY id'):
+                account = {k: row[k] for k in ('id','enabled','ready','state','heartbeat','updated')}
+                account['worker_alive'] = time.time() - row['heartbeat'] < 20
+                if row['error']:
+                    account['error'] = json.loads(row['error'])
+                active = db.execute("SELECT id,status FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')", (row['id'],)).fetchone()
+                account['active_job_id'] = active['id'] if active else None
+                account['active_job_status'] = active['status'] if active else None
+                control = db.execute('SELECT id,action,status,result,updated FROM controls WHERE account_id=? ORDER BY created DESC LIMIT 1', (row['id'],)).fetchone()
+                if control:
+                    account['last_control'] = dict(control)
+                    account['last_control']['result'] = json.loads(control['result'] or '{}')
+                accounts.append(account)
+            counts = {r['status']: r['n'] for r in db.execute('SELECT status,COUNT(*) n FROM jobs GROUP BY status')}
+        return {'ok': True, 'service': 'local-durable-pool', 'accounts': accounts, 'jobs': counts,
+                'configured_capacity': sum(bool(a['enabled']) for a in accounts),
+                'parallel_capacity': sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and a['active_job_status'] != 'needs_attention') for a in accounts)}
+
+    def ensure_workers(self):
+        failures = []
+        with self.connect() as db:
+            accounts = [dict(r) for r in db.execute('SELECT * FROM accounts')]
+        for account in accounts:
+            if time.time() - account['heartbeat'] < 20:
+                continue
+            env = account_env(account, self.root)
+            try:
+                with (self.root / ('worker-' + account['id'] + '.log')).open('ab') as log:
+                    subprocess.Popen([sys.executable, str(Path(__file__).with_name('image_worker.py')), account['id']],
+                                     env=env, cwd=self.root, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                     creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS) if os.name == 'nt' else 0,
+                                     close_fds=True)
+            except OSError as exc:
+                failures.append({'account_id': account['id'], 'code': 'worker_start_failed', 'type': type(exc).__name__})
+        return failures
+
+
+def account_env(account, root):
+    # Never inherit another lane's auth file, remembered account, data or output overrides.
+    env = {k: v for k, v in os.environ.items() if not k.startswith('CHATGPT_WEB_IMAGES_')}
+    env.update(CHATGPT_WEB_IMAGES_CONFIG_DIR=account['config_dir'], CHATGPT_WEB_IMAGES_DATA=account['data_dir'],
+               CHATGPT_WEB_IMAGES_POOL=str(root), CHATGPT_WEB_IMAGES_WORKER='1', PYTHONIOENCODING='utf-8')
+    return env

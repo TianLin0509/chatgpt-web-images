@@ -1,0 +1,17 @@
+{
+    "mcpServers":  {
+                       "chatgpt-web-images":  {
+                                                  "command":  "C:\\Users\\lintian\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+                                                  "args":  [
+                                                               "C:\\Users\\lintian\\plugins\\chatgpt-web-images\\scripts\\web_images.py",
+                                                               "mcp"
+                                                           ],
+                                                  "env":  {
+                                                              "PYTHONIOENCODING":  "utf-8",
+                                                              "CHATGPT_WEB_IMAGES_POOL":  "C:\\VibeData\\ChatGPTWebImagesPool"
+                                                          },
+                                                  "startup_timeout_sec":  30,
+                                                  "tool_timeout_sec":  180
+                                              }
+                   }
+}
