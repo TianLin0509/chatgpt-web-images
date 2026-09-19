@@ -1,4 +1,13 @@
-# ChatGPT Web Images 0.3.1
+# ChatGPT Web Images 0.4.0
+
+## 吞吐与卡死修复（0.4.0）
+
+- 暂停的任务不再长期占用它的账号。超过 120 秒无人处理就 parked：交回浏览器，保留同一账号、同一会话和已下载文件，排队任务立即继续。parked 不是失败，也不重发提示词。
+- parked 任务按 60/300/900 秒退避自动回到原会话重新观察，最多三次；仍不成功才等人处理，此时 next_action 为 inspect_account_then_resume。resume 只是让它重新排上队，不抢占正在跑的任务。
+- 身份校验失败先强制重载记录在案的会话再判断，最多两次。此前刷新写在校验之后，恢复路径在真正需要它时永远走不到，resume 必然再次失败。
+- 浏览器故障后的账号按 60/300/900 秒自动重检，最多三次；此前 browser_unhealthy 永不自检，一次抖动就让整条车道静默下线直到人工 account_check。
+- `account-clone` 为同一个已登录账号增加独立 Profile 车道。并发上限来自「一个账号一个浏览器页面」，不是 ChatGPT 的限制。
+- 生成期间无新图时后台轮询放慢到 10 秒，减少浏览器子进程启动；出现图片后恢复 3 秒节奏。
 
 ## 并发与故障恢复修复
 
@@ -17,6 +26,15 @@
 ## 多 agent 与多账号
 
 所有 stdio MCP 客户端共用 SQLite 持久队列。每账号一个独立后台进程、独立 Profile，同时执行一个任务。多个 agent 可同时提交，空闲账号领取，其余排队。后台自主检查生成、下载和收尾，客户端断开不会终止任务。
+
+**并发上限等于车道数，不等于账号数。** 一条车道是一个浏览器 Profile，一次只做一个任务；单个任务从提交到下载完通常要几分钟。想提高并发，给同一个已登录账号再加车道：
+
+```powershell
+chatgpt-web-images account-clone --account-id primary2 --clone-from primary
+chatgpt-web-images check --account-id primary2
+```
+
+克隆会新建独立 Profile 并复制源账号已保存的登录态，源账号必须先 check 过一次。ChatGPT 侧会看到同一账号的多个并发会话，与手工多开窗口等价；额度、限流和网页可用性仍由服务决定，加车道不会让单张图更快。
 
 支持本机的标准 stdio MCP 客户端，不等于认证所有 agent 或提供远程服务。两个账号的实际速度、额度和网页可用性仍由服务决定。
 
@@ -70,12 +88,14 @@ codex mcp add chatgpt-web-images --env PYTHONIOENCODING=utf-8 --env "CHATGPT_WEB
 | image_open | 异步打开指定账号专属浏览器 |
 | image_account_check | 用户登录后检查账号状态 |
 | image_select_account | 只选择用户授权的已记住账号，不处理密码或验证码 |
-| image_resume | 接续 needs_attention 原任务，保持同一账号和请求身份 |
+| image_resume | 接续 needs_attention 或 parked 原任务，保持同一账号和请求身份 |
 | image_cancel | 按用户要求取消排队任务，或异步请求取消它自己的网页生成 |
 
 prompt / UTF-8 prompt_file 二选一，参考图最多五个本地 PNG/JPEG/WebP，输出目录为绝对路径。count=1..20 是插件参数上限，不是网页额度保证。
 
-状态为 queued → dispatching → running → complete；phase 是浏览器实际阶段。needs_attention 阻塞该任务所属账号，另一账号仍可工作。连续三次操作失败暂停；会话串线、参考文件改变、输出完整性异常也会停止继续操作。处理后显式 resume，不换账号重发。
+状态为 queued → dispatching → running → complete；phase 是浏览器实际阶段。连续三次操作失败暂停；会话串线、参考文件改变、输出完整性异常也会停止继续操作。处理后显式 resume，不换账号重发。
+
+needs_attention 仍暂停该账号，但只暂停 120 秒：之后转为 parked 交回车道，队列继续推进。parked 保留账号、会话和已存文件，按退避自动重新观察，结果里带 auto_retry_at 与 auto_retry_attempts_left；次数用完才需要人工检查后 resume。从未进入浏览器的任务 parked 后不自动重试，resume 会让它重新派发，start 通过持久请求索引保持幂等。
 
 partial / count_mismatch / failed 明确返回，保留已有文件。完成结果再次读取会检查文件哈希，缺失或修改不能冒充成功。request_id 在整个队列中唯一，不自动过期；不同 agent 使用含日期和任务/席位的 ID。
 
@@ -97,6 +117,7 @@ python scripts/test_mcp_protocol.py
 python scripts/test_image_pool.py
 python scripts/test_pool_protocol.py
 python scripts/test_account_contracts.py
+python scripts/test_throughput.py
 python scripts/test_account_browser.py
 ```
 

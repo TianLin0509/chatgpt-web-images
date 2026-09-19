@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+- Park a paused job instead of letting it hold its account: the browser is released while the same account, conversation and downloaded files are kept, so the queue keeps draining.
+- Re-observe parked jobs automatically on a 60/300/900 second backoff, at most three times, then wait for a human; never resend a prompt to recover one.
+- Reload the recorded conversation before judging identity, and spend two forced reloads on a mismatch, so a stale DOM no longer pauses a job that is still generating.
+- Re-check an unhealthy account on the same backoff instead of leaving the lane offline until a human runs an account check.
+- Add `account-clone` so one signed-in account can serve several isolated browser lanes; concurrency is bounded by lanes, not by accounts.
+- Slow background polling to 10 seconds while generation has produced nothing yet, and expose parked job counts per account.
+
 ## 0.3.1
 
 - Fix account admission after preparation failure, control starvation, repeated account controls, and concurrent worker launch storms.

@@ -19,7 +19,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.3.1'
+VERSION = '0.4.0'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -45,6 +45,8 @@ SESSION = 'chatgpt-web-images'
 CLI_ENTRY = setting('CHATGPT_WEB_IMAGES_CLI','cli_entry',DATA/'runtime'/'node_modules'/'@playwright'/'cli'/'playwright-cli.js')
 DEFAULT_OUTPUT = setting('CHATGPT_WEB_IMAGES_OUTPUT','output_dir',DATA/'output')
 TERMINAL = {'complete','failed','preparation_failed','cancelled','partial','count_mismatch'}
+# Forced reloads spent on an identity mismatch before refusing to observe the conversation.
+IDENTITY_RETRIES = 2
 
 
 class ImageError(RuntimeError):
@@ -273,6 +275,55 @@ def resume_existing(job_id):
         if job['status'] == 'needs_attention':
             job['status'] = 'generating'
         job.pop('error', None)
+        save_job(job)
+        return public_job(job)
+
+
+def park(job_id):
+    """Release browser ownership of a stalled job without abandoning its conversation.
+
+    A paused job used to hold its account until a human intervened, which idled the
+    whole lane. Parking keeps the runtime record, the conversation URL and every
+    downloaded file, and only gives the browser back so queued work can proceed.
+    """
+    with locked():
+        job = json.loads(job_path(job_id).read_text(encoding='utf-8'))
+        if job['status'] in TERMINAL:
+            return public_job(job)
+        active = active_job()
+        if active and active['job_id'] == job_id:
+            (DATA / 'active.json').unlink(missing_ok=True)
+        job['parked_at'] = time.time()
+        job.pop('refresh_requested', None)
+        save_job(job)
+        return public_job(job)
+
+
+def adopt(job_id):
+    """Re-take browser ownership of a parked job; observation only, never resends."""
+    with locked():
+        job = json.loads(job_path(job_id).read_text(encoding='utf-8'))
+        if job['status'] in TERMINAL:
+            return public_job(job)
+        active = active_job()
+        if active and active['job_id'] != job_id:
+            raise ImageError('job_active', f"Job {active['job_id']} owns the browser; adopt this job later.")
+        url = job.get('conversation_url', '')
+        if not re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+', url):
+            raise ImageError('adopt_without_conversation', 'This job never recorded a conversation; inspect the browser manually.')
+        ensure_browser()
+        cli(['goto', url])
+        run_js('''async page => {
+          await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+          return true;
+        }''')
+        write_json(DATA / 'active.json', {'job_id': job_id})
+        job['wait_started_at'] = time.time()
+        job.pop('parked_at', None)
+        job.pop('identity_retry', None)
+        job.pop('error', None)
+        if job['status'] == 'needs_attention':
+            job['status'] = 'generating'
         save_job(job)
         return public_job(job)
 
@@ -602,18 +653,33 @@ def poll(job_id):
               return true;
             }''')
         result=run_js(POLL_JS)
+        if job.pop('refresh_requested', False):
+            # An explicit resume, or a first identity mismatch, may be looking at a stale
+            # DOM. Reload the RECORDED conversation before judging identity: validating
+            # first would make this recovery path unreachable exactly when it is needed,
+            # and reloading whatever page is open cannot repair a drifted browser.
+            save_job(job)
+            if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',url):
+                cli(['goto',url])
+                run_js('''async page => {
+                  await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+                  return true;
+                }''')
+                result=run_js(POLL_JS)
         expected=job.get('identity_hash',job['prompt_sha256'])
         if result['user_count'] and prompt_hash(result['user_text'])!=expected:
+            # A half-rendered or stale conversation is indistinguishable from a different
+            # one. Spend a bounded number of forced reloads before refusing to continue;
+            # a real mismatch still pauses without downloading or resending anything.
+            if job.get('identity_retry',0) < IDENTITY_RETRIES and re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',url):
+                job['identity_retry']=job.get('identity_retry',0)+1
+                job['refresh_requested']=True
+                save_job(job)
+                return public_job(job)
             raise ImageError('conversation_changed','The browser contains a different prompt; do not download or resend. Open the recorded conversation and poll again.')
+        job.pop('identity_retry',None)
         if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',result['url']):
             job['conversation_url']=result['url']
-        if job.pop('refresh_requested', False):
-            # An explicit resume may recover a stale "Thinking" DOM. Refresh only
-            # a conversation whose last user message has just passed identity validation.
-            save_job(job)
-            if result['user_count'] and re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',result['url']):
-                cli(['goto', result['url']])
-                return public_job(job)
         # Deduplicate repeated DOM representations of the same generated asset.
         assets=list({a['key']:a for a in result['images']}.values())
         job['observed_count']=len(assets)

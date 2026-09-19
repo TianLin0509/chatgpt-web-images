@@ -20,9 +20,12 @@ class FakeRuntime:
         self.DATA.mkdir(parents=True, exist_ok=True)
         self.starts = 0
         self.polls = 0
+        self.adopts = 0
         self.failed = False
         self.uncertain = False
+        self.adopt_fails = False
         self.active = None
+        self.active_id = '20260916-123456abcdef'
 
     def active_job(self):
         return self.active
@@ -40,7 +43,7 @@ class FakeRuntime:
         if index.exists():
             return json.loads(index.read_text())
         self.starts += 1
-        result = {'job_id': '20260916-123456abcdef', 'status': 'submission_uncertain' if self.uncertain else 'generating', 'files': []}
+        result = {'job_id': self.active_id, 'status': 'submission_uncertain' if self.uncertain else 'generating', 'files': []}
         w.write_json(index, result)
         self.active = {'job_id': result['job_id']}
         return result
@@ -58,6 +61,17 @@ class FakeRuntime:
     def cancel(self, job_id):
         self.active = None
         return {'job_id': job_id, 'status': 'cancelled', 'files': []}
+
+    def park(self, job_id):
+        self.active = None
+        return {'job_id': job_id, 'status': 'generating', 'files': []}
+
+    def adopt(self, job_id):
+        if self.adopt_fails:
+            raise w.ImageError('browser_timeout', 'Fixture adopt failure')
+        self.adopts += 1
+        self.active = {'job_id': job_id}
+        return {'job_id': job_id, 'status': 'generating', 'files': []}
 
 
 class QueueContracts(unittest.TestCase):

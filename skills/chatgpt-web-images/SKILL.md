@@ -10,12 +10,13 @@ description: 使用用户自己的 ChatGPT 网页账号生成图片、制作参�
 1. 首次使用调用 `image_status`，读取账号健康、活动任务和最近账号操作结果，不访问网页。未登录时 `image_open(account_id)`；用户登录后 `image_account_check(account_id)`，再查看 status。账号操作返回 queued 只表示已接收。
 2. 长提示词保存为带日期、任务标识的 UTF-8 文件。`image_generate(prompt_file=绝对路径, count=张数, request_id=全局唯一任务标识, output_dir=绝对路径, name=任务名, account_id="auto")`。prompt 与 prompt_file 二选一；reference_images 接受至多五个 PNG/JPEG/WebP 绝对路径，排队期间保持文件不变。
 3. count=1..20 是一次网页请求的图片数量，不是账号并发数或额度保证。遵从指定张数，多图要求独立附件，不能用拼图或裁切代替，不静默压缩或降低要求。
-4. 提交立即返回 job_id；queued、dispatching、running 是正常状态。多个 agent 可以同时提交，每账号执行一个任务，其余持久排队。auto 分配空闲账号，也可明确指定已经配置的账号别名。
+4. 提交立即返回 job_id；queued、dispatching、running 是正常状态。多个 agent 可以同时提交，每条车道执行一个任务，其余持久排队。auto 分配空闲车道，也可明确指定已经配置的账号别名。并发上限是车道数（一个浏览器 Profile 一条），不是账号数，也不随排队时长变化；排队久属正常，不要改 ID 重投。
 5. 保持同一 request_id 和参数；超时重试返回原任务。ID 应含日期、任务或席位标识。不得自动换 ID 或账号重发不确定提交。
 6. `image_poll(job_id, wait_seconds=20)` 等待结果。后台自主执行、下载、收尾，agent 断开仍会继续。无需额外 shell 循环、高频 status 或自建后台任务。phase 是浏览器实际阶段。查询自己的任务，不接管其他人的任务。
 7. needs_attention 表示暂停核查并保留原账号和请求身份。按错误检查账号，必要时 image_open；处理后 `image_resume(job_id)` 接续原任务，不换账号重发。仅在用户要求取消时 `image_cancel(job_id)`；活动任务取消为异步请求，确认 cancelled 后才宣称取消成功。
-   queued 时先看 blocking_accounts；browser_unhealthy 需排查后 account_check，不通过反复提交试错。worker_stalled 表示进程仍有心跳但操作停滞，不等于可用。已有活动任务不可切换账号。resume 只恢复观察，不重发；同一超时反复出现时交代阻塞原因，不无限 resume。
-8. 只有请求、观察与下载数量相符才是 complete。partial / count_mismatch / failed 必须如实交代，交付已保存文件。确认本地文件存在并用本地看图工具检查，不把图片 base64 放进工具文字。
+8. parked 表示该任务已交回车道让队列继续，账号、会话和已存文件都保留，不是失败也没有重发。auto_retry_attempts_left 大于零时它会自行回到原会话重新观察，继续 image_poll 即可；为零且 next_action 为 inspect_account_then_resume 才需要检查账号后 image_resume。不要因为看到 parked 就换账号、换 request_id 或重新提交。
+   queued 时先看 blocking_accounts；账号故障后后台会自行重检有限次，仍是 browser_unhealthy 才需排查后 account_check，不通过反复提交试错。worker_stalled 表示进程仍有心跳但操作停滞，不等于可用。已有活动任务不可切换账号。resume 只恢复观察，不重发；同一超时反复出现时交代阻塞原因，不无限 resume。
+9. 只有请求、观察与下载数量相符才是 complete。partial / count_mismatch / failed 必须如实交代，交付已保存文件。确认本地文件存在并用本地看图工具检查，不把图片 base64 放进工具文字。
 
 内部图片模型未核实，称为“ChatGPT 网页生成”；保留网页模型和思考强度，不自动改用 API 或其他生图工具。尺寸以原图为准。不绕过登录、校验、额度；密码和验证码只由用户在专属浏览器输入。
 

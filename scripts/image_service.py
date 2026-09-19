@@ -38,7 +38,8 @@ def create_mcp(pool=None):
         'queued/running are normal: workers continue after you disconnect. Poll the SAME job_id '
         'with wait_seconds=20; never resend or switch accounts for uncertain submissions. '
         'account_id=auto selects an available independent account. needs_attention requires '
-        'browser inspection then image_resume. Only cancel on user request. '
+        'browser inspection then image_resume; parked means the job released its lane so '
+        'the queue keeps moving and is re-observed automatically. Only cancel on user request. '
         'Outputs are original local file paths and text metadata, never image base64.'))
 
     def encoded(result):
@@ -103,7 +104,7 @@ def create_mcp(pool=None):
 
     @server.tool(structured_output=False)
     async def image_resume(job_id: str) -> str:
-        """After inspecting/fixing a needs_attention account, resume the SAME job on the SAME account; never resubmits an uncertain job."""
+        """After inspecting/fixing a needs_attention or parked account, resume the SAME job on the SAME account; never resubmits an uncertain job."""
         return await call(lambda: wake(pool, pool.resume(job_id)))
 
     return server
@@ -111,8 +112,9 @@ def create_mcp(pool=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['mcp','status','open','check','select-account','generate','poll','cancel','resume','account-add','account-enable','import-legacy'])
+    parser.add_argument('command', choices=['mcp','status','open','check','select-account','generate','poll','cancel','resume','account-add','account-clone','account-enable','import-legacy'])
     parser.add_argument('--account-id', default='auto')
+    parser.add_argument('--clone-from', default='')
     parser.add_argument('--account-name', default='')
     parser.add_argument('--no-remember', action='store_true')
     parser.add_argument('--prompt-file', default='')
@@ -138,6 +140,10 @@ def main(argv=None):
         if args.command == 'account-add':
             row = pool.add_account(account, args.data_dir, args.config_dir, enabled=not args.disabled)
             return {'ok': True, 'account_id': row['id'], 'enabled': bool(row['enabled'])}
+        if args.command == 'account-clone':
+            if not args.clone_from:
+                raise w.ImageError('invalid_account_id', 'Pass --clone-from with the logged-in account to add a lane for.')
+            return pool.clone_account(args.clone_from, account, enabled=not args.disabled)
         if args.command == 'account-enable':
             return pool.enable(account, not args.disabled)
         if args.command == 'import-legacy':

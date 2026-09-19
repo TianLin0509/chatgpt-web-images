@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -18,7 +19,13 @@ import web_images as w
 
 TERMINAL = w.TERMINAL | {'cancelled'}
 LIVE = ('dispatching', 'running', 'needs_attention')
-VERSION = '0.3.1'
+# A parked job keeps its account, conversation and files but no longer occupies the lane.
+PARKED = 'parked'
+# How long a paused job may hold its lane before it is parked and the queue moves on.
+PARK_AFTER_SECONDS = 120
+# Unattended re-observation delays for a parked job; afterwards it waits for a human.
+ADOPT_BACKOFF = (60, 300, 900)
+VERSION = '0.4.0'
 
 
 @contextlib.contextmanager
@@ -77,6 +84,13 @@ class Pool:
                     args TEXT NOT NULL, status TEXT NOT NULL, result TEXT, created REAL NOT NULL,
                     updated REAL NOT NULL);
             ''')
+            # Existing queues are migrated in place; a rebuild would lose live ownership.
+            known = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
+            for column, ddl in (('park_count', 'INTEGER NOT NULL DEFAULT 0'),
+                                ('retry_after', 'REAL NOT NULL DEFAULT 0')):
+                if column not in known:
+                    db.execute('ALTER TABLE jobs ADD COLUMN ' + column + ' ' + ddl)
+            db.execute('CREATE INDEX IF NOT EXISTS jobs_parked ON jobs(account_id, status, retry_after)')
 
     def connect(self):
         db = sqlite3.connect(self.db, timeout=10, isolation_level=None)
@@ -125,6 +139,29 @@ class Pool:
                 except sqlite3.IntegrityError as exc:
                     raise w.ImageError('duplicate_profile', 'Two accounts must not share a browser data directory.') from exc
         return self.account(account_id)
+
+    def clone_account(self, source_id, account_id, enabled=True):
+        """Add another browser lane reusing an account that is already logged in.
+
+        ChatGPT has no one-image-at-a-time rule per account; the single-page browser
+        automation does. A clone is an isolated profile seeded with the same saved
+        login, which is what opening a second browser window already does by hand.
+        """
+        source = self.account(source_id)
+        identifier(account_id)
+        auth = Path(source['data_dir']) / 'auth-state.json'
+        if not auth.is_file():
+            raise w.ImageError('clone_without_login', 'Check the source account first so its login state is saved.')
+        base = self.root / 'accounts' / account_id
+        data, config = base / 'browser', base / 'config'
+        data.mkdir(parents=True, exist_ok=True)
+        settings = json.loads((Path(source['config_dir']) / 'settings.json').read_text(encoding='utf-8-sig'))
+        settings['data_dir'] = str(data)
+        w.write_json(config / 'settings.json', settings)
+        shutil.copy2(auth, data / 'auth-state.json')
+        row = self.add_account(account_id, str(data), str(config), enabled=enabled)
+        return {'ok': True, 'account_id': row['id'], 'cloned_from': source_id, 'data_dir': row['data_dir'],
+                'enabled': bool(row['enabled']), 'next_action': 'image_account_check'}
 
     def enable(self, account_id, enabled):
         self.account(account_id)
@@ -206,9 +243,16 @@ class Pool:
         if row['error']:
             result['error'] = json.loads(row['error'])
         result['ok'] = row['status'] not in {'failed', 'preparation_failed', 'partial', 'count_mismatch'}
-        result['retryable'] = row['status'] in {'queued', 'dispatching', 'running'}
-        result['next_action'] = ('inspect_account_then_resume' if row['status'] == 'needs_attention' else
+        result['retryable'] = row['status'] in {'queued', 'dispatching', 'running', PARKED}
+        attended = row['status'] == 'needs_attention' or (row['status'] == PARKED and row['park_count'] > len(ADOPT_BACKOFF))
+        result['next_action'] = ('inspect_account_then_resume' if attended else
                                  'poll_same_job' if row['status'] not in TERMINAL else 'deliver_saved_files')
+        if row['status'] == PARKED:
+            # Parking is not a failure: the conversation, the account and every saved
+            # file are kept, and the lane is released so other jobs are not blocked.
+            result['parked_reason'] = 'lane_released_for_queue'
+            result['auto_retry_attempts_left'] = max(0, len(ADOPT_BACKOFF) - row['park_count'] + 1)
+            result['auto_retry_at'] = row['retry_after'] if not attended else None
         if row['status'] == 'queued':
             with self.connect() as db:
                 result['queue_position'] = db.execute("SELECT COUNT(*) FROM jobs WHERE status='queued' AND created<=?", (row['created'],)).fetchone()[0]
@@ -239,7 +283,7 @@ class Pool:
         while True:
             result = await asyncio.to_thread(self.get, job_id, detail)
             remaining = deadline - time.monotonic()
-            if result['status'] in TERMINAL | {'needs_attention'} or remaining <= 0:
+            if result['status'] in TERMINAL | {'needs_attention', PARKED} or remaining <= 0:
                 return result
             await asyncio.sleep(min(0.5, remaining))
 
@@ -249,7 +293,7 @@ class Pool:
         deadline = time.monotonic() + wait_seconds
         while True:
             result = self.get(job_id, detail)
-            if result['status'] in TERMINAL | {'needs_attention'} or time.monotonic() >= deadline:
+            if result['status'] in TERMINAL | {'needs_attention', PARKED} or time.monotonic() >= deadline:
                 return result
             time.sleep(min(0.5, max(0, deadline-time.monotonic())))
 
@@ -267,15 +311,52 @@ class Pool:
     def resume(self, job_id):
         with self.transaction() as db:
             row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
-            if row is None or row['status'] != 'needs_attention':
-                raise w.ImageError('not_paused', 'Resume only a needs_attention job after inspecting its account.')
+            if row is None or row['status'] not in {'needs_attention', PARKED}:
+                raise w.ImageError('not_paused', 'Resume only a needs_attention or parked job after inspecting its account.')
             # Never move an uncertain submission to another account or allocate a new request ID.
+            if row['status'] == PARKED:
+                # The lane is free; hand the job back to its own worker instead of
+                # seizing the lane here, which would evict whatever is running now.
+                db.execute('UPDATE jobs SET park_count=0,retry_after=0,failures=0,error=NULL,updated=? WHERE id=?',
+                           (time.time(), job_id))
+                return self.get(job_id)
             state = 'running' if row['runtime_id'] else 'dispatching'
             result = json.loads(row['result'] or '{}')
             result['_resume_requested'] = True
             db.execute('UPDATE jobs SET status=?,failures=0,error=NULL,result=?,updated=? WHERE id=?',
                        (state, json.dumps(result), time.time(), job_id))
         return self.get(job_id)
+
+    def park(self, job_id, error=None):
+        """Give the lane back without abandoning the job's account or conversation."""
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None or row['status'] in TERMINAL:
+                raise w.ImageError('not_parkable', 'Only an unfinished job can be parked.')
+            # Without a runtime job there is no conversation to re-observe, so parking
+            # only frees the lane; such a job waits for an explicit human resume.
+            count = len(ADOPT_BACKOFF) + 1 if not row['runtime_id'] else row['park_count'] + 1
+            delay = ADOPT_BACKOFF[min(row['park_count'], len(ADOPT_BACKOFF) - 1)]
+            db.execute('UPDATE jobs SET status=?,park_count=?,retry_after=?,error=COALESCE(?,error),updated=? WHERE id=?',
+                       (PARKED, count, time.time() + delay, json.dumps(error) if error else None, time.time(), job_id))
+        return self.get(job_id)
+
+    def redispatch(self, job_id):
+        """Return a parked job that never reached the browser to its own lane."""
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None or row['status'] != PARKED or row['runtime_id']:
+                raise w.ImageError('not_redispatchable', 'Only a parked job without a runtime job can be re-dispatched.')
+            db.execute("UPDATE jobs SET status='dispatching',failures=0,error=NULL,updated=? WHERE id=?",
+                       (time.time(), job_id))
+        return self.get(job_id)
+
+    def due_parked(self, account_id):
+        """The parked job this account should re-observe now, if any."""
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM jobs WHERE account_id=? AND status=? AND park_count<=? AND retry_after<=? ORDER BY created,id LIMIT 1',
+                             (account_id, PARKED, len(ADOPT_BACKOFF), time.time())).fetchone()
+        return dict(row) if row else None
 
     def claim(self, account_id):
         with self.transaction() as db:
@@ -355,6 +436,8 @@ class Pool:
                 active = db.execute("SELECT id,status FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')", (row['id'],)).fetchone()
                 account['active_job_id'] = active['id'] if active else None
                 account['active_job_status'] = active['status'] if active else None
+                account['parked_jobs'] = db.execute('SELECT COUNT(*) FROM jobs WHERE account_id=? AND status=?',
+                                                    (row['id'], PARKED)).fetchone()[0]
                 control = db.execute('SELECT id,action,status,result,updated FROM controls WHERE account_id=? ORDER BY created DESC LIMIT 1', (row['id'],)).fetchone()
                 if control:
                     account['last_control'] = dict(control)
