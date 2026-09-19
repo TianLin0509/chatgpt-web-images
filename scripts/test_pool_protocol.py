@@ -68,10 +68,10 @@ async def check():
             async with AsyncExitStack() as stack:
                 a, b = await client(stack), await client(stack)
                 catalog = await a.list_tools()
-                assert len(catalog.tools) == 8
+                assert len(catalog.tools) == 9
                 gen = next(t for t in catalog.tools if t.name == 'image_generate')
                 assert gen.inputSchema['properties']['count']['maximum'] == 20
-                checks.append('eight universal tools and bounded count schema')
+                checks.append('nine universal tools and bounded count schema')
                 for bad in (0, 21, True, 1.5):
                     response = await a.call_tool('image_generate', {'prompt': 'fixture', 'count': bad})
                     assert response.isError
@@ -108,6 +108,18 @@ async def check():
                 assert json.loads(response.content[0].text)['status'] == 'complete'
                 assert response.structuredContent is None and 'base64' not in response.content[0].text
                 checks.append('new client retrieves durable text-only result')
+                batch = await resumed.call_tool('image_generate_batch', {
+                    'requests': [{'prompt': 'deck %d' % i, 'request_id': 'deck%d' % i} for i in range(3)],
+                    'output_dir': str(Path(folder) / 'output')})
+                assert not batch.isError
+                queued = json.loads(batch.content[0].text)
+                assert queued['submitted'] == 3 and len(set(queued['job_ids'])) == 3
+                checks.append('one call queues a whole batch')
+                many = await resumed.call_tool('image_poll', {'job_ids': queued['job_ids'], 'wait_seconds': 0})
+                assert not many.isError
+                states = json.loads(many.content[0].text)
+                assert states['total'] == 3 and len(states['jobs']) == 3
+                checks.append('one call polls a whole batch')
                 bad = await resumed.call_tool('image_poll', {'job_id': 'unknown'})
                 assert bad.isError and 'job_not_found' in bad.content[0].text
                 assert json.loads(bad.content[0].text)['error']['code'] == 'job_not_found'

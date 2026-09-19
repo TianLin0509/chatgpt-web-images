@@ -1,4 +1,29 @@
-# ChatGPT Web Images 0.5.1
+# ChatGPT Web Images 0.6.0
+
+## 最大化并行：MCP 说明直接把规则讲出来（0.6.0）
+
+MCP 的 server instructions 和工具描述现在显式写明四条，agent 不读 skill 也能拿到：
+
+1. **并发 = 车道数，不是账号数**；`image_status` 给出每个登录的车道与负载。
+2. **同一提示词的多张备选 → 一个 `image_generate(count=N)`**，一次网页请求出全部 N 张。
+3. **多个不同提示词 → 一次 `image_generate_batch`**，一次调用排满所有空闲车道。
+4. **绝不串行**：先把已知的活全部提交，再统一轮询；`submit → 等 → submit` 会让车道空转，这是批量变慢的主因。
+
+新增与改动的工具：
+
+```jsonc
+// 一次排入整批不同提示词
+image_generate_batch({
+  requests: [{prompt_file: "...p1.txt", name: "p1", request_id: "20260919-deck-p1"},
+             {prompt_file: "...p2.txt", name: "p2", request_id: "20260919-deck-p2"}],
+  output_dir: "C:/.../out"
+})
+
+// 一次等待整批，而不是一个一个 poll
+image_poll({job_ids: [...], wait_seconds: 20, return_when: "all"})   // "any" 可提前取回先完成的
+```
+
+批量提交先整体校验再统一入队，不会留下"半个批次"；同 `request_id` 重发幂等。批量轮询里的未知 job_id 只在结果里标出来，不会让整批失败或空等。CLI 用重复的 `--job-id` 达到同样效果。
 
 ## 请求形状：一次多张 vs 多个任务（0.5.1）
 
@@ -111,7 +136,8 @@ codex mcp add chatgpt-web-images --env PYTHONIOENCODING=utf-8 --env "CHATGPT_WEB
 | 工具 | 行为 |
 |---|---|
 | image_generate | 持久入队，立即返回 job_id；account_id=auto 或指定账号；request_id 防重复 |
-| image_poll | 读取/等待自己的任务，后台不依赖它执行 |
+| image_generate_batch | 一次排入整批不同提示词，立刻占满所有空闲车道；整体校验、按 request_id 幂等 |
+| image_poll | 读取/等待自己的任务；传 job_ids 一次等待整批，return_when=any 可提前取回 |
 | image_status | 缓存健康、后台存活、任务状态数量和账号操作结果 |
 | image_open | 异步打开指定账号专属浏览器 |
 | image_account_check | 用户登录后检查账号状态 |

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0
+
+- Rewrite the MCP instructions so the surface itself teaches parallelism: concurrency is lanes rather than accounts, alternates of one prompt belong in one `count=N` request, different prompts belong in one `image_generate_batch` call, and callers must submit everything before polling anything.
+- Add `image_generate_batch`: one call validates and queues a whole batch, filling every free lane at once, and stays idempotent per `request_id`.
+- Let `image_poll` take `job_ids` and wait on a whole batch in one call, with `return_when='any'` for early delivery. Polling job by job was what turned a parallel batch back into a serial one.
+- Report an unknown job id inside the batch result instead of failing or stalling the whole poll.
+- Accept repeated `--job-id` on the CLI `poll` command for the same batch waiting.
+
 ## 0.5.1
 
 - Point callers at `count=N` when several single-image jobs for one output directory are in flight at once: alternates of one prompt belong in one ChatGPT request, which costs one lane and one account request instead of N.

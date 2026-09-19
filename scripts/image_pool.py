@@ -27,12 +27,17 @@ PARK_AFTER_SECONDS = 120
 ADOPT_BACKOFF = (60, 300, 900)
 # A caller splitting one picture request into many single-image jobs pays the whole
 # submit-and-navigate cost per image and spends one account request per image.
+# One call may queue a whole deck; a job still settles independently of its batch.
+MAX_BATCH = 20
+REQUEST_KEYS = ('prompt', 'prompt_file', 'output_dir', 'name', 'reference_images', 'count', 'request_id')
 BATCH_HINT_WINDOW = 900
 BATCH_HINT_SIBLINGS = 3
 # Every lane is a full browser profile (~0.6 GB resident), so the cap is about the
 # machine, not about ChatGPT. Raising it without free memory only causes swapping.
 MAX_LANES = 16
-VERSION = '0.5.1'
+# A job in one of these states will not change on its own while a caller waits.
+SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
+VERSION = '0.6.0'
 
 
 @contextlib.contextmanager
@@ -278,6 +283,75 @@ class Pool:
                            'alternates of one prompt, one image_generate with count=N delivers them from a '
                            'single ChatGPT request: one lane instead of N, and one request against the '
                            'account limit instead of N. Keep separate jobs when the prompts really differ.'}
+
+    def submit_many(self, requests, account_id='auto'):
+        """Queue a whole batch in one call so every free lane can start at once.
+
+        Everything is validated before anything is inserted: a caller should not have to
+        reason about half a batch. Re-sending the same batch is idempotent per request_id.
+        """
+        if not isinstance(requests, list) or not 1 <= len(requests) <= MAX_BATCH:
+            raise w.ImageError('invalid_batch', 'Provide 1 to %d image requests in a list.' % MAX_BATCH)
+        seen = set()
+        for item in requests:
+            if not isinstance(item, dict):
+                raise w.ImageError('invalid_batch', 'Each batch entry must be an object of image_generate arguments.')
+            unknown = set(item) - set(REQUEST_KEYS)
+            if unknown:
+                raise w.ImageError('invalid_batch', 'Unsupported batch entry keys: ' + ', '.join(sorted(unknown)))
+            payload, _ = w.validate_request(**item)
+            if not payload['request_id']:
+                raise w.ImageError('invalid_request_id', 'Every batch entry needs its own stable request_id.')
+            if payload['request_id'] in seen:
+                raise w.ImageError('request_id_conflict', 'Batch entries must use distinct request_ids: ' + payload['request_id'])
+            seen.add(payload['request_id'])
+        jobs = [self.submit(account_id=account_id, **item) for item in requests]
+        return {'ok': True, 'submitted': len(jobs), 'reused': sum(bool(j['reused_request']) for j in jobs),
+                'job_ids': [j['job_id'] for j in jobs], 'jobs': jobs,
+                'next_action': 'image_poll_with_job_ids'}
+
+    def poll_states(self, job_ids, detail=False):
+        """Read every job in one pass; an unknown id is reported, it does not fail the batch."""
+        states = []
+        for job_id in job_ids:
+            try:
+                states.append(self.get(job_id, detail))
+            except w.ImageError as exc:
+                states.append({'job_id': job_id, 'ok': False, 'status': 'unknown',
+                               'error': {'code': exc.code, 'message': str(exc)}})
+        return states
+
+    def batch_summary(self, states):
+        waiting = [s for s in states if s['status'] not in SETTLED]
+        attention = [s['job_id'] for s in states if s.get('next_action') == 'inspect_account_then_resume']
+        return {'ok': all(s.get('ok', False) for s in states), 'total': len(states),
+                'settled': len(states) - len(waiting), 'pending': len(waiting),
+                'complete': sum(s['status'] == 'complete' for s in states),
+                'downloaded_count': sum(s.get('downloaded_count', 0) for s in states),
+                'files': [f['path'] for s in states for f in s.get('files', [])],
+                'pending_job_ids': [s['job_id'] for s in waiting], 'needs_attention': attention,
+                'jobs': states,
+                'next_action': 'inspect_blocking_accounts' if attention else
+                               'poll_same_job_ids' if waiting else 'deliver_saved_files'}
+
+    async def poll_many_async(self, job_ids, wait_seconds=0, detail=False, return_when='all'):
+        """Wait on a whole batch in one call; polling one job at a time is what serialises callers."""
+        if type(wait_seconds) is not int or not 0 <= wait_seconds <= 45:
+            raise w.ImageError('invalid_wait', 'wait_seconds must be an integer from 0 to 45.')
+        if return_when not in {'all', 'any'}:
+            raise w.ImageError('invalid_return_when', "return_when must be 'all' or 'any'.")
+        unique = list(dict.fromkeys(job_ids))
+        if not 1 <= len(unique) <= MAX_BATCH:
+            raise w.ImageError('invalid_batch', 'Poll 1 to %d job ids at a time.' % MAX_BATCH)
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            states = await asyncio.to_thread(self.poll_states, unique, detail)
+            settled = sum(s['status'] in SETTLED for s in states)
+            enough = settled == len(states) if return_when == 'all' else settled > 0
+            remaining = deadline - time.monotonic()
+            if enough or remaining <= 0:
+                return self.batch_summary(states)
+            await asyncio.sleep(min(0.5, remaining))
 
     def import_legacy(self, account_id):
         account = self.account(account_id)

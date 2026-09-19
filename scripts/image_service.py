@@ -34,14 +34,26 @@ def create_mcp(pool=None):
     from mcp.types import CallToolResult, TextContent
     pool = pool or Pool()
     server = FastMCP('chatgpt-web-images', instructions=(
-        'Shared persistent local image queue for ALL agents. Submit once with a stable request_id. '
-        'queued/running are normal: workers continue after you disconnect. Poll the SAME job_id '
-        'with wait_seconds=20; never resend or switch accounts for uncertain submissions. '
-        'account_id=auto picks a free lane and balances work across ChatGPT logins; '
-        'concurrency equals the number of lanes, not the number of accounts. needs_attention requires '
-        'browser inspection then image_resume; parked means the job released its lane so '
-        'the queue keeps moving and is re-observed automatically. Only cancel on user request. '
-        'Outputs are original local file paths and text metadata, never image base64.'))
+        'Shared durable local image queue for ALL agents. Run work in parallel on purpose.\n\n'
+        'CONCURRENCY: one lane is one browser profile and runs one job at a time. Concurrency '
+        'equals the number of lanes, NOT the number of ChatGPT accounts. image_status reports '
+        'lanes and load per login. account_id=auto picks a free lane and balances across logins '
+        'so no single account absorbs a burst.\n\n'
+        'CHOOSE THE REQUEST SHAPE BEFORE CALLING:\n'
+        '1. Several alternates of ONE prompt, for example multiple design options for one slide: '
+        'use ONE image_generate with count=N. ChatGPT returns all N images from a single request, '
+        'costing one lane and one account request instead of N. Do NOT split this into N jobs.\n'
+        '2. Several DIFFERENT prompts, for example one image per slide: use ONE '
+        'image_generate_batch call listing them all, so every free lane starts immediately.\n\n'
+        'NEVER SERIALISE. Submit every job you already know about before polling anything. A '
+        'submit-then-wait-then-submit loop leaves lanes idle and is the main cause of slow '
+        'batches. Then wait on the whole batch with image_poll(job_ids=[...]). Workers keep '
+        'generating and downloading after you disconnect, so polling only reads progress.\n\n'
+        'queued, dispatching and running are normal; long queues are expected and are not a '
+        'reason to resubmit. parked means the job released its lane so others could run and is '
+        'retried automatically. needs_attention requires browser inspection then image_resume. '
+        'Never change request_id or account_id to retry an uncertain submission. Only cancel on '
+        'user request. Outputs are original local file paths and text metadata, never image base64.'))
 
     def encoded(result):
         text = json.dumps(result, ensure_ascii=False, separators=(',', ':'))
@@ -83,13 +95,35 @@ def create_mcp(pool=None):
                                                        count=count, request_id=request_id)))
 
     @server.tool(structured_output=False)
-    async def image_poll(job_id: str, wait_seconds: Annotated[int, Field(strict=True, ge=0, le=45)] = 20,
-                         detail: bool = False) -> str:
-        """Read or wait for this job only. The background worker saves originals even without polling. No browser operation extends this waiting budget."""
+    async def image_generate_batch(
+            requests: Annotated[list[dict], Field(description=(
+                'One entry per DIFFERENT prompt, each an image_generate argument object with its own '
+                'stable request_id. Use this instead of many image_generate calls so every free lane '
+                'starts at once. For several alternates of the SAME prompt use image_generate with '
+                'count=N instead, which is one ChatGPT request rather than several.'))],
+            output_dir: str = '', count: Annotated[int, Field(strict=True, ge=1, le=20)] = 1,
+            account_id: str = 'auto', detail: bool = False) -> str:
+        """Queue a whole batch of different prompts in one call, filling every free lane at once. output_dir and count apply to entries that do not set their own. Everything is validated before anything is queued, and resending the same batch is idempotent per request_id."""
+        shared = {'count': count}
+        if output_dir:
+            shared['output_dir'] = output_dir
+        merged = [{**shared, **entry} if isinstance(entry, dict) else entry for entry in (requests or [])]
+        return await call(lambda: wake(pool, pool.submit_many(merged, account_id=account_id)))
+
+    @server.tool(structured_output=False)
+    async def image_poll(job_id: str = '', job_ids: list[str] | None = None,
+                         wait_seconds: Annotated[int, Field(strict=True, ge=0, le=45)] = 20,
+                         detail: bool = False, return_when: str = 'all') -> str:
+        """Read or wait for your jobs. Pass job_ids=[...] to wait on a whole batch in ONE call: polling job by job is what makes a parallel batch behave like a serial one. return_when='any' returns as soon as one job settles, 'all' waits for the batch. Workers save originals even if you never poll, and no browser operation extends this waiting budget."""
         try:
-            await asyncio.to_thread(pool.row, job_id)
             start_errors = await asyncio.to_thread(pool.ensure_workers)
-            result = await pool.poll_async(job_id, wait_seconds, detail)
+            if job_ids:
+                result = await pool.poll_many_async(job_ids, wait_seconds, detail, return_when)
+            elif job_id:
+                await asyncio.to_thread(pool.row, job_id)
+                result = await pool.poll_async(job_id, wait_seconds, detail)
+            else:
+                raise w.ImageError('invalid_job_id', 'Pass job_id for one job, or job_ids for a batch.')
             if start_errors:
                 result['worker_start_errors'] = start_errors
         except w.ImageError as exc:
@@ -126,7 +160,8 @@ def main(argv=None):
     parser.add_argument('--reference', action='append', default=[])
     parser.add_argument('--count', type=int, default=1)
     parser.add_argument('--request-id', default='')
-    parser.add_argument('--job-id', default='')
+    parser.add_argument('--job-id', action='append', default=[])
+    parser.add_argument('--return-when', default='all')
     parser.add_argument('--wait-seconds', type=int, default=0)
     parser.add_argument('--detail', action='store_true')
     parser.add_argument('--data-dir', default='')
@@ -163,13 +198,16 @@ def main(argv=None):
             return pool.submit(account_id=args.account_id, prompt=args.prompt, prompt_file=args.prompt_file, output_dir=args.output_dir,
                                name=args.name, reference_images=args.reference, count=args.count, request_id=args.request_id)
         if args.command == 'poll':
-            pool.row(args.job_id)
             start_errors = pool.ensure_workers()
-            result = pool.poll(args.job_id, args.wait_seconds, args.detail)
+            if len(args.job_id) > 1:
+                result = asyncio.run(pool.poll_many_async(args.job_id, args.wait_seconds, args.detail, args.return_when))
+            else:
+                pool.row(args.job_id[0])
+                result = pool.poll(args.job_id[0], args.wait_seconds, args.detail)
             if start_errors:
                 result['worker_start_errors'] = start_errors
             return result
-        return (pool.cancel if args.command == 'cancel' else pool.resume)(args.job_id)
+        return (pool.cancel if args.command == 'cancel' else pool.resume)(args.job_id[0])
     result = invoke(execute)
     if result.get('ok'):
         result = wake(pool, result)

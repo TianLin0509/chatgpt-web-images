@@ -1,4 +1,5 @@
 """Lane throughput contracts: a stalled job must never hold the queue hostage."""
+import asyncio
 import json
 from pathlib import Path
 import time
@@ -7,8 +8,8 @@ from unittest.mock import patch
 
 import web_images as w
 import image_worker
-from image_pool import (ADOPT_BACKOFF, BATCH_HINT_SIBLINGS, MAX_LANES, PARK_AFTER_SECONDS,
-                        PARKED, login_group)
+from image_pool import (ADOPT_BACKOFF, BATCH_HINT_SIBLINGS, MAX_BATCH, MAX_LANES,
+                        PARK_AFTER_SECONDS, PARKED, login_group)
 import test_image_pool as fixtures
 import test_web_images as contracts
 
@@ -404,6 +405,136 @@ class BatchShape(fixtures.QueueContracts):
                                  output_dir=str(self.root / 'shared'))
         self.assertTrue(again['reused_request'])
         self.assertNotIn('hint', again)
+
+
+class BatchApi(fixtures.QueueContracts):
+    """One call queues the batch, one call waits on it; that is what keeps lanes full."""
+
+    def batch(self, how_many=3, **shared):
+        return [{'prompt': 'Draw page %d.' % index, 'request_id': 'page%d' % index,
+                 'output_dir': str(self.root / 'deck'), **shared} for index in range(how_many)]
+
+    def test_one_call_queues_the_whole_batch(self):
+        result = self.pool.submit_many(self.batch(4))
+        self.assertEqual(result['submitted'], 4)
+        self.assertEqual(len(set(result['job_ids'])), 4)
+        self.assertEqual(result['reused'], 0)
+        for job_id in result['job_ids']:
+            self.assertEqual(self.pool.row(job_id)['status'], 'queued')
+
+    def test_resending_a_batch_is_idempotent(self):
+        first = self.pool.submit_many(self.batch(3))
+        again = self.pool.submit_many(self.batch(3))
+        self.assertEqual(first['job_ids'], again['job_ids'])
+        self.assertEqual(again['reused'], 3)
+
+    def test_nothing_is_queued_when_any_entry_is_invalid(self):
+        requests = self.batch(2) + [{'prompt': '', 'request_id': 'broken'}]
+        with self.assertRaises(w.ImageError):
+            self.pool.submit_many(requests)
+        self.assertEqual(self.pool.status()['jobs'].get('queued', 0), 0)
+
+    def test_duplicate_request_ids_in_one_batch_are_refused(self):
+        requests = self.batch(2)
+        requests[1]['request_id'] = requests[0]['request_id']
+        with self.assertRaises(w.ImageError) as caught:
+            self.pool.submit_many(requests)
+        self.assertEqual(caught.exception.code, 'request_id_conflict')
+
+    def test_every_batch_entry_needs_its_own_request_id(self):
+        with self.assertRaises(w.ImageError) as caught:
+            self.pool.submit_many([{'prompt': 'no id', 'output_dir': str(self.root / 'deck')}])
+        self.assertEqual(caught.exception.code, 'invalid_request_id')
+
+    def test_unsupported_batch_keys_are_refused(self):
+        with self.assertRaises(w.ImageError) as caught:
+            self.pool.submit_many([{'prompt': 'x', 'request_id': 'k', 'account_id': 'primary'}])
+        self.assertEqual(caught.exception.code, 'invalid_batch')
+
+    def test_batch_size_is_bounded(self):
+        with self.assertRaises(w.ImageError):
+            self.pool.submit_many(self.batch(MAX_BATCH + 1))
+
+    def test_polling_a_batch_reports_every_job_in_one_result(self):
+        jobs = self.pool.submit_many(self.batch(3))['job_ids']
+        summary = asyncio.run(self.pool.poll_many_async(jobs, 0))
+        self.assertEqual(summary['total'], 3)
+        self.assertEqual(summary['pending'], 3)
+        self.assertEqual(summary['next_action'], 'poll_same_job_ids')
+        self.assertEqual([job['job_id'] for job in summary['jobs']], jobs)
+
+    def test_a_finished_batch_reports_every_file_once(self):
+        jobs = self.pool.submit_many(self.batch(2))['job_ids']
+        for lane in ('primary', 'secondary'):
+            self.worker(lane).tick()
+            self.worker(lane).tick()
+        summary = asyncio.run(self.pool.poll_many_async(jobs, 0))
+        self.assertEqual(summary['settled'], 2)
+        self.assertEqual(summary['complete'], 2)
+        self.assertEqual(summary['next_action'], 'deliver_saved_files')
+        self.assertEqual(len(summary['files']), 2)
+
+    def test_return_when_any_stops_at_the_first_settled_job(self):
+        jobs = self.pool.submit_many(self.batch(2))['job_ids']
+        self.worker('primary').tick()
+        self.worker('primary').tick()
+        summary = asyncio.run(self.pool.poll_many_async(jobs, 45, return_when='any'))
+        self.assertEqual(summary['settled'], 1)
+        self.assertEqual(summary['pending'], 1)
+
+    def test_an_unknown_job_id_never_stalls_or_fails_the_batch(self):
+        jobs = self.pool.submit_many(self.batch(1))['job_ids'] + ['20260101-deadbeefdead']
+        summary = asyncio.run(self.pool.poll_many_async(jobs, 45, return_when='all'))
+        self.assertFalse(summary['ok'])
+        unknown = [job for job in summary['jobs'] if job['status'] == 'unknown'][0]
+        self.assertEqual(unknown['error']['code'], 'job_not_found')
+
+    def test_duplicate_job_ids_are_polled_once(self):
+        jobs = self.pool.submit_many(self.batch(1))['job_ids']
+        summary = asyncio.run(self.pool.poll_many_async(jobs * 3, 0))
+        self.assertEqual(summary['total'], 1)
+
+    def test_batch_poll_rejects_an_unsupported_return_mode(self):
+        jobs = self.pool.submit_many(self.batch(1))['job_ids']
+        with self.assertRaises(w.ImageError) as caught:
+            asyncio.run(self.pool.poll_many_async(jobs, 0, return_when='first'))
+        self.assertEqual(caught.exception.code, 'invalid_return_when')
+
+
+class McpTeachesParallelism(unittest.TestCase):
+    """The MCP surface must state the parallel rules, not merely permit them."""
+
+    def surface(self):
+        import tempfile
+        from image_service import create_mcp
+        from image_pool import Pool
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        server = create_mcp(Pool(Path(folder.name) / 'pool'))
+        return server, asyncio.run(server.list_tools())
+
+    def test_instructions_state_the_two_request_shapes(self):
+        text = self.surface()[0].instructions
+        for phrase in ('count=N', 'image_generate_batch', 'alternates of ONE prompt',
+                       'DIFFERENT prompts', 'NEVER SERIALISE', 'job_ids'):
+            self.assertIn(phrase, text)
+
+    def test_instructions_say_concurrency_is_lanes_not_accounts(self):
+        text = self.surface()[0].instructions
+        self.assertIn('NOT the number of ChatGPT accounts', text)
+        self.assertIn('balances across logins', text)
+
+    def test_batch_and_multi_poll_are_exposed_as_tools(self):
+        names = {tool.name for tool in self.surface()[1]}
+        self.assertIn('image_generate_batch', names)
+        poll = [tool for tool in self.surface()[1] if tool.name == 'image_poll'][0]
+        self.assertIn('job_ids', poll.inputSchema['properties'])
+        self.assertIn('return_when', poll.inputSchema['properties'])
+
+    def test_generate_tool_points_at_count_for_alternates(self):
+        generate = [tool for tool in self.surface()[1] if tool.name == 'image_generate'][0]
+        self.assertIn('count=N', generate.description)
+        self.assertIn('one slide', generate.description)
 
 
 class PollCadence(fixtures.QueueContracts):
