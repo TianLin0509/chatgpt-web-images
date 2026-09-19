@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1
+
+- Compare conversation identity independently of browser layout. innerText reports what a reader sees, so a soft wrap inside a hyphenated word returned `On- Device` for a prompt that said `On-Device`, and that one invisible space made a finished job look like a foreign conversation for hours. Identity now also matches with whitespace removed, which still compares the whole prompt.
+- Record both the exact and the layout-independent identity when a job starts, and use the same comparison for polling and for cancelling.
+
 ## 0.6.0
 
 - Rewrite the MCP instructions so the surface itself teaches parallelism: concurrency is lanes rather than accounts, alternates of one prompt belong in one `count=N` request, different prompts belong in one `image_generate_batch` call, and callers must submit everything before polling anything.

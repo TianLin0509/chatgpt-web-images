@@ -37,7 +37,7 @@ BATCH_HINT_SIBLINGS = 3
 MAX_LANES = 16
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.6.0'
+VERSION = '0.6.1'
 
 
 @contextlib.contextmanager

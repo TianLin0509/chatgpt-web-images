@@ -537,6 +537,70 @@ class McpTeachesParallelism(unittest.TestCase):
         self.assertIn('one slide', generate.description)
 
 
+class IdentityUnderReflow(contracts.Contracts):
+    """A finished job must not look foreign because the browser wrapped a line."""
+
+    # Real capture from the primary lane, 2026-09-19: the prompt ended with
+    # 'On-Device', the word landed at the end of a rendered line, and innerText
+    # returned 'On- Device'. One invisible space stalled a completed job for hours.
+    SENT = 'Gemini Robotics On-Device\n页脚：来源：产品官方资料。'
+    REFLOWED = 'Gemini Robotics On- Device\n页脚：来源：产品官方资料。'
+
+    def wrapped(self):
+        job = self.job()
+        job.update(created_at=time.time(), conversation_url='https://chatgpt.com/c/abc-def',
+                   identity_hash=runtime.prompt_hash(self.SENT),
+                   identity_loose=runtime.loose_hash(self.SENT))
+        runtime.save_job(job)
+        return job
+
+    def snapshot(self, user_text):
+        return {'user_count': 1, 'user_text': user_text, 'url': 'https://chatgpt.com/c/abc-def',
+                'stop': False, 'pending_images': 0, 'text': 'Worked for 1m 34s', 'images': []}
+
+    def test_a_soft_wrapped_hyphen_is_not_a_different_conversation(self):
+        job = self.wrapped()
+        with patch.object(runtime, 'ensure_browser', return_value={'url': 'https://chatgpt.com/c/abc-def'}), \
+             patch.object(runtime, 'cli'), patch.object(runtime, 'run_js', return_value=self.snapshot(self.REFLOWED)):
+            result = runtime.safe_call(runtime.poll, job_id=job['job_id'])
+        self.assertTrue(result['ok'])
+        self.assertNotIn('identity_retry', json.loads(runtime.job_path(job['job_id']).read_text(encoding='utf-8')))
+
+    def test_reflow_tolerance_still_rejects_a_different_prompt(self):
+        job = self.wrapped()
+        foreign = self.snapshot('An entirely unrelated request about cats.')
+        with patch.object(runtime, 'ensure_browser', return_value={'url': 'https://chatgpt.com/c/abc-def'}), \
+             patch.object(runtime, 'cli'), patch.object(runtime, 'run_js', return_value=foreign):
+            for _ in range(runtime.IDENTITY_RETRIES):
+                runtime.safe_call(runtime.poll, job_id=job['job_id'])
+            result = runtime.safe_call(runtime.poll, job_id=job['job_id'])
+        self.assertEqual(result['error']['code'], 'conversation_changed')
+
+    def test_cancel_also_tolerates_reflow(self):
+        job = self.wrapped()
+        with patch.object(runtime, 'ensure_browser'), \
+             patch.object(runtime, 'run_js', return_value=self.snapshot(self.REFLOWED)):
+            result = runtime.safe_call(runtime.cancel, job_id=job['job_id'])
+        self.assertEqual(result['status'], 'cancelled')
+
+    def test_line_break_differences_do_not_break_identity(self):
+        job = self.wrapped()
+        squashed = self.snapshot(self.SENT.replace('\n', '  '))
+        with patch.object(runtime, 'ensure_browser', return_value={'url': 'https://chatgpt.com/c/abc-def'}), \
+             patch.object(runtime, 'cli'), patch.object(runtime, 'run_js', return_value=squashed):
+            result = runtime.safe_call(runtime.poll, job_id=job['job_id'])
+        self.assertTrue(result['ok'])
+
+    def test_a_started_job_records_both_identities(self):
+        with patch.object(runtime, 'ensure_browser'), patch.object(runtime, 'cli'), \
+             patch.object(runtime, 'set_visible', return_value=True), \
+             patch.object(runtime, 'run_js', side_effect=[True, True, True, {'url': 'https://chatgpt.com/c/abc-def'}]):
+            started = runtime.start(prompt=self.SENT, output_dir=str(self.data))
+        stored = json.loads(runtime.job_path(started['job_id']).read_text(encoding='utf-8'))
+        self.assertEqual(stored['identity_loose'], runtime.loose_hash(self.SENT))
+        self.assertNotEqual(stored['identity_loose'], stored['identity_hash'])
+
+
 class PollCadence(fixtures.QueueContracts):
     def test_tick_slows_down_only_while_generation_cannot_change(self):
         self.submit('slow', 'primary')

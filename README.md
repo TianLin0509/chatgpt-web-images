@@ -1,4 +1,4 @@
-# ChatGPT Web Images 0.6.0
+# ChatGPT Web Images 0.6.1
 
 ## 最大化并行：MCP 说明直接把规则讲出来（0.6.0）
 
