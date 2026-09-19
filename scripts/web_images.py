@@ -1,4 +1,4 @@
-﻿"""ChatGPT web images: isolated Playwright CLI session, text-only MCP results."""
+"""ChatGPT web images: isolated Playwright CLI session, text-only MCP results."""
 from __future__ import annotations
 
 import argparse
@@ -217,7 +217,7 @@ def ensure_browser(*, require_login=True, account_name=None):
         cli(['goto', 'https://chatgpt.com/'])
         run_js('''async page => {
           await page.waitForFunction(() => !!document.querySelector('#prompt-textarea, [data-testid="accounts-profile-button"]') ||
-            /Log in|Sign up|ç™»å½•|æ³¨å†Œ|Just a moment/i.test((document.body?.innerText||'')+' '+document.title), null, {timeout:20000});
+            /Log in|Sign up|登录|注册|Just a moment/i.test((document.body?.innerText||'')+' '+document.title), null, {timeout:20000});
           return true;
         }''')
         state = run_js(STATUS_JS)
@@ -413,11 +413,11 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
     refs = validated['reference_images']
     original_hash=hashlib.sha256(prompt.encode('utf-8')).hexdigest()
     if count>1:
-        prompt += (f'\n\n[å›¾ç‰‡äº¤ä»˜æ•°é‡è¦æ±‚]\næœ¬æ¬¡è¯·æ±‚éœ€è¦ {count} å¼ ç‹¬ç«‹ç”Ÿæˆçš„å›¾ç‰‡ï¼Œ'
-                   f'è¯·åœ¨æœ¬æ¡è¯·æ±‚ä¸­å®Œæˆå…¨éƒ¨ {count} å¼ ï¼Œæ¯å¼ ä½œä¸ºç‹¬ç«‹å›¾ç‰‡é™„ä»¶äº¤ä»˜ã€‚'
-                   'ä¸è¦æŠŠå¤šå¼ æŽ’æˆä¸€å¼ æ‹¼å›¾ã€è”ç³»è¡¨æˆ–å¤šå®«æ ¼ï¼›ä¸è¦ç”¨è£åˆ‡ä¸€å¼ å¤§å›¾ä»£æ›¿ç‹¬ç«‹å›¾ç‰‡ã€‚'
-                   'å¦‚æžœä¸Šæ–‡åˆ†é¡¹åˆ—å‡ºäº†å†…å®¹ï¼Œè¯·æŒ‰é¡ºåºé€å¼ ç”Ÿæˆï¼›å¦‚æžœæè¿°çš„æ˜¯åŒä¸€ä¸»é¢˜ï¼Œè¯·ç”Ÿæˆæ˜Žæ˜¾ä¸åŒçš„æž„å›¾æ–¹æ¡ˆã€‚'
-                   'è¯·ç›´æŽ¥åˆ¶ä½œå›¾ç‰‡ï¼Œä¸è¦åªç»™æ–‡å­—æ–¹æ¡ˆã€‚å¦‚æžœæ— æ³•å®ŒæˆæŒ‡å®šæ•°é‡ï¼Œè¯·å¦‚å®žè¯´æ˜Žå®žé™…æ•°é‡ã€‚')
+        prompt += (f'\n\n[图片交付数量要求]\n本次请求需要 {count} 张独立生成的图片，'
+                   f'请在本条请求中完成全部 {count} 张，每张作为独立图片附件交付。'
+                   '不要把多张排成一张拼图、联系表或多宫格；不要用裁切一张大图代替独立图片。'
+                   '如果上文分项列出了内容，请按顺序逐张生成；如果描述的是同一主题，请生成明显不同的构图方案。'
+                   '请直接制作图片，不要只给文字方案。如果无法完成指定数量，请如实说明实际数量。')
     with locked():
         if request_id:
             previous_path=DATA/'requests'/(request_id+'.json')
@@ -465,7 +465,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
               // The sidebar can contain a chat also titled 'Create image'.
               // Only the open composer action group/menu is a valid tool entry.
               const tool=page.locator('[role="menu"], [role="group"]')
-                .getByText(/^(Create image|Create images|åˆ›å»ºå›¾ç‰‡|åˆ›å»ºå›¾åƒ|ç”Ÿæˆå›¾ç‰‡)$/);
+                .getByText(/^(Create image|Create images|创建图片|创建图像|生成图片)$/);
               try { await tool.click({timeout:15000}); }
               catch(e) { throw new Error('IMAGE_TOOL_UNAVAILABLE: '+e.name); }
               await page.locator('#prompt-textarea [data-inline-selection-pill][data-system-hint-type="picture_v2"]').waitFor({state:'attached',timeout:10000});
@@ -522,7 +522,7 @@ function ownedImages() {
  const user=users.at(-1);
  if(!user)return [];
  const seen=new Set(), assets=[];
- const selector='[data-testid^="conversation-turn-"] img[alt^="Generated image"], [data-testid^="conversation-turn-"] img[alt^="ç”Ÿæˆçš„å›¾ç‰‡"]';
+ const selector='[data-testid^="conversation-turn-"] img[alt^="Generated image"], [data-testid^="conversation-turn-"] img[alt^="生成的图片"]';
  for(const node of document.querySelectorAll(selector)) {
    if(!(user.compareDocumentPosition(node)&Node.DOCUMENT_POSITION_FOLLOWING))continue;
    const source=node.currentSrc||node.src;
@@ -559,7 +559,14 @@ POLL_JS = r'''async page => {
    }
    const turns=Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"]'));
    const assets=ownedImages();
+   // A turn only grows its action footer once it is finished. copy-turn-action-button
+   // is present on both image replies and text replies, so it is the shared signal.
+   // Containment, not order, is what distinguishes 'the user's own turn is last'.
+   const lastTurn=turns.at(-1);
+   const turnComplete=!!lastTurn&&!!lastTurn.querySelector('[data-testid="copy-turn-action-button"]')
+     &&!!lastUser&&!!(lastUser.compareDocumentPosition(lastTurn)&Node.DOCUMENT_POSITION_FOLLOWING);
    return {url:location.href,stop:!!document.querySelector('[data-testid="stop-button"]'),
+     turn_complete:turnComplete,
      images:assets.filter(a=>a.ready).map(({node,...a})=>a),
      pending_images:assets.filter(a=>!a.ready).length,
      text:(turns.at(-1)?.innerText||'').slice(-1600),user_count:users.length,user_text:userText};
@@ -567,9 +574,9 @@ POLL_JS = r'''async page => {
 }'''.replace('__DOM__',DOM_IMAGES_JS)
 
 DOWNLOAD_JS = r'''async page => {
- const dialog=page.getByRole('dialog').filter({has:page.getByRole('button',{name:/^Save$|^ä¿å­˜$/})});
+ const dialog=page.getByRole('dialog').filter({has:page.getByRole('button',{name:/^Save$|^保存$/})});
  if(await dialog.count()) {
-   await dialog.getByRole('button',{name:/^Close$|^Close fullscreen view$|^å…³é—­$|^å…³é—­å…¨å±è§†å›¾$/}).click({timeout:10000});
+   await dialog.getByRole('button',{name:/^Close$|^Close fullscreen view$|^关闭$|^关闭全屏视图$/}).click({timeout:10000});
    await dialog.waitFor({state:'hidden',timeout:10000});
  }
  const key=__KEY__;
@@ -600,8 +607,8 @@ DOWNLOAD_JS = r'''async page => {
  const download=await Promise.all([
    downloadPromise,
    (async()=>{
-     await dialog.getByRole('button',{name:/^Save$|^ä¿å­˜$/}).click({timeout:10000});
-     const single=page.getByRole('menuitem',{name:/^Download image$|^ä¸‹è½½å›¾ç‰‡$/});
+     await dialog.getByRole('button',{name:/^Save$|^保存$/}).click({timeout:10000});
+     const single=page.getByRole('menuitem',{name:/^Download image$|^下载图片$/});
      const menu=await Promise.race([
        downloadPromise.then(()=>null),
        single.waitFor({state:'visible',timeout:10000}).then(()=>single)
@@ -726,11 +733,16 @@ def poll(job_id):
             if time.time()-job.get('wait_started_at',job['created_at'])>900:
                 job['status']='needs_attention'
                 job['error']={'code':'generation_wait_exceeded','message':'Generation has not settled after 15 minutes. Inspect the existing conversation; the prompt has not been resent.'}
-            if not result['stop'] and result['user_count'] and re.search(
-                r"unable to generate|couldn.t generate|can.t generate|image generation limit|too many requests|æ— æ³•ç”Ÿæˆ|è¾¾åˆ°.*ä¸Šé™",
-                result['text'],re.I) and not assets and not pending:
+            if (not result['stop'] and result['user_count'] and not assets and not pending
+                    and result.get('turn_complete')):
+                # ChatGPT finished answering and produced no image. Waiting the full
+                # observation budget here taught the caller nothing; its own words are
+                # the useful reply, so hand them over and let the caller adjust.
+                refused=re.search(r"unable to generate|couldn.t generate|can.t generate|image generation limit|"
+                                  r"too many requests|无法生成|不能生成|达到.*上限", result['text'], re.I)
                 job['status']='failed'
-                job['error']={'code':'generation_failed','message':result['text'][:800]}
+                job['error']={'code':'generation_failed' if refused else 'no_image_in_reply',
+                              'message':result['text'][:800]}
                 (DATA/'active.json').unlink(missing_ok=True)
             save_job(job)
             return public_job(job)

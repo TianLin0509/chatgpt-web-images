@@ -35,6 +35,18 @@ BATCH_HINT_SIBLINGS = 3
 # Every lane is a full browser profile (~0.6 GB resident), so the cap is about the
 # machine, not about ChatGPT. Raising it without free memory only causes swapping.
 MAX_LANES = 16
+# Who can actually act on a failure. An agent that cannot tell 'rewrite your prompt'
+# from 'a human must log in' either gives up too early or retries something hopeless.
+ACTIONABLE = {
+    'no_image_in_reply': 'agent', 'generation_failed': 'agent', 'image_count_mismatch': 'agent',
+    'reference_changed': 'agent', 'request_id_conflict': 'agent', 'invalid_prompt': 'agent',
+    'browser_timeout': 'retry', 'browser_operation_failed': 'retry', 'browser_not_open': 'retry',
+    'browser_closed': 'retry', 'busy': 'retry', 'browser_protocol_error': 'retry',
+    'generation_wait_exceeded': 'retry', 'browser_locator_ambiguous': 'retry',
+    'login_required': 'human', 'browser_challenge': 'human', 'account_selection_required': 'human',
+    'credential_required': 'human', 'image_tool_unavailable': 'human', 'output_exists': 'human',
+    'output_changed': 'human', 'conversation_changed': 'human', 'legacy_job_active': 'human',
+}
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
 VERSION = '0.6.1'
@@ -400,6 +412,7 @@ class Pool:
         result['cancel_requested'] = bool(row['cancel_requested'])
         if row['error']:
             result['error'] = json.loads(row['error'])
+            result['error']['actionable_by'] = ACTIONABLE.get(result['error'].get('code'), 'human')
         result['ok'] = row['status'] not in {'failed', 'preparation_failed', 'partial', 'count_mismatch'}
         result['retryable'] = row['status'] in {'queued', 'dispatching', 'running', PARKED}
         attended = row['status'] == 'needs_attention' or (row['status'] == PARKED and row['park_count'] > len(ADOPT_BACKOFF))

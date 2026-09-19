@@ -601,6 +601,126 @@ class IdentityUnderReflow(contracts.Contracts):
         self.assertNotEqual(stored['identity_loose'], stored['identity_hash'])
 
 
+class AnswerWithoutImage(contracts.Contracts):
+    """A finished reply with no image is an answer the caller can act on, not a wait."""
+
+    def pending_job(self):
+        job = self.job()
+        job.update(created_at=time.time(), requested_count=1, output_dir=str(self.data), name='x',
+                   conversation_url='https://chatgpt.com/c/abc-def',
+                   identity_hash=runtime.prompt_hash('my prompt'),
+                   identity_loose=runtime.loose_hash('my prompt'))
+        runtime.save_job(job)
+        return job
+
+    def reply(self, text, turn_complete=True, images=None, stop=False, pending=0):
+        return {'user_count': 1, 'user_text': 'my prompt', 'url': 'https://chatgpt.com/c/abc-def',
+                'stop': stop, 'pending_images': pending, 'text': text,
+                'turn_complete': turn_complete, 'images': images or []}
+
+    def poll_with(self, job, snapshot):
+        with patch.object(runtime, 'ensure_browser', return_value={'url': 'https://chatgpt.com/c/abc-def'}), \
+             patch.object(runtime, 'cli'), patch.object(runtime, 'run_js', return_value=snapshot):
+            return runtime.safe_call(runtime.poll, job_id=job['job_id'])
+
+    def test_a_finished_reply_without_an_image_fails_at_once(self):
+        job = self.pending_job()
+        result = self.poll_with(job, self.reply('I can help with that, but here is a plan instead.'))
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['error']['code'], 'no_image_in_reply')
+        self.assertIn('plan instead', result['error']['message'])
+        self.assertIsNone(runtime.active_job())
+
+    def test_a_refusal_is_reported_as_a_generation_failure(self):
+        job = self.pending_job()
+        result = self.poll_with(job, self.reply("I'm unable to generate that image."))
+        self.assertEqual(result['error']['code'], 'generation_failed')
+
+    def test_an_unfinished_turn_is_still_waited_for(self):
+        job = self.pending_job()
+        result = self.poll_with(job, self.reply('Thinking', turn_complete=False))
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['status'], 'generating')
+        self.assertIsNotNone(runtime.active_job())
+
+    def test_a_streaming_reply_is_never_called_imageless(self):
+        job = self.pending_job()
+        result = self.poll_with(job, self.reply('Working', turn_complete=True, stop=True))
+        self.assertEqual(result['status'], 'generating')
+
+    def test_images_still_loading_are_not_called_imageless(self):
+        job = self.pending_job()
+        result = self.poll_with(job, self.reply('Done', turn_complete=True, pending=1))
+        self.assertEqual(result['status'], 'generating')
+
+    def test_poll_js_derives_turn_completion_from_the_action_footer(self):
+        # Captured live 2026-09-19: both an image turn and a text turn expose this button
+        # only once the turn has finished, while a streaming turn does not.
+        self.assertIn('copy-turn-action-button', runtime.POLL_JS)
+        self.assertIn('turn_complete', runtime.POLL_JS)
+        self.assertIn('DOCUMENT_POSITION_FOLLOWING', runtime.POLL_JS)
+
+
+class ActionableErrors(fixtures.QueueContracts):
+    """An agent must be able to tell 'rewrite your prompt' from 'a human must log in'."""
+
+    def failed_with(self, code):
+        job = self.submit('err-' + code, 'primary')
+        self.pool.save_result(job['job_id'], {'status': 'failed', 'files': [],
+                                              'error': {'code': code, 'message': 'fixture'}})
+        return self.pool.get(job['job_id'])
+
+    def test_a_refusal_is_marked_for_the_agent(self):
+        for code in ('no_image_in_reply', 'generation_failed', 'image_count_mismatch'):
+            self.assertEqual(self.failed_with(code)['error']['actionable_by'], 'agent', code)
+
+    def test_a_transient_browser_fault_is_marked_retry(self):
+        for code in ('browser_timeout', 'browser_operation_failed', 'busy'):
+            self.assertEqual(self.failed_with(code)['error']['actionable_by'], 'retry', code)
+
+    def test_an_account_problem_is_marked_for_a_human(self):
+        for code in ('login_required', 'browser_challenge', 'conversation_changed'):
+            self.assertEqual(self.failed_with(code)['error']['actionable_by'], 'human', code)
+
+    def test_an_unknown_code_never_claims_the_agent_can_fix_it(self):
+        self.assertEqual(self.failed_with('something_new')['error']['actionable_by'], 'human')
+
+
+class SourceEncoding(unittest.TestCase):
+    """Non-ASCII selectors and prompts must survive every edit of these files.
+
+    PowerShell 5.1 reads with the ANSI code page unless told otherwise, so round-tripping
+    a UTF-8 source file through `Get-Content -Raw` and writing it back as UTF-8 double
+    encodes every Chinese character. The damage is invisible in a diff viewer that renders
+    the mojibake, and it silently breaks the Chinese ChatGPT selectors and the multi-image
+    instruction block. Byte-level assertions are the only reliable detection.
+    """
+
+    SOURCES = ('web_images.py', 'image_pool.py', 'image_worker.py', 'image_service.py', 'chatgpt_account.py')
+    # Sequences that only appear when UTF-8 has been decoded as ANSI and re-encoded.
+    MOJIBAKE = ('Ã§', 'Ã¦', 'Ã¥', 'â', 'Â ')
+
+    def source(self, name):
+        return (Path(__file__).with_name(name)).read_bytes()
+
+    def test_no_source_file_carries_a_byte_order_mark(self):
+        for name in self.SOURCES:
+            self.assertFalse(self.source(name).startswith(b'\xef\xbb\xbf'), name)
+
+    def test_no_source_file_contains_double_encoded_text(self):
+        for name in self.SOURCES:
+            text = self.source(name).decode('utf-8')
+            for marker in self.MOJIBAKE:
+                self.assertNotIn(marker, text, '%s looks double encoded' % name)
+
+    def test_the_chinese_browser_selectors_are_still_readable(self):
+        text = self.source('web_images.py').decode('utf-8')
+        for phrase in ('图片交付数量要求', '生成的图片',
+                       '创建图片', '保存', '下载图片',
+                       '登录', '无法生成'):
+            self.assertIn(phrase, text)
+
+
 class PollCadence(fixtures.QueueContracts):
     def test_tick_slows_down_only_while_generation_cannot_change(self):
         self.submit('slow', 'primary')
