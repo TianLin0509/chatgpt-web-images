@@ -12,11 +12,31 @@ import subprocess
 import sys
 import time
 import uuid
+import asyncio
 
 import web_images as w
 
 TERMINAL = w.TERMINAL | {'cancelled'}
 LIVE = ('dispatching', 'running', 'needs_attention')
+VERSION = '0.3.1'
+
+
+@contextlib.contextmanager
+def launch_lock(path):
+    """Cross-process gate for launch reservations; never waits on another caller."""
+    import msvcrt
+    with Path(path).open('a+b') as handle:
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def pool_root():
@@ -192,9 +212,36 @@ class Pool:
         if row['status'] == 'queued':
             with self.connect() as db:
                 result['queue_position'] = db.execute("SELECT COUNT(*) FROM jobs WHERE status='queued' AND created<=?", (row['created'],)).fetchone()[0]
+            lanes = self.status()['accounts']
+            lanes = [a for a in lanes if row['preferred'] in ('auto', a['id'])]
+            result['blocking_accounts'] = [
+                {k: a[k] for k in ('id', 'state', 'worker_alive', 'worker_stalled', 'active_job_id', 'active_job_status')}
+                for a in lanes if not a['enabled'] or not a['ready'] or not a['worker_alive'] or a['worker_stalled'] or a['active_job_id']]
+            if lanes and all(not a['enabled'] or not a['ready'] or a['worker_stalled'] or
+                             a['active_job_status'] == 'needs_attention' for a in lanes):
+                result['next_action'] = 'inspect_blocking_accounts'
         if detail:
             result['runtime_job_id'] = row['runtime_id']
+        else:
+            result = {k: v for k, v in result.items() if k not in {
+                'conversation_url', 'output_dir', 'prompt_sha256', 'submitted_prompt_sha256',
+                'reference_count', 'window_hidden', '_resume_requested'}}
+            if 'files' in result:
+                result['files'] = [{k: v for k, v in f.items() if k in
+                    {'path', 'width', 'height', 'bytes', 'sha256'}} for f in result['files']]
         return result
+
+    async def poll_async(self, job_id, wait_seconds=0, detail=False):
+        """Sleep in the event loop, not in the shared thread executor."""
+        if type(wait_seconds) is not int or not 0 <= wait_seconds <= 45:
+            raise w.ImageError('invalid_wait', 'wait_seconds must be an integer from 0 to 45.')
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            result = await asyncio.to_thread(self.get, job_id, detail)
+            remaining = deadline - time.monotonic()
+            if result['status'] in TERMINAL | {'needs_attention'} or remaining <= 0:
+                return result
+            await asyncio.sleep(min(0.5, remaining))
 
     def poll(self, job_id, wait_seconds=0, detail=False):
         if type(wait_seconds) is not int or not 0 <= wait_seconds <= 45:
@@ -224,7 +271,10 @@ class Pool:
                 raise w.ImageError('not_paused', 'Resume only a needs_attention job after inspecting its account.')
             # Never move an uncertain submission to another account or allocate a new request ID.
             state = 'running' if row['runtime_id'] else 'dispatching'
-            db.execute('UPDATE jobs SET status=?,failures=0,error=NULL,updated=? WHERE id=?', (state, time.time(), job_id))
+            result = json.loads(row['result'] or '{}')
+            result['_resume_requested'] = True
+            db.execute('UPDATE jobs SET status=?,failures=0,error=NULL,result=?,updated=? WHERE id=?',
+                       (state, json.dumps(result), time.time(), job_id))
         return self.get(job_id)
 
     def claim(self, account_id):
@@ -263,8 +313,9 @@ class Pool:
             row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
             failures = row['failures'] + 1
             pause = failures >= 3 or error['code'] in {'conversation_changed', 'job_not_active', 'output_changed', 'reference_changed'}
-            db.execute('UPDATE jobs SET failures=?,status=?,error=?,updated=? WHERE id=?',
-                       (failures, 'needs_attention' if pause else row['status'], json.dumps(error), time.time(), job_id))
+            db.execute('UPDATE jobs SET failures=?,status=?,error=?,cancel_requested=?,updated=? WHERE id=?',
+                       (failures, 'needs_attention' if pause else row['status'], json.dumps(error),
+                        0 if pause else row['cancel_requested'], time.time(), job_id))
 
     def control(self, account_id, action, **args):
         self.account(account_id)
@@ -272,9 +323,19 @@ class Pool:
             raise w.ImageError('invalid_action', 'Unsupported account action.')
         control_id = uuid.uuid4().hex
         now = time.time()
-        with self.connect() as db:
+        encoded = json.dumps(args, sort_keys=True)
+        with self.transaction() as db:
+            if action == 'select' and db.execute(
+                "SELECT 1 FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')", (account_id,)).fetchone():
+                raise w.ImageError('account_busy', 'An existing job owns this account. Do not switch its login identity.')
+            old = db.execute("SELECT id,status FROM controls WHERE account_id=? AND action=? AND args=? AND status IN ('queued','running') ORDER BY created LIMIT 1",
+                             (account_id, action, encoded)).fetchone()
+            if old:
+                return {'ok': True, 'account_id': account_id, 'control_id': old['id'],
+                        'status': old['status'], 'reused_control': True,
+                        'next_action': 'image_status_for_control_result'}
             db.execute('INSERT INTO controls(id,account_id,action,args,status,created,updated) VALUES(?,?,?,?,?,?,?)',
-                       (control_id, account_id, action, json.dumps(args), 'queued', now, now))
+                       (control_id, account_id, action, encoded, 'queued', now, now))
         return {'ok': True, 'account_id': account_id, 'control_id': control_id, 'status': 'queued',
                 'next_action': 'image_status_for_control_result'}
 
@@ -284,6 +345,11 @@ class Pool:
             for row in db.execute('SELECT * FROM accounts ORDER BY id'):
                 account = {k: row[k] for k in ('id','enabled','ready','state','heartbeat','updated')}
                 account['worker_alive'] = time.time() - row['heartbeat'] < 20
+                health = self.worker_health(row['id'])
+                account['worker_version'] = health.get('version', 'unknown')
+                account['worker_stalled'] = bool(account['worker_alive'] and health.get('pid') == row['pid'] and
+                    health.get('tick_started', 0) > health.get('tick_finished', 0) and
+                    time.time() - health['tick_started'] > 300)
                 if row['error']:
                     account['error'] = json.loads(row['error'])
                 active = db.execute("SELECT id,status FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')", (row['id'],)).fetchone()
@@ -295,24 +361,42 @@ class Pool:
                     account['last_control']['result'] = json.loads(control['result'] or '{}')
                 accounts.append(account)
             counts = {r['status']: r['n'] for r in db.execute('SELECT status,COUNT(*) n FROM jobs GROUP BY status')}
-        return {'ok': True, 'service': 'local-durable-pool', 'accounts': accounts, 'jobs': counts,
+        return {'ok': True, 'service': 'local-durable-pool', 'version': VERSION, 'accounts': accounts, 'jobs': counts,
                 'configured_capacity': sum(bool(a['enabled']) for a in accounts),
-                'parallel_capacity': sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and a['active_job_status'] != 'needs_attention') for a in accounts)}
+                'parallel_capacity': sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and not a['worker_stalled'] and a['active_job_status'] != 'needs_attention') for a in accounts)}
+
+    def worker_health(self, account_id):
+        try:
+            return json.loads((self.root / ('worker-' + account_id + '-health.json')).read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            return {'error': 'worker_health_unreadable'}
 
     def ensure_workers(self):
         failures = []
         with self.connect() as db:
             accounts = [dict(r) for r in db.execute('SELECT * FROM accounts')]
         for account in accounts:
-            if time.time() - account['heartbeat'] < 20:
+            if (self.root / ('stop-' + account['id'])).exists() or time.time() - account['heartbeat'] < 20:
                 continue
             env = account_env(account, self.root)
             try:
-                with (self.root / ('worker-' + account['id'] + '.log')).open('ab') as log:
-                    subprocess.Popen([sys.executable, str(Path(__file__).with_name('image_worker.py')), account['id']],
+                with launch_lock(self.root / ('launch-' + account['id'] + '.lock')) as acquired:
+                    if not acquired:
+                        continue
+                    reservation = self.root / ('launch-' + account['id'] + '.json')
+                    if reservation.exists() and time.time() - reservation.stat().st_mtime < 20:
+                        continue
+                    # Re-read after acquiring the gate; another client may have just started it.
+                    if time.time() - self.account(account['id'])['heartbeat'] < 20:
+                        continue
+                    with (self.root / ('worker-' + account['id'] + '.log')).open('ab') as log:
+                        child = subprocess.Popen([sys.executable, str(Path(__file__).with_name('image_worker.py')), account['id']],
                                      env=env, cwd=self.root, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                      creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS) if os.name == 'nt' else 0,
                                      close_fds=True)
+                    w.write_json(reservation, {'pid': child.pid, 'started': time.time(), 'version': VERSION})
             except OSError as exc:
                 failures.append({'account_id': account['id'], 'code': 'worker_start_failed', 'type': type(exc).__name__})
         return failures

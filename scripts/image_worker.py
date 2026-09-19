@@ -10,7 +10,7 @@ import threading
 import time
 
 import web_images as w
-from image_pool import Pool, TERMINAL
+from image_pool import Pool, TERMINAL, VERSION
 
 
 @contextlib.contextmanager
@@ -39,6 +39,20 @@ class Worker:
     def __init__(self, pool, account_id, runtime=w):
         self.pool, self.account_id, self.runtime = pool, account_id, runtime
         self.last_check = 0
+        self.control_turn = True
+
+    def record_result(self, job_id, result, runtime_id=None):
+        previous = self.pool.row(job_id)
+        self.pool.save_result(job_id, result, runtime_id)
+        phase = result.get('status')
+        if phase in {'preparation_failed', 'failed'}:
+            self.pool.account_state(self.account_id, 'browser_unhealthy', False, result.get('error'))
+        elif phase in {'complete', 'partial', 'count_mismatch', 'cancelled'}:
+            self.pool.account_state(self.account_id, 'authenticated', True)
+        if json.loads(previous['result'] or '{}').get('status') != phase:
+            print(json.dumps({'event': 'job_phase', 'job_id': job_id, 'account_id': self.account_id,
+                              'phase': phase, 'operation_stage': result.get('operation_stage'),
+                              'error_code': (result.get('error') or {}).get('code')}), flush=True)
 
     def controls(self):
         with self.pool.transaction() as db:
@@ -48,6 +62,10 @@ class Worker:
             db.execute("UPDATE controls SET status='running',updated=? WHERE id=?", (time.time(), row['id']))
         try:
             args = json.loads(row['args'])
+            if row['action'] == 'select':
+                with self.pool.connect() as db:
+                    if db.execute("SELECT 1 FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')", (self.account_id,)).fetchone():
+                        raise w.ImageError('account_busy', 'An existing job owns this account; login identity cannot be switched.')
             fn = {'open': self.runtime.open_browser, 'check': self.runtime.status, 'select': self.runtime.select_account}[row['action']]
             result = fn(**args)
             # Browser URLs and title are unnecessary in the shared status surface.
@@ -57,7 +75,8 @@ class Worker:
             state = 'complete'
         except Exception as exc:
             safe = {'ok': False, 'error': error_value(exc)}
-            self.pool.account_state(self.account_id, 'needs_attention', False, safe['error'])
+            if safe['error']['code'] != 'account_busy':
+                self.pool.account_state(self.account_id, 'needs_attention', False, safe['error'])
             state = 'failed'
         with self.pool.connect() as db:
             db.execute('UPDATE controls SET status=?,result=?,updated=? WHERE id=?', (state, json.dumps(safe), time.time(), row['id']))
@@ -65,12 +84,14 @@ class Worker:
         return True
 
     def tick(self):
-        if self.controls():
+        if self.control_turn and self.controls():
+            self.control_turn = False
             return
+        self.control_turn = True
         account = self.pool.account(self.account_id)
         if not account['ready'] and time.monotonic() - self.last_check >= 30:
             # Disabled accounts are touched only when the user asks to open/check them.
-            if account['enabled']:
+            if account['enabled'] and account['state'] not in {'browser_unhealthy', 'worker_error'}:
                 self.pool.control(self.account_id, 'check')
             self.last_check = time.monotonic()
             return
@@ -96,10 +117,17 @@ class Worker:
                     result = self.runtime.cancel(runtime_id)
                 else:
                     result = {'status': 'cancelled', 'files': []}
-                self.pool.save_result(job['id'], result, runtime_id)
+                self.record_result(job['id'], result, runtime_id)
                 return
             if job['status'] == 'dispatching':
                 payload = json.loads(job['payload'])
+                index = self.runtime.DATA / 'requests' / (payload['request_id'] + '.json')
+                if index.exists() and hasattr(self.runtime, 'recover_existing'):
+                    # The browser may already have received this request. Do not require
+                    # the original reference files just to recover its existing identity.
+                    result = self.runtime.recover_existing(payload['request_id'])
+                    self.record_result(job['id'], result, result['job_id'])
+                    return
                 # Revalidate reference bytes at execution time, unless a durable runtime request already exists.
                 _, digest = self.runtime.validate_request(**payload)
                 import hashlib
@@ -108,15 +136,19 @@ class Worker:
                 if digest != job['request_hash'] and not index.exists():
                     raise w.ImageError('reference_changed', 'Reference content changed while queued; restore it or cancel this job explicitly.')
                 result = self.runtime.start(**payload)
-                self.pool.save_result(job['id'], result, result['job_id'])
+                self.record_result(job['id'], result, result['job_id'])
             else:
+                prior = json.loads(job['result'] or '{}')
+                if prior.get('_resume_requested') and hasattr(self.runtime, 'resume_existing'):
+                    result = self.runtime.resume_existing(job['runtime_id'])
+                    self.pool.save_result(job['id'], result)
                 result = self.runtime.poll(job['runtime_id'])
-                self.pool.save_result(job['id'], result)
-            if result.get('status') in TERMINAL:
-                self.pool.account_state(self.account_id, 'authenticated', True)
+                self.record_result(job['id'], result)
         except Exception as exc:
             error = error_value(exc)
             self.pool.failure(job['id'], error)
+            print(json.dumps({'event': 'job_error', 'job_id': job['id'], 'account_id': self.account_id,
+                              'error_code': error['code']}), flush=True)
             if error['code'] in {'login_required','browser_challenge','account_selection_required','credential_required'}:
                 self.pool.account_state(self.account_id, error['code'], False, error)
 
@@ -145,14 +177,21 @@ def main():
         thread = threading.Thread(target=pulse, daemon=True)
         thread.start()
         worker = Worker(pool, account_id)
+        health = {'version': VERSION, 'pid': os.getpid(), 'tick_started': 0, 'tick_finished': 0}
+        health_path = pool.root / ('worker-' + account_id + '-health.json')
         try:
             while not (pool.root / ('stop-' + account_id)).exists():
                 try:
+                    health['tick_started'] = time.time()
+                    w.write_json(health_path, health)
                     worker.tick()
                 except Exception as exc:
                     error = error_value(exc)
                     print(json.dumps({'event': 'tick_error', 'error': error}), flush=True)
                     pool.account_state(account_id, 'worker_error', False, error)
+                finally:
+                    health['tick_finished'] = time.time()
+                    w.write_json(health_path, health)
                 stop.wait(3)
         finally:
             stop.set()

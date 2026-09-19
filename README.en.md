@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.3
+# ChatGPT Web Images 0.3.1
+
+Reliability update: pending account actions coalesce and alternate with job work; asynchronous MCP waits do not occupy executor threads. Cross-process launch reservations prevent worker startup storms. Browser preparation/generation failures pause account admission until an explicit successful check. Queue results explain blocking accounts, and worker health distinguishes a live heartbeat from an operation stalled for over 300 seconds. Stalled browser operations are reported, not force-killed or resubmitted. Explicit resume renews observation time and refreshes only the verified original conversation; active jobs prevent account switching. Restart workers between operations and reload existing MCP sessions to activate these changes.
 
 Unofficial Windows stdio MCP for your own ChatGPT web accounts. Original files are saved locally; tool results contain text and paths, never image base64. See [the complete setup guide](README.md).
 

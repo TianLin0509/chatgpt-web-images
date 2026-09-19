@@ -14,6 +14,7 @@ description: 使用用户自己的 ChatGPT 网页账号生成图片、制作参�
 5. 保持同一 request_id 和参数；超时重试返回原任务。ID 应含日期、任务或席位标识。不得自动换 ID 或账号重发不确定提交。
 6. `image_poll(job_id, wait_seconds=20)` 等待结果。后台自主执行、下载、收尾，agent 断开仍会继续。无需额外 shell 循环、高频 status 或自建后台任务。phase 是浏览器实际阶段。查询自己的任务，不接管其他人的任务。
 7. needs_attention 表示暂停核查并保留原账号和请求身份。按错误检查账号，必要时 image_open；处理后 `image_resume(job_id)` 接续原任务，不换账号重发。仅在用户要求取消时 `image_cancel(job_id)`；活动任务取消为异步请求，确认 cancelled 后才宣称取消成功。
+   queued 时先看 blocking_accounts；browser_unhealthy 需排查后 account_check，不通过反复提交试错。worker_stalled 表示进程仍有心跳但操作停滞，不等于可用。已有活动任务不可切换账号。resume 只恢复观察，不重发；同一超时反复出现时交代阻塞原因，不无限 resume。
 8. 只有请求、观察与下载数量相符才是 complete。partial / count_mismatch / failed 必须如实交代，交付已保存文件。确认本地文件存在并用本地看图工具检查，不把图片 base64 放进工具文字。
 
 内部图片模型未核实，称为“ChatGPT 网页生成”；保留网页模型和思考强度，不自动改用 API 或其他生图工具。尺寸以原图为准。不绕过登录、校验、额度；密码和验证码只由用户在专属浏览器输入。

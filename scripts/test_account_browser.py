@@ -31,6 +31,31 @@ class AccountBrowser(unittest.TestCase):
         from chatgpt_account import STATE_FUNCTION
         return self.page.evaluate(STATE_FUNCTION)
 
+    def test_image_pill_survives_fill_before_selection(self):
+        self.page.set_content('<div id="prompt-textarea" contenteditable="true"><span contenteditable="false" data-inline-selection-pill data-system-hint-type="picture_v2">Create image</span></div>')
+        # Reproduce the old destructive ordering in real Chromium.
+        self.page.locator('#prompt-textarea').fill('A boat')
+        self.assertEqual(self.page.locator('[data-inline-selection-pill]').count(), 0)
+        # New preparation writes the prompt first, then the UI inserts its tool pill.
+        self.page.locator('#prompt-textarea').fill('A boat')
+        self.page.locator('#prompt-textarea').evaluate("n=>{const pill=document.createElement('span');pill.contentEditable='false';pill.setAttribute('data-inline-selection-pill','');pill.setAttribute('data-system-hint-type','picture_v2');pill.textContent='Create image';n.append(pill)}")
+        self.assertEqual(self.page.locator('[data-inline-selection-pill]').count(), 1)
+        self.assertIn('A boat', self.page.locator('#prompt-textarea').inner_text())
+
+    def test_image_pill_is_excluded_without_stripping_user_words(self):
+        from web_images import POLL_JS, prompt_hash
+        prompt = 'Keep the literal words Create image.\nSecond line.'
+        self.page.set_content('<div data-message-author-role="user"></div>')
+        self.page.locator('[data-message-author-role="user"]').evaluate('''(n,prompt)=>{
+          n.append(document.createTextNode(prompt));
+          const pill=document.createElement('span');pill.setAttribute('data-inline-selection-pill','');
+          pill.setAttribute('data-id','picture_v2');pill.textContent='Create image';n.append(pill);
+          n.append(document.createTextNode(' '));
+        }''',prompt)
+        result=self.page.evaluate('async()=>{const page={evaluate:async fn=>fn()};return ('+POLL_JS+')(page)}')
+        self.assertEqual(prompt_hash(result['user_text']),prompt_hash(prompt))
+        self.assertIn('literal words Create image',result['user_text'])
+
     def test_remembered_name_and_profile_are_not_authenticated(self):
         self.page.set_content('<button data-testid="accounts-profile-button">TIAN LIN</button><div id="prompt-textarea">draft</div><div role="dialog">Welcome back. Choose an account to continue.<button>TIAN LIN</button></div>')
         self.assertFalse(self.state()['logged_in'])

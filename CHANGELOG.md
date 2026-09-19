@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+- Fix account admission after preparation failure, control starvation, repeated account controls, and concurrent worker launch storms.
+- Replace executor-blocking MCP polling with asynchronous waits; expose queue blockers and worker operation health.
+- Preserve durable runtime identity during crash recovery even if original references are no longer available.
+- Renew observation deadlines on explicit resume, without resending; prevent switching an account owned by an active job.
+- Bound cancellation failure retries, respect maintenance stop markers, and restore compact default output.
+- Add isolated regression, runtime recovery and four-client / 96-wait stdio pressure checks.
+- Fill the prompt before selecting the inline image tool and verify its picture_v2 marker before dispatch; return parseable JSON for MCP error results.
+
 ## 0.3.0
 
 - Agent-neutral stdio tools backed by a shared SQLite queue and isolated per-account worker processes.

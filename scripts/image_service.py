@@ -31,7 +31,7 @@ def wake(pool, result):
 
 def create_mcp(pool=None):
     from mcp.server.fastmcp import FastMCP
-    from mcp.server.fastmcp.exceptions import ToolError
+    from mcp.types import CallToolResult, TextContent
     pool = pool or Pool()
     server = FastMCP('chatgpt-web-images', instructions=(
         'Shared persistent local image queue for ALL agents. Submit once with a stable request_id. '
@@ -44,7 +44,7 @@ def create_mcp(pool=None):
     def encoded(result):
         text = json.dumps(result, ensure_ascii=False, separators=(',', ':'))
         if not result.get('ok', True):
-            raise ToolError(text)
+            return CallToolResult(isError=True, content=[TextContent(type='text', text=text)])
         return text
 
     async def call(fn, **kwargs):
@@ -84,13 +84,17 @@ def create_mcp(pool=None):
     async def image_poll(job_id: str, wait_seconds: Annotated[int, Field(strict=True, ge=0, le=45)] = 20,
                          detail: bool = False) -> str:
         """Read or wait for this job only. The background worker saves originals even without polling. No browser operation extends this waiting budget."""
-        def poll_awake():
-            start_errors = pool.ensure_workers()
-            result = pool.poll(job_id, wait_seconds, detail)
+        try:
+            await asyncio.to_thread(pool.row, job_id)
+            start_errors = await asyncio.to_thread(pool.ensure_workers)
+            result = await pool.poll_async(job_id, wait_seconds, detail)
             if start_errors:
                 result['worker_start_errors'] = start_errors
-            return result
-        return await call(poll_awake)
+        except w.ImageError as exc:
+            result = {'ok': False, 'error': {'code': exc.code, 'message': str(exc)}}
+        except Exception as exc:
+            result = {'ok': False, 'error': {'code': 'service_error', 'message': type(exc).__name__}}
+        return encoded(result)
 
     @server.tool(structured_output=False)
     async def image_cancel(job_id: str) -> str:
@@ -147,7 +151,12 @@ def main(argv=None):
             return pool.submit(account_id=args.account_id, prompt=args.prompt, prompt_file=args.prompt_file, output_dir=args.output_dir,
                                name=args.name, reference_images=args.reference, count=args.count, request_id=args.request_id)
         if args.command == 'poll':
-            return pool.poll(args.job_id, args.wait_seconds, args.detail)
+            pool.row(args.job_id)
+            start_errors = pool.ensure_workers()
+            result = pool.poll(args.job_id, args.wait_seconds, args.detail)
+            if start_errors:
+                result['worker_start_errors'] = start_errors
+            return result
         return (pool.cancel if args.command == 'cancel' else pool.resume)(args.job_id)
     result = invoke(execute)
     if result.get('ok'):

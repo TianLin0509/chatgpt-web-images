@@ -110,6 +110,7 @@ async def check():
                 checks.append('new client retrieves durable text-only result')
                 bad = await resumed.call_tool('image_poll', {'job_id': 'unknown'})
                 assert bad.isError and 'job_not_found' in bad.content[0].text
+                assert json.loads(bad.content[0].text)['error']['code'] == 'job_not_found'
                 checks.append('unknown job errors preserved through stdio')
         finally:
             (pool.root / 'fixture-stop').touch()

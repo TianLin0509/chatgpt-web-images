@@ -19,7 +19,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.3.0'
+VERSION = '0.3.1'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -114,6 +114,10 @@ def cli(args, timeout=55):
             code = 'browser_not_open'
         elif 'strict mode violation' in message:
             code = 'browser_locator_ambiguous'
+        elif 'Target page, context or browser has been closed' in message or 'Target closed' in message:
+            code = 'browser_closed'
+        elif 'IMAGE_TOOL_UNAVAILABLE' in message:
+            code = 'image_tool_unavailable'
         elif 'Timeout' in message:
             code = 'browser_timeout'
         else:
@@ -230,7 +234,7 @@ def job_path(job_id):
 def public_job(job):
     keys = ['job_id', 'status', 'conversation_url', 'output_dir', 'files', 'error',
             'provider', 'image_model_verified', 'prompt_sha256', 'created_at', 'updated_at',
-            'reference_count', 'window_hidden', 'requested_count', 'observed_count', 'count_match', 'submitted_prompt_sha256']
+            'reference_count', 'window_hidden', 'requested_count', 'observed_count', 'count_match', 'submitted_prompt_sha256', 'operation_stage']
     result={k:job[k] for k in keys if k in job}
     result['requested_count']=job.get('requested_count',1)
     result['downloaded_count']=len(job.get('files',[]))
@@ -242,6 +246,35 @@ def public_job(job):
 def save_job(job):
     job['updated_at'] = time.time()
     write_json(job_path(job['job_id']), job)
+
+
+def recover_existing(request_id):
+    """Observe an existing durable request; never execute prompt preparation or send."""
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', request_id):
+        raise ImageError('invalid_request_id', 'Invalid recovery request ID.')
+    with locked():
+        index = json.loads((DATA/'requests'/(request_id+'.json')).read_text(encoding='utf-8'))
+        job = json.loads(job_path(index['job_id']).read_text(encoding='utf-8'))
+        verify_outputs(job)
+        return public_job(job)
+
+
+def resume_existing(job_id):
+    """Explicitly renew only the observation deadline; keep the same conversation."""
+    with locked():
+        job = json.loads(job_path(job_id).read_text(encoding='utf-8'))
+        if job['status'] in TERMINAL:
+            return public_job(job)
+        active = active_job()
+        if not active or active['job_id'] != job_id:
+            raise ImageError('job_not_active', 'The original job no longer owns this browser.')
+        job['wait_started_at'] = time.time()
+        job['refresh_requested'] = True
+        if job['status'] == 'needs_attention':
+            job['status'] = 'generating'
+        job.pop('error', None)
+        save_job(job)
+        return public_job(job)
 
 
 def validate_request(prompt='', prompt_file='', output_dir='', name='image', reference_images=None, count=1, request_id=''):
@@ -322,36 +355,57 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
         if request_id:
             write_json(previous_path,{'request_hash':request_hash,'job_id':job_id})
         try:
+            job['operation_stage'] = 'new_conversation'
+            save_job(job)
             cli(['goto','https://chatgpt.com/'])
+            job['operation_stage'] = 'wait_composer'
+            save_job(job)
             run_js(r'''async page => {
-              await page.locator('#prompt-textarea').waitFor({timeout:20000});
-              await page.getByTestId('composer-plus-btn').click();
+              await page.locator('#prompt-textarea').waitFor({state:'visible',timeout:45000});
+              await page.getByTestId('composer-plus-btn').waitFor({state:'visible',timeout:5000});
+              return true;
+            }''')
+            job['operation_stage'] = 'fill_prompt'
+            save_job(job)
+            run_js(FILL_PROMPT_JS.replace('__PROMPT__',json.dumps(prompt)))
+            job['operation_stage'] = 'select_image_tool'
+            save_job(job)
+            run_js(r'''async page => {
+              await page.getByTestId('composer-plus-btn').press('Enter',{timeout:10000});
               // The sidebar can contain a chat also titled 'Create image'.
               // Only the open composer action group/menu is a valid tool entry.
-              await page.locator('[role="menu"], [role="group"]')
-                .getByText('Create image',{exact:true}).click();
+              const tool=page.locator('[role="menu"], [role="group"]')
+                .getByText(/^(Create image|Create images|创建图片|创建图像|生成图片)$/);
+              try { await tool.click({timeout:15000}); }
+              catch(e) { throw new Error('IMAGE_TOOL_UNAVAILABLE: '+e.name); }
+              await page.locator('#prompt-textarea [data-inline-selection-pill][data-system-hint-type="picture_v2"]').waitFor({state:'attached',timeout:10000});
               return true;
             }''')
             if refs:
+                job['operation_stage'] = 'upload_references'
+                save_job(job)
                 run_js('''async page => {
                   const input=page.locator('input[type="file"]').first();
                   await input.setInputFiles(''' + json.dumps(refs) + ''');
                   return {uploaded:''' + str(len(refs)) + '''};
                 }''')
             job['status']='submitting'
+            job['operation_stage']='submit_prompt'
             save_job(job)
             result=run_js(r'''async page => {
-              const prompt=__PROMPT__;
               const composer=page.locator('#prompt-textarea');
-              await composer.fill(prompt);
+              // Filling here would erase ChatGPT's inline image-tool selection.
+              if(!await composer.locator('[data-inline-selection-pill][data-system-hint-type="picture_v2"]').count())
+                throw new Error('IMAGE_TOOL_UNAVAILABLE');
               const button=page.getByTestId('send-button');
               await button.waitFor({state:'visible', timeout:20000});
               await button.click({timeout:20000});
               await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
               await page.waitForURL(/^https:\/\/chatgpt\.com\/c\/[a-zA-Z0-9-]+$/, {timeout:20000});
               return {url:page.url()};
-            }'''.replace('__PROMPT__',json.dumps(prompt)))
+            }''')
             job['status']='generating'
+            job['operation_stage']='observe_images'
             job['conversation_url']=result['url']
             job['window_hidden']=set_visible(False)
             save_job(job)
@@ -365,6 +419,12 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
                 (DATA/'active.json').unlink(missing_ok=True)
         return public_job(job)
 
+
+FILL_PROMPT_JS = r'''async page => {
+ const composer=page.locator('#prompt-textarea');
+ await composer.fill(__PROMPT__);
+ return true;
+}'''
 
 DOM_IMAGES_JS = r"""
 function ownedImages() {
@@ -399,12 +459,20 @@ POLL_JS = r'''async page => {
    // Collapsed long messages include a Show more/less button outside the prompt.
    // Read the full content container, never UI labels. Keep exact identity checks.
    const userContent=lastUser?.querySelector('[data-testid="collapsible-user-message-content"]')||lastUser;
+   let userText=userContent?.innerText||'';
+   if(userContent?.querySelector('[data-inline-selection-pill][data-id="picture_v2"]')) {
+     // The image tool is rendered inside the user message but is not prompt text.
+     // Remove only its typed DOM marker, never matching words in the user's text.
+     const copy=userContent.cloneNode(true);
+     copy.querySelectorAll('[data-inline-selection-pill][data-id="picture_v2"]').forEach(n=>n.remove());
+     userText=copy.textContent||'';
+   }
    const turns=Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"]'));
    const assets=ownedImages();
    return {url:location.href,stop:!!document.querySelector('[data-testid="stop-button"]'),
      images:assets.filter(a=>a.ready).map(({node,...a})=>a),
      pending_images:assets.filter(a=>!a.ready).length,
-     text:(turns.at(-1)?.innerText||'').slice(-1600),user_count:users.length,user_text:userContent?.innerText||''};
+     text:(turns.at(-1)?.innerText||'').slice(-1600),user_count:users.length,user_text:userText};
  });
 }'''.replace('__DOM__',DOM_IMAGES_JS)
 
@@ -539,12 +607,19 @@ def poll(job_id):
             raise ImageError('conversation_changed','The browser contains a different prompt; do not download or resend. Open the recorded conversation and poll again.')
         if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',result['url']):
             job['conversation_url']=result['url']
+        if job.pop('refresh_requested', False):
+            # An explicit resume may recover a stale "Thinking" DOM. Refresh only
+            # a conversation whose last user message has just passed identity validation.
+            save_job(job)
+            if result['user_count'] and re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',result['url']):
+                cli(['goto', result['url']])
+                return public_job(job)
         # Deduplicate repeated DOM representations of the same generated asset.
         assets=list({a['key']:a for a in result['images']}.values())
         job['observed_count']=len(assets)
         pending=result.get('pending_images',0)
         if not result['user_count'] or not assets or result['stop'] or pending:
-            if time.time()-job['created_at']>900:
+            if time.time()-job.get('wait_started_at',job['created_at'])>900:
                 job['status']='needs_attention'
                 job['error']={'code':'generation_wait_exceeded','message':'Generation has not settled after 15 minutes. Inspect the existing conversation; the prompt has not been resent.'}
             if not result['stop'] and result['user_count'] and re.search(
