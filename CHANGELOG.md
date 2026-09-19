@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0
+
+- Add conversation continuity: `continue_from=<job_id>` asks the follow-up inside that job's own conversation, so ChatGPT still sees the earlier images and refinements such as "keep the layout, darker palette" behave the way they do for a person.
+- Route a follow-up to the ChatGPT login that owns the conversation rather than to one browser profile. Conversations are account-scoped, so any free lane of that login can serve it; verified against the live site.
+- Serialise writers per conversation so two follow-ups cannot interleave in one thread, while unrelated jobs keep using every other lane.
+- Report a finished reply that produced no image immediately as `no_image_in_reply` (or `generation_failed` for an explicit refusal), carrying ChatGPT's own words, instead of waiting out the fifteen minute observation budget.
+- Classify every error by who can act on it: `actionable_by` is `agent`, `retry` or `human`, and an unrecognised code never claims an agent can fix it.
+- Guard source encoding: no byte order mark, no double-encoded text and readable Chinese selectors, because a PowerShell round trip silently corrupted them once.
+
 ## 0.6.1
 
 - Compare conversation identity independently of browser layout. innerText reports what a reader sees, so a soft wrap inside a hyphenated word returned `On- Device` for a prompt that said `On-Device`, and that one invisible space made a finished job look like a foreign conversation for hours. Identity now also matches with whitespace removed, which still compares the whole prompt.

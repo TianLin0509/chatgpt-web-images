@@ -721,6 +721,155 @@ class SourceEncoding(unittest.TestCase):
             self.assertIn(phrase, text)
 
 
+class Continuity(fixtures.QueueContracts):
+    """A follow-up belongs in the original conversation, on the login that owns it."""
+
+    CONVERSATION = 'https://chatgpt.com/c/6aae7e7e-8b00-83e9-bd27-faf509989850'
+
+    def finished(self, lane='primary', conversation=None, status='complete'):
+        job = self.submit('parent-' + lane, lane)
+        self.pool.claim(lane)
+        self.pool.save_result(job['job_id'], {'status': status, 'files': [],
+                                              'conversation_url': self.CONVERSATION if conversation is None else conversation})
+        return job
+
+    def follow_up(self, parent, key='follow', account='auto'):
+        return self.pool.submit(prompt='Keep the layout, use a darker palette.', request_id=key,
+                                output_dir=str(self.root / 'out'), account_id=account,
+                                continue_from=parent['job_id'])
+
+    def payload(self, job):
+        import json as _json
+        return _json.loads(self.pool.row(job['job_id'])['payload'])
+
+    def test_a_follow_up_carries_the_parent_conversation(self):
+        child = self.follow_up(self.finished())
+        self.assertEqual(self.payload(child)['conversation_url'], self.CONVERSATION)
+        self.assertTrue(child['continues_conversation'])
+
+    def test_a_follow_up_is_pinned_to_the_login_that_owns_the_conversation(self):
+        child = self.follow_up(self.finished('secondary'))
+        self.assertEqual(self.pool.row(child['job_id'])['preferred'], 'secondary')
+
+    def test_any_lane_of_that_login_may_run_the_follow_up(self):
+        # Conversations are account-scoped, not profile-scoped: proven on the live site.
+        auth = Path(self.pool.account('primary')['data_dir']) / 'auth-state.json'
+        auth.parent.mkdir(parents=True, exist_ok=True)
+        auth.write_text('{"cookies":[]}', encoding='utf-8')
+        lanes = self.pool.scale_account('primary', 2)['lanes']
+        for lane in lanes:
+            self.pool.account_state(lane, 'authenticated', True)
+            self.runtimes.setdefault(lane, fixtures.FakeRuntime(self.pool.account(lane)['data_dir']))
+        parent = self.finished('primary')
+        self.pool.save_result(parent['job_id'], {'status': 'complete', 'files': [],
+                                                 'conversation_url': self.CONVERSATION})
+        child = self.follow_up(parent)
+        claimed = self.pool.claim(lanes[1])
+        self.assertEqual(claimed['id'], child['job_id'])
+
+    def test_a_conversation_takes_one_writer_at_a_time(self):
+        parent = self.finished()
+        first = self.follow_up(parent, 'follow-a')
+        second = self.follow_up(parent, 'follow-b')
+        self.pool.claim('primary')
+        self.assertEqual(self.pool.row(first['job_id'])['status'], 'dispatching')
+        self.assertIsNone(self.pool.claim('secondary'))
+        self.assertEqual(self.pool.row(second['job_id'])['status'], 'queued')
+
+    def test_an_unrelated_job_is_not_blocked_by_a_busy_thread(self):
+        parent = self.finished()
+        self.follow_up(parent, 'follow-a')
+        other = self.submit('unrelated', 'auto')
+        self.pool.claim('primary')
+        claimed = self.pool.claim('secondary')
+        self.assertEqual(claimed['id'], other['job_id'])
+
+    def test_continuing_a_job_without_a_conversation_is_refused(self):
+        parent = self.finished(conversation='')
+        with self.assertRaises(w.ImageError) as caught:
+            self.follow_up(parent)
+        self.assertEqual(caught.exception.code, 'continue_without_conversation')
+
+    def test_continuing_a_job_that_is_still_running_is_refused(self):
+        parent = self.finished(status='generating')
+        with self.assertRaises(w.ImageError) as caught:
+            self.follow_up(parent)
+        self.assertEqual(caught.exception.code, 'continue_while_active')
+
+    def test_pinning_the_wrong_login_for_a_conversation_is_refused(self):
+        parent = self.finished('primary')
+        with self.assertRaises(w.ImageError) as caught:
+            self.follow_up(parent, account='secondary')
+        self.assertEqual(caught.exception.code, 'continue_wrong_account')
+
+    def test_an_unknown_parent_is_refused(self):
+        with self.assertRaises(w.ImageError) as caught:
+            self.pool.submit(prompt='x', request_id='orphan', output_dir=str(self.root / 'out'),
+                             continue_from='20260101-deadbeefdead')
+        self.assertEqual(caught.exception.code, 'job_not_found')
+
+    def test_the_same_prompt_in_two_conversations_is_two_requests(self):
+        one = self.finished('primary')
+        two = self.finished('secondary', conversation='https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd')
+        a = self.follow_up(one, 'shared-key')
+        with self.assertRaises(w.ImageError) as caught:
+            self.follow_up(two, 'shared-key')
+        self.assertEqual(caught.exception.code, 'request_id_conflict')
+        self.assertTrue(a['continues_conversation'])
+
+
+class ContinuityRuntime(contracts.Contracts):
+    """start() must join the recorded conversation rather than open a new chat."""
+
+    CONVERSATION = 'https://chatgpt.com/c/6aae7e7e-8b00-83e9-bd27-faf509989850'
+
+    def run_start(self, conversation_url):
+        # The composer wait now also returns how many user messages are already there.
+        script = []
+
+        def js(source, **kwargs):
+            script.append(source)
+            if 'composer-plus-btn' in source and 'waitFor' in source:
+                return 2 if conversation_url else 0
+            if 'send-button' in source:
+                return {'url': conversation_url or 'https://chatgpt.com/c/new-one'}
+            return True
+
+        with patch.object(runtime, 'ensure_browser'), patch.object(runtime, 'cli') as browser, \
+             patch.object(runtime, 'set_visible', return_value=True), \
+             patch.object(runtime, 'run_js', side_effect=js):
+            result = runtime.start(prompt='darker palette', output_dir=str(self.data),
+                                   conversation_url=conversation_url)
+        return result, script, [list(call.args[0]) for call in browser.call_args_list]
+
+    def test_a_follow_up_navigates_to_the_recorded_conversation(self):
+        result, _, calls = self.run_start(self.CONVERSATION)
+        self.assertIn(['goto', self.CONVERSATION], calls)
+        self.assertEqual(result['conversation_url'], self.CONVERSATION)
+        self.assertEqual(result['status'], 'generating')
+
+    def test_a_fresh_request_still_opens_a_new_chat(self):
+        _, _, calls = self.run_start('')
+        self.assertIn(['goto', 'https://chatgpt.com/'], calls)
+
+    def test_the_follow_up_waits_for_a_new_user_message_not_any(self):
+        _, script, _ = self.run_start(self.CONVERSATION)
+        submit = [s for s in script if 'send-button' in s][0]
+        self.assertIn('waitForFunction', submit)
+        self.assertIn('> n', submit)
+        self.assertIn('2, {timeout', submit)
+
+    def test_a_follow_up_into_a_bad_link_is_refused(self):
+        with self.assertRaises(runtime.ImageError) as caught:
+            runtime.validate_request(prompt='x', conversation_url='https://example.com/c/abc')
+        self.assertEqual(caught.exception.code, 'invalid_conversation')
+
+    def test_the_conversation_is_part_of_request_identity(self):
+        _, one = runtime.validate_request(prompt='x', conversation_url=self.CONVERSATION)
+        _, two = runtime.validate_request(prompt='x', conversation_url='')
+        self.assertNotEqual(one, two)
+
+
 class PollCadence(fixtures.QueueContracts):
     def test_tick_slows_down_only_while_generation_cannot_change(self):
         self.submit('slow', 'primary')

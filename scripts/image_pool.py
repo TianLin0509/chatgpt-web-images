@@ -29,7 +29,8 @@ ADOPT_BACKOFF = (60, 300, 900)
 # submit-and-navigate cost per image and spends one account request per image.
 # One call may queue a whole deck; a job still settles independently of its batch.
 MAX_BATCH = 20
-REQUEST_KEYS = ('prompt', 'prompt_file', 'output_dir', 'name', 'reference_images', 'count', 'request_id')
+REQUEST_KEYS = ('prompt', 'prompt_file', 'output_dir', 'name', 'reference_images', 'count',
+                'request_id', 'continue_from')
 BATCH_HINT_WINDOW = 900
 BATCH_HINT_SIBLINGS = 3
 # Every lane is a full browser profile (~0.6 GB resident), so the cap is about the
@@ -49,7 +50,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.6.1'
+VERSION = '0.7.0'
 
 
 @contextlib.contextmanager
@@ -116,7 +117,8 @@ class Pool:
             # Existing queues are migrated in place; a rebuild would lose live ownership.
             known = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
             for column, ddl in (('park_count', 'INTEGER NOT NULL DEFAULT 0'),
-                                ('retry_after', 'REAL NOT NULL DEFAULT 0')):
+                                ('retry_after', 'REAL NOT NULL DEFAULT 0'),
+                                ('thread', "TEXT NOT NULL DEFAULT ''")):
                 if column not in known:
                     db.execute('ALTER TABLE jobs ADD COLUMN ' + column + ' ' + ddl)
             # A lane is one browser profile. Several lanes can share one ChatGPT login,
@@ -246,10 +248,39 @@ class Pool:
             db.execute('UPDATE accounts SET enabled=?,updated=? WHERE id=?', (int(enabled), time.time(), account_id))
         return {'ok': True, 'account_id': account_id, 'enabled': bool(enabled)}
 
+    def continuation(self, job_id):
+        """Resolve a follow-up target into its conversation and the login that owns it.
+
+        A conversation belongs to the ChatGPT account, not to one browser profile, so any
+        lane of that login may continue it. Verified against the live site on 2026-09-19.
+        """
+        row = self.row(job_id)
+        conversation = json.loads(row['result'] or '{}').get('conversation_url', '')
+        if not re.fullmatch(w.CONVERSATION_URL, conversation or ''):
+            raise w.ImageError('continue_without_conversation',
+                               'That job never recorded a conversation, so there is nothing to continue.')
+        if row['status'] not in TERMINAL:
+            raise w.ImageError('continue_while_active',
+                               'Finish or cancel that job before asking a follow-up in its conversation.')
+        group = login_group(self.account(row['account_id'])) if row['account_id'] else 'auto'
+        return conversation, group
+
     def submit(self, account_id='auto', **kwargs):
         with self.connect() as db:
             if not db.execute('SELECT 1 FROM accounts LIMIT 1').fetchone():
                 raise w.ImageError('no_accounts', 'Register and log in to at least one isolated account before submitting.')
+        parent = kwargs.pop('continue_from', '')
+        thread = ''
+        if parent:
+            thread, group = self.continuation(parent)
+            kwargs['conversation_url'] = thread
+            # The follow-up must reach the login that owns the conversation; any of its
+            # lanes will do, so this pins the login rather than one browser profile.
+            if account_id == 'auto':
+                account_id = group
+            elif login_group(self.account(account_id)) != group:
+                raise w.ImageError('continue_wrong_account',
+                                   'That conversation belongs to a different ChatGPT login.')
         if account_id != 'auto':
             self.account(account_id)
         payload, digest = w.validate_request(**kwargs)
@@ -265,8 +296,8 @@ class Pool:
                 job_id = time.strftime('%Y%m%d') + '-' + uuid.uuid4().hex[:12]
                 payload['request_id'] = 'pool-' + job_id
                 now = time.time()
-                db.execute('INSERT INTO jobs(id,request_id,request_hash,payload,preferred,status,created,updated) VALUES(?,?,?,?,?,?,?,?)',
-                           (job_id, request_id, digest, json.dumps(payload, ensure_ascii=False), account_id, 'queued', now, now))
+                db.execute('INSERT INTO jobs(id,request_id,request_hash,payload,preferred,status,thread,created,updated) VALUES(?,?,?,?,?,?,?,?,?)',
+                           (job_id, request_id, digest, json.dumps(payload, ensure_ascii=False), account_id, 'queued', thread, now, now))
                 reused = False
                 hint = self.batch_hint(db, payload)
         result = self.get(job_id)
@@ -410,6 +441,8 @@ class Pool:
         result['downloaded_count'] = len(result.get('files', []))
         result['missing_count'] = max(0, payload['count'] - result['downloaded_count'])
         result['cancel_requested'] = bool(row['cancel_requested'])
+        if row['thread']:
+            result['continues_conversation'] = True
         if row['error']:
             result['error'] = json.loads(row['error'])
             result['error']['actionable_by'] = ACTIONABLE.get(result['error'].get('code'), 'human')
@@ -539,15 +572,20 @@ class Pool:
             if not account or not account['enabled'] or not account['ready']:
                 return None
             group = login_group(account)
+            # Two follow-ups typing into one conversation would interleave, so a thread
+            # admits a single writer at a time regardless of how many lanes are free.
+            busy = "SELECT thread FROM jobs WHERE status IN ('dispatching','running','needs_attention') AND thread<>''"
+            free = "(thread='' OR thread NOT IN (%s))" % busy
             # An explicit pin names either this lane or its login, and always wins.
-            queued = db.execute("SELECT * FROM jobs WHERE status='queued' AND preferred IN (?,?) ORDER BY created,id LIMIT 1",
-                                (account_id, group)).fetchone()
+            queued = db.execute("SELECT * FROM jobs WHERE status='queued' AND preferred IN (?,?) AND " + free +
+                                " ORDER BY created,id LIMIT 1", (account_id, group)).fetchone()
             if not queued:
                 # Spreading auto work evenly over logins is what keeps one ChatGPT account
                 # from absorbing a whole burst, so a busier login lets the other go first.
                 if not self.fair_turn(db, group):
                     return None
-                queued = db.execute("SELECT * FROM jobs WHERE status='queued' AND preferred='auto' ORDER BY created,id LIMIT 1").fetchone()
+                queued = db.execute("SELECT * FROM jobs WHERE status='queued' AND preferred='auto' AND " + free +
+                                    " ORDER BY created,id LIMIT 1").fetchone()
             if not queued:
                 return None
             db.execute("UPDATE jobs SET status='dispatching',account_id=?,updated=? WHERE id=?", (account_id, time.time(), queued['id']))

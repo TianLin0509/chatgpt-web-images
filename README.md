@@ -1,4 +1,33 @@
-# ChatGPT Web Images 0.6.1
+# ChatGPT Web Images 0.7.0
+
+## 对话连续性与出错可调整（0.7.0）
+
+**改图不用重头说。** `continue_from=<job_id>` 把追问发进那个任务自己的对话里，ChatGPT 仍然看得见之前的图，所以"保持版式、配色调深一点"这种说法能直接用。
+
+```jsonc
+image_generate({prompt: "保持版式，配色调深一点，标题换成深红", continue_from: "20260919-xxxx"})
+```
+
+实测确认的三条机制：
+
+1. **对话属于账号，不属于浏览器 Profile。** 同一登录的**任意空闲车道**都能接续同一个对话，不用等原车道空出来。
+2. **同一对话同时只允许一个写入者**，避免两条追问在一个会话里交错；不相关的任务照常用其它车道。
+3. 追问自动钉到拥有该对话的登录账号；指定了别的账号会明确报 `continue_wrong_account`。
+
+新开对话仍是默认行为，**换个不相关的图就别用 `continue_from`**。
+
+## 出错要让 agent 能立刻调整（0.7.0）
+
+- **答完但没出图 → 立刻失败**，不再干等 15 分钟。判据取自真实 DOM：一个回合只有完成后才长出操作栏，`copy-turn-action-button` 是图片回合与文本回合的共同信号。明确回绝报 `generation_failed`，其它情况报 `no_image_in_reply`，两者都带回 ChatGPT 的原话（800 字符）。
+- **错误按"谁能处理"分类**，结果里的 `error.actionable_by`：
+
+  | 值 | 含义 | 例子 |
+  |---|---|---|
+  | `agent` | 改提示词重投 | `no_image_in_reply`、`generation_failed`、数量不符 |
+  | `retry` | 等一下重试即可 | `browser_timeout`、`busy`、观察超时 |
+  | `human` | 需要人处理 | `login_required`、`browser_challenge`、`conversation_changed` |
+
+  未知错误码一律归 `human`，绝不谎称 agent 能自行解决。
 
 ## 最大化并行：MCP 说明直接把规则讲出来（0.6.0）
 
@@ -135,7 +164,7 @@ codex mcp add chatgpt-web-images --env PYTHONIOENCODING=utf-8 --env "CHATGPT_WEB
 
 | 工具 | 行为 |
 |---|---|
-| image_generate | 持久入队，立即返回 job_id；account_id=auto 或指定账号；request_id 防重复 |
+| image_generate | 持久入队，立即返回 job_id；account_id=auto 或指定账号；request_id 防重复；continue_from=<job_id> 在原对话里追问 |
 | image_generate_batch | 一次排入整批不同提示词，立刻占满所有空闲车道；整体校验、按 request_id 幂等 |
 | image_poll | 读取/等待自己的任务；传 job_ids 一次等待整批，return_when=any 可提前取回 |
 | image_status | 缓存健康、后台存活、任务状态数量和账号操作结果 |

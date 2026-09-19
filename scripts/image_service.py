@@ -50,6 +50,10 @@ def create_mcp(pool=None):
         'submit-then-wait-then-submit loop leaves lanes idle and is the main cause of slow '
         'batches. Then wait on the whole batch with image_poll(job_ids=[...]). Workers keep '
         'generating and downloading after you disconnect, so polling only reads progress.\n\n'
+'REFINING AN EARLIER IMAGE: pass continue_from=<job_id> to ask the follow-up inside that '
+        'job\'s own conversation, so ChatGPT still sees those images and "keep the layout, darker '
+        'palette" works like it does for a person. Start a fresh request instead when the new image '
+        'is unrelated. Follow-ups are serialised per conversation and run on the login that owns it.\n\n'
         'queued, dispatching and running are normal; long queues are expected and are not a '
         'reason to resubmit. parked means the job released its lane so others could run and is '
         'retried automatically. needs_attention requires browser inspection then image_resume. '
@@ -89,11 +93,16 @@ def create_mcp(pool=None):
     async def image_generate(prompt: str = '', prompt_file: str = '', output_dir: str = '', name: str = 'image',
                              reference_images: list[str] | None = None,
                              count: Annotated[int, Field(strict=True, ge=1, le=20)] = 1,
-                             request_id: str = '', detail: bool = False, account_id: str = 'auto') -> str:
-        """Persist one image request and return job_id immediately. Stable request_id deduplicates retries. Many callers may submit at once: every free lane runs a job in parallel and auto balances across logins. account_id accepts auto, a lane alias or a login name. count=N asks ONE ChatGPT request for N independent images: use it for alternates of the same prompt (for example several options for one slide) instead of submitting N jobs, because it costs one lane and one account request rather than N. Submit separate jobs only when the prompts genuinely differ."""
+                             request_id: str = '', detail: bool = False, account_id: str = 'auto',
+                             continue_from: Annotated[str, Field(description=(
+                                 'job_id of a finished job whose conversation this request should continue. '
+                                 'ChatGPT then still sees the earlier images, so refinements like "keep the '
+                                 'layout, make the palette darker" work. Omit it to start a fresh conversation, '
+                                 'which is right whenever the new request is unrelated.'))] = '') -> str:
+        """Persist one image request and return job_id immediately. Pass continue_from=<job_id> to refine an earlier result inside its own conversation, which keeps ChatGPT's memory of those images; the follow-up automatically runs on the login that owns that conversation, and a conversation takes one writer at a time. Stable request_id deduplicates retries. Many callers may submit at once: every free lane runs a job in parallel and auto balances across logins. account_id accepts auto, a lane alias or a login name. count=N asks ONE ChatGPT request for N independent images: use it for alternates of the same prompt (for example several options for one slide) instead of submitting N jobs, because it costs one lane and one account request rather than N. Submit separate jobs only when the prompts genuinely differ."""
         return await call(lambda: wake(pool, pool.submit(account_id=account_id, prompt=prompt, prompt_file=prompt_file,
                                                        output_dir=output_dir, name=name, reference_images=reference_images,
-                                                       count=count, request_id=request_id)))
+                                                       count=count, request_id=request_id, continue_from=continue_from)))
 
     @server.tool(structured_output=False)
     async def image_generate_batch(
@@ -162,6 +171,7 @@ def main(argv=None):
     parser.add_argument('--reference', action='append', default=[])
     parser.add_argument('--count', type=int, default=1)
     parser.add_argument('--request-id', default='')
+    parser.add_argument('--continue-from', default='')
     parser.add_argument('--job-id', action='append', default=[])
     parser.add_argument('--return-when', default='all')
     parser.add_argument('--wait-seconds', type=int, default=0)
@@ -198,7 +208,8 @@ def main(argv=None):
             return pool.control(account, 'select' if args.command == 'select-account' else args.command, **kwargs)
         if args.command == 'generate':
             return pool.submit(account_id=args.account_id, prompt=args.prompt, prompt_file=args.prompt_file, output_dir=args.output_dir,
-                               name=args.name, reference_images=args.reference, count=args.count, request_id=args.request_id)
+                               name=args.name, reference_images=args.reference, count=args.count, request_id=args.request_id,
+                               continue_from=args.continue_from)
         if args.command == 'generate-batch':
             source = Path(args.requests_file)
             if not source.is_absolute() or not source.is_file():

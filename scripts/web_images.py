@@ -19,7 +19,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.6.1'
+VERSION = '0.7.0'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -45,6 +45,7 @@ SESSION = 'chatgpt-web-images'
 CLI_ENTRY = setting('CHATGPT_WEB_IMAGES_CLI','cli_entry',DATA/'runtime'/'node_modules'/'@playwright'/'cli'/'playwright-cli.js')
 DEFAULT_OUTPUT = setting('CHATGPT_WEB_IMAGES_OUTPUT','output_dir',DATA/'output')
 TERMINAL = {'complete','failed','preparation_failed','cancelled','partial','count_mismatch'}
+CONVERSATION_URL = r'https://chatgpt\.com/c/[a-zA-Z0-9-]+'
 # Forced reloads spent on an identity mismatch before refusing to observe the conversation.
 IDENTITY_RETRIES = 2
 
@@ -367,7 +368,7 @@ def release_browser():
         return {'closed': True}
 
 
-def validate_request(prompt='', prompt_file='', output_dir='', name='image', reference_images=None, count=1, request_id=''):
+def validate_request(prompt='', prompt_file='', output_dir='', name='image', reference_images=None, count=1, request_id='', conversation_url=''):
     if request_id and not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',request_id):
         raise ImageError('invalid_request_id','request_id must contain 1-100 ASCII letters, numbers, underscores or hyphens.')
     if request_id.upper() in {'CON','PRN','AUX','NUL',*(f'COM{i}' for i in range(1,10)),*(f'LPT{i}' for i in range(1,10))}:
@@ -398,16 +399,21 @@ def validate_request(prompt='', prompt_file='', output_dir='', name='image', ref
         refs.append(str(ref))
     if len(refs)>5:
         raise ImageError('invalid_reference', 'At most five reference images per job.')
+    if conversation_url and not re.fullmatch(CONVERSATION_URL, conversation_url):
+        raise ImageError('invalid_conversation','conversation_url must be an existing ChatGPT conversation link.')
     # Content identity binds a retry key to its exact request, including reference bytes.
+    # A follow-up into another conversation is a different request, so it is hashed in too.
     request_hash=hashlib.sha256(json.dumps({'prompt':prompt,'count':count,'output_dir':str(out.resolve()),
-        'name':name,'references':[(p,hashlib.sha256(Path(p).read_bytes()).hexdigest()) for p in refs]},
+        'name':name,'conversation':conversation_url,
+        'references':[(p,hashlib.sha256(Path(p).read_bytes()).hexdigest()) for p in refs]},
         sort_keys=True,ensure_ascii=False).encode('utf-8')).hexdigest()
     return dict(prompt=prompt, output_dir=str(out.resolve()), name=name,
-                reference_images=refs, count=count, request_id=request_id), request_hash
+                reference_images=refs, count=count, request_id=request_id,
+                conversation_url=conversation_url), request_hash
 
 
-def start(prompt='', prompt_file='', output_dir='', name='image', reference_images=None, count=1, request_id=''):
-    validated, request_hash = validate_request(prompt, prompt_file, output_dir, name, reference_images, count, request_id)
+def start(prompt='', prompt_file='', output_dir='', name='image', reference_images=None, count=1, request_id='', conversation_url=''):
+    validated, request_hash = validate_request(prompt, prompt_file, output_dir, name, reference_images, count, request_id, conversation_url)
     prompt = validated['prompt']
     out = Path(validated['output_dir'])
     refs = validated['reference_images']
@@ -445,16 +451,21 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
         if request_id:
             write_json(previous_path,{'request_hash':request_hash,'job_id':job_id})
         try:
-            job['operation_stage'] = 'new_conversation'
+            job['operation_stage'] = 'continue_conversation' if conversation_url else 'new_conversation'
+            job['conversation_url'] = conversation_url or job.get('conversation_url', '')
             save_job(job)
-            cli(['goto','https://chatgpt.com/'])
+            cli(['goto', conversation_url or 'https://chatgpt.com/'])
             job['operation_stage'] = 'wait_composer'
             save_job(job)
-            run_js(r'''async page => {
+            # A follow-up lands after messages that are already in the thread, so waiting
+            # for 'a user message exists' would return instantly. Count them while waiting
+            # for the composer, which costs no extra browser round trip.
+            before = run_js(r'''async page => {
               await page.locator('#prompt-textarea').waitFor({state:'visible',timeout:45000});
               await page.getByTestId('composer-plus-btn').waitFor({state:'visible',timeout:5000});
-              return true;
+              return await page.evaluate(() => document.querySelectorAll('[data-message-author-role="user"]').length);
             }''')
+            before = before if type(before) is int else 0
             job['operation_stage'] = 'fill_prompt'
             save_job(job)
             run_js(FILL_PROMPT_JS.replace('__PROMPT__',json.dumps(prompt)))
@@ -490,10 +501,11 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
               const button=page.getByTestId('send-button');
               await button.waitFor({state:'visible', timeout:20000});
               await button.click({timeout:20000});
-              await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+              await page.waitForFunction(n => document.querySelectorAll('[data-message-author-role="user"]').length > n,
+                                         __BEFORE__, {timeout:20000});
               await page.waitForURL(/^https:\/\/chatgpt\.com\/c\/[a-zA-Z0-9-]+$/, {timeout:20000});
               return {url:page.url()};
-            }''')
+            }'''.replace('__BEFORE__', str(int(before))))
             job['status']='generating'
             job['operation_stage']='observe_images'
             job['conversation_url']=result['url']
