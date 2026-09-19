@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -46,8 +47,12 @@ class AccountContracts(unittest.TestCase):
             self.assertTrue(result['remembered'])
 
     def test_bridge_auth_failure_does_not_advance_cursor(self):
-        path=Path(r'C:\Users\lintian\tools\chatgpt_bridge\bridge.py')
-        if not path.exists():self.skipTest('Local bridge integration is not installed')
+        # Optional local integration. Point CHATGPT_BRIDGE_PATH at a bridge.py to run it;
+        # a hardcoded home directory does not belong in a published repository.
+        configured=os.environ.get('CHATGPT_BRIDGE_PATH','')
+        path=Path(configured) if configured else None
+        if path is None or not path.is_file():
+            self.skipTest('Set CHATGPT_BRIDGE_PATH to run the local bridge integration.')
         spec=importlib.util.spec_from_file_location('account_test_bridge',path)
         bridge=importlib.util.module_from_spec(spec);spec.loader.exec_module(bridge)
         cfg={'account_name':'TIAN LIN','storage_state_path':'unused'}

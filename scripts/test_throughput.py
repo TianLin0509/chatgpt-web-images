@@ -724,7 +724,7 @@ class SourceEncoding(unittest.TestCase):
 class Continuity(fixtures.QueueContracts):
     """A follow-up belongs in the original conversation, on the login that owns it."""
 
-    CONVERSATION = 'https://chatgpt.com/c/6aae7e7e-8b00-83e9-bd27-faf509989850'
+    CONVERSATION = 'https://chatgpt.com/c/test-thread-alpha'
 
     def finished(self, lane='primary', conversation=None, status='complete'):
         job = self.submit('parent-' + lane, lane)
@@ -821,7 +821,7 @@ class Continuity(fixtures.QueueContracts):
 class ContinuityRuntime(contracts.Contracts):
     """start() must join the recorded conversation rather than open a new chat."""
 
-    CONVERSATION = 'https://chatgpt.com/c/6aae7e7e-8b00-83e9-bd27-faf509989850'
+    CONVERSATION = 'https://chatgpt.com/c/test-thread-alpha'
 
     def run_start(self, conversation_url):
         # The composer wait now also returns how many user messages are already there.
@@ -943,6 +943,41 @@ class ReviewFindings(fixtures.QueueContracts):
         damaged = [s for s in summary['jobs'] if s['job_id'] == broken['job_id']][0]
         self.assertEqual(damaged['error']['code'], 'job_state_unreadable')
         self.assertEqual([s for s in summary['jobs'] if s['job_id'] == good['job_id']][0]['status'], 'queued')
+
+
+class PublicationHygiene(unittest.TestCase):
+    """This repository is public; tracked files must not carry anyone's machine or chats.
+
+    Learned the hard way preparing a push: a real conversation id had been pasted into
+    a fixture, and .mcp.json had been overwritten with one developer's absolute paths.
+    check_release.py catches both, but only if someone remembers to run it.
+    """
+
+    def tracked(self):
+        import subprocess
+        root = Path(__file__).resolve().parents[1]
+        names = subprocess.run(['git', 'ls-files'], cwd=root, capture_output=True,
+                               check=True).stdout.decode('utf-8').split()
+        for name in names:
+            data = (root / name).read_bytes()
+            try:
+                yield name, data.decode('utf-8')
+            except UnicodeDecodeError:
+                continue
+
+    def test_no_tracked_file_carries_a_home_directory(self):
+        import re
+        for name, text in self.tracked():
+            self.assertIsNone(re.search(r'[A-Za-z]:[\\/]Users[\\/][A-Za-z0-9_]', text.replace('\\\\', '\\')),
+                              '%s contains a machine-specific home path' % name)
+
+    def test_no_tracked_file_carries_a_real_conversation_id(self):
+        import re
+        # check_release.py rejects 30+ run of [a-f0-9-] after /c/; fixtures must stay short
+        # and obviously fake so a real link can never hide among them.
+        for name, text in self.tracked():
+            self.assertIsNone(re.search(r'https://chatgpt\.com/c/[a-f0-9-]{30,}', text),
+                              '%s looks like it contains a real conversation link' % name)
 
 
 class PollCadence(fixtures.QueueContracts):
