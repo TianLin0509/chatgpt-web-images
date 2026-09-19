@@ -870,6 +870,81 @@ class ContinuityRuntime(contracts.Contracts):
         self.assertNotEqual(one, two)
 
 
+class ReviewFindings(fixtures.QueueContracts):
+    """Defects found reviewing this session's own changes; each one shipped once."""
+
+    CONVERSATION = 'https://chatgpt.com/c/aaaa-bbbb-cccc-dddd'
+
+    def parent(self, lane='primary'):
+        job = self.submit('parent', lane)
+        self.pool.claim(lane)
+        self.pool.save_result(job['job_id'], {'status': 'complete', 'files': [],
+                                              'conversation_url': self.CONVERSATION})
+        return job
+
+    def entry(self, key, **extra):
+        return dict({'prompt': 'draw ' + key, 'request_id': key,
+                     'output_dir': str(self.root / 'out')}, **extra)
+
+    def test_a_batch_entry_may_continue_a_conversation(self):
+        # validate_request cannot accept continue_from, so the batch used to raise a
+        # bare TypeError and surface as an opaque service_error.
+        parent = self.parent()
+        result = self.pool.submit_many([self.entry('follow', continue_from=parent['job_id'])])
+        self.assertEqual(result['submitted'], 1)
+        self.assertTrue(self.pool.get(result['job_ids'][0])['continues_conversation'])
+
+    def test_a_parked_follow_up_keeps_holding_its_conversation(self):
+        # Parking frees the lane, but the job still intends to write to that thread.
+        parent = self.parent()
+        first = self.pool.submit(**self.entry('f1', continue_from=parent['job_id']))
+        second = self.pool.submit(**self.entry('f2', continue_from=parent['job_id']))
+        self.pool.claim('primary')
+        self.pool.save_result(first['job_id'], {'status': 'needs_attention', 'files': [],
+                                                'error': {'code': 'browser_timeout', 'message': 'fixture'}})
+        self.pool.park(first['job_id'])
+        self.assertEqual(self.pool.row(first['job_id'])['status'], PARKED)
+        self.assertIsNone(self.pool.claim('primary'))
+        self.assertEqual(self.pool.row(second['job_id'])['status'], 'queued')
+
+    def test_a_parked_follow_up_blocks_only_its_own_thread(self):
+        parent = self.parent()
+        first = self.pool.submit(**self.entry('f1', continue_from=parent['job_id']))
+        unrelated = self.pool.submit(**self.entry('fresh'))
+        self.pool.claim('primary')
+        self.pool.save_result(first['job_id'], {'status': 'needs_attention', 'files': [],
+                                                'error': {'code': 'browser_timeout', 'message': 'fixture'}})
+        self.pool.park(first['job_id'])
+        self.assertEqual(self.pool.claim('primary')['id'], unrelated['job_id'])
+
+    def test_a_batch_that_conflicts_on_its_last_entry_queues_nothing(self):
+        # The caller is told the batch failed, so none of it may be running.
+        self.pool.submit(**self.entry('dup'))
+        batch = [self.entry('n1'), self.entry('n2'),
+                 dict(self.entry('dup'), prompt='completely different text')]
+        with self.assertRaises(w.ImageError) as caught:
+            self.pool.submit_many(batch)
+        self.assertEqual(caught.exception.code, 'request_id_conflict')
+        self.assertEqual(self.pool.status()['jobs'].get('queued', 0), 1)
+
+    def test_resending_an_identical_batch_still_reuses_every_job(self):
+        first = self.pool.submit_many([self.entry('a'), self.entry('b')])
+        again = self.pool.submit_many([self.entry('a'), self.entry('b')])
+        self.assertEqual(first['job_ids'], again['job_ids'])
+        self.assertEqual(again['reused'], 2)
+
+    def test_one_damaged_row_never_fails_the_whole_batch_poll(self):
+        good = self.pool.submit(**self.entry('good'))
+        broken = self.pool.submit(**self.entry('broken'))
+        with self.pool.connect() as db:
+            db.execute("UPDATE jobs SET result='{not json' WHERE id=?", (broken['job_id'],))
+        summary = asyncio.run(self.pool.poll_many_async([good['job_id'], broken['job_id']], 0))
+        self.assertEqual(summary['total'], 2)
+        damaged = [s for s in summary['jobs'] if s['job_id'] == broken['job_id']][0]
+        self.assertEqual(damaged['error']['code'], 'job_state_unreadable')
+        self.assertEqual([s for s in summary['jobs'] if s['job_id'] == good['job_id']][0]['status'], 'queued')
+
+
 class PollCadence(fixtures.QueueContracts):
     def test_tick_slows_down_only_while_generation_cannot_change(self):
         self.submit('slow', 'primary')

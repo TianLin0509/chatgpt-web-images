@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1
+
+- Share one preparation path between `image_generate` and `image_generate_batch`, so a batch entry may use `continue_from` instead of raising an opaque error.
+- Keep a parked follow-up holding its conversation. Parking frees the lane, but the job still intends to write to that thread, and releasing it let a second follow-up into the same conversation.
+- Queue a whole batch in a single transaction, so a conflict on the last entry cannot leave earlier entries running behind a caller who was told the batch failed.
+- Report an unreadable job row as `job_state_unreadable` inside the batch result instead of letting it end the whole poll.
+
 ## 0.7.0
 
 - Add conversation continuity: `continue_from=<job_id>` asks the follow-up inside that job's own conversation, so ChatGPT still sees the earlier images and refinements such as "keep the layout, darker palette" behave the way they do for a person.

@@ -1,4 +1,4 @@
-# ChatGPT Web Images 0.7.0
+# ChatGPT Web Images 0.7.1
 
 ## 对话连续性与出错可调整（0.7.0）
 

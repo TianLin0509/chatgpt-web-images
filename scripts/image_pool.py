@@ -43,6 +43,7 @@ ACTIONABLE = {
     'reference_changed': 'agent', 'request_id_conflict': 'agent', 'invalid_prompt': 'agent',
     'browser_timeout': 'retry', 'browser_operation_failed': 'retry', 'browser_not_open': 'retry',
     'browser_closed': 'retry', 'busy': 'retry', 'browser_protocol_error': 'retry',
+    'job_state_unreadable': 'human',
     'generation_wait_exceeded': 'retry', 'browser_locator_ambiguous': 'retry',
     'login_required': 'human', 'browser_challenge': 'human', 'account_selection_required': 'human',
     'credential_required': 'human', 'image_tool_unavailable': 'human', 'output_exists': 'human',
@@ -50,7 +51,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.0'
+VERSION = '0.7.1'
 
 
 @contextlib.contextmanager
@@ -265,7 +266,8 @@ class Pool:
         group = login_group(self.account(row['account_id'])) if row['account_id'] else 'auto'
         return conversation, group
 
-    def submit(self, account_id='auto', **kwargs):
+    def prepare(self, account_id='auto', **kwargs):
+        """Resolve one request into everything the queue needs, touching nothing yet."""
         with self.connect() as db:
             if not db.execute('SELECT 1 FROM accounts LIMIT 1').fetchone():
                 raise w.ImageError('no_accounts', 'Register and log in to at least one isolated account before submitting.')
@@ -285,21 +287,28 @@ class Pool:
             self.account(account_id)
         payload, digest = w.validate_request(**kwargs)
         digest = hashlib.sha256((digest + '\n' + account_id).encode()).hexdigest()
-        request_id = payload['request_id'] or 'auto-' + uuid.uuid4().hex
+        return {'request_id': payload['request_id'] or 'auto-' + uuid.uuid4().hex,
+                'payload': payload, 'digest': digest, 'preferred': account_id, 'thread': thread}
+
+    def insert(self, db, plan):
+        """Queue one prepared request inside a caller-owned transaction."""
+        old = db.execute('SELECT * FROM jobs WHERE request_id=?', (plan['request_id'],)).fetchone()
+        if old:
+            if old['request_hash'] != plan['digest']:
+                raise w.ImageError('request_id_conflict', 'This request_id belongs to different input; do not resend an uncertain job.')
+            return old['id'], True, None
+        job_id = time.strftime('%Y%m%d') + '-' + uuid.uuid4().hex[:12]
+        payload = dict(plan['payload'], request_id='pool-' + job_id)
+        now = time.time()
+        db.execute('INSERT INTO jobs(id,request_id,request_hash,payload,preferred,status,thread,created,updated) VALUES(?,?,?,?,?,?,?,?,?)',
+                   (job_id, plan['request_id'], plan['digest'], json.dumps(payload, ensure_ascii=False),
+                    plan['preferred'], 'queued', plan['thread'], now, now))
+        return job_id, False, self.batch_hint(db, payload)
+
+    def submit(self, account_id='auto', **kwargs):
+        plan = self.prepare(account_id, **kwargs)
         with self.transaction() as db:
-            old = db.execute('SELECT * FROM jobs WHERE request_id=?', (request_id,)).fetchone()
-            if old:
-                if old['request_hash'] != digest:
-                    raise w.ImageError('request_id_conflict', 'This request_id belongs to different input; do not resend an uncertain job.')
-                job_id, reused = old['id'], True
-            else:
-                job_id = time.strftime('%Y%m%d') + '-' + uuid.uuid4().hex[:12]
-                payload['request_id'] = 'pool-' + job_id
-                now = time.time()
-                db.execute('INSERT INTO jobs(id,request_id,request_hash,payload,preferred,status,thread,created,updated) VALUES(?,?,?,?,?,?,?,?,?)',
-                           (job_id, request_id, digest, json.dumps(payload, ensure_ascii=False), account_id, 'queued', thread, now, now))
-                reused = False
-                hint = self.batch_hint(db, payload)
+            job_id, reused, hint = self.insert(db, plan)
         result = self.get(job_id)
         result['reused_request'] = reused
         if not reused and hint:
@@ -335,20 +344,34 @@ class Pool:
         """
         if not isinstance(requests, list) or not 1 <= len(requests) <= MAX_BATCH:
             raise w.ImageError('invalid_batch', 'Provide 1 to %d image requests in a list.' % MAX_BATCH)
-        seen = set()
+        seen, plans = set(), []
         for item in requests:
             if not isinstance(item, dict):
                 raise w.ImageError('invalid_batch', 'Each batch entry must be an object of image_generate arguments.')
             unknown = set(item) - set(REQUEST_KEYS)
             if unknown:
                 raise w.ImageError('invalid_batch', 'Unsupported batch entry keys: ' + ', '.join(sorted(unknown)))
-            payload, _ = w.validate_request(**item)
-            if not payload['request_id']:
+            # prepare() also resolves continue_from, which validate_request cannot accept.
+            plan = self.prepare(account_id, **item)
+            if not plan['payload']['request_id']:
                 raise w.ImageError('invalid_request_id', 'Every batch entry needs its own stable request_id.')
-            if payload['request_id'] in seen:
-                raise w.ImageError('request_id_conflict', 'Batch entries must use distinct request_ids: ' + payload['request_id'])
-            seen.add(payload['request_id'])
-        jobs = [self.submit(account_id=account_id, **item) for item in requests]
+            if plan['request_id'] in seen:
+                raise w.ImageError('request_id_conflict', 'Batch entries must use distinct request_ids: ' + plan['request_id'])
+            seen.add(plan['request_id'])
+            plans.append(plan)
+        # One transaction for the whole batch: a conflict on the last entry must not
+        # leave the earlier ones queued behind a caller who was told the batch failed.
+        results = []
+        with self.transaction() as db:
+            for plan in plans:
+                results.append(self.insert(db, plan))
+        jobs = []
+        for (job_id, reused, hint) in results:
+            job = self.get(job_id)
+            job['reused_request'] = reused
+            if not reused and hint:
+                job['hint'] = hint
+            jobs.append(job)
         return {'ok': True, 'submitted': len(jobs), 'reused': sum(bool(j['reused_request']) for j in jobs),
                 'job_ids': [j['job_id'] for j in jobs], 'jobs': jobs,
                 'next_action': 'image_poll_with_job_ids'}
@@ -362,6 +385,10 @@ class Pool:
             except w.ImageError as exc:
                 states.append({'job_id': job_id, 'ok': False, 'status': 'unknown',
                                'error': {'code': exc.code, 'message': str(exc)}})
+            except Exception as exc:
+                # A damaged row is this job's problem, not the whole batch's.
+                states.append({'job_id': job_id, 'ok': False, 'status': 'unknown',
+                               'error': {'code': 'job_state_unreadable', 'message': type(exc).__name__}})
         return states
 
     def batch_summary(self, states):
@@ -574,7 +601,10 @@ class Pool:
             group = login_group(account)
             # Two follow-ups typing into one conversation would interleave, so a thread
             # admits a single writer at a time regardless of how many lanes are free.
-            busy = "SELECT thread FROM jobs WHERE status IN ('dispatching','running','needs_attention') AND thread<>''"
+            # A parked follow-up still intends to write there once it is re-observed, so
+            # it keeps holding its thread; other threads and lanes are unaffected.
+            busy = ("SELECT thread FROM jobs WHERE status IN "
+                    "('dispatching','running','needs_attention','" + PARKED + "') AND thread<>''")
             free = "(thread='' OR thread NOT IN (%s))" % busy
             # An explicit pin names either this lane or its login, and always wins.
             queued = db.execute("SELECT * FROM jobs WHERE status='queued' AND preferred IN (?,?) AND " + free +
