@@ -121,11 +121,16 @@ class Contracts(unittest.TestCase):
         browser.assert_not_called()
 
     def test_one_submission_carries_requested_count(self):
-        with patch.object(w,'ensure_browser'),patch.object(w,'cli'),patch.object(w,'set_visible',return_value=True),patch.object(w,'run_js',side_effect=[True,{'url':'https://chatgpt.com/c/abc-def'}]) as js:
+        with patch.object(w,'ensure_browser'),patch.object(w,'cli'),patch.object(w,'set_visible',return_value=True),patch.object(w,'run_js',side_effect=[True,True,True,{'url':'https://chatgpt.com/c/abc-def'}]) as js:
             result=w.start(prompt='my prompt',count=5,output_dir=str(self.data))
         self.assertEqual(result['requested_count'],5)
-        self.assertEqual(js.call_count,2)  # image-mode selection + ONE submitted request
-        self.assertIn('5',js.call_args_list[-1].args[0])
+        sources=[c.args[0] for c in js.call_args_list]
+        self.assertEqual(sum('button.click' in source for source in sources),1)
+        fill=next(i for i,source in enumerate(sources) if 'composer.fill' in source)
+        select=next(i for i,source in enumerate(sources) if 'composer-plus-btn' in source and 'press' in source)
+        self.assertLess(fill,select)
+        self.assertIn('5',sources[fill])
+        self.assertNotIn('composer.fill',sources[-1])
         self.assertNotEqual(result['prompt_sha256'],result['submitted_prompt_sha256'])
 
     def multi_fixture(self,requested=5,observed=5):
@@ -211,7 +216,7 @@ class Contracts(unittest.TestCase):
         self.assertEqual(len(recovered['files']),1)
 
     def test_request_id_reuses_completed_job_without_browser(self):
-        with patch.object(w,'ensure_browser'),patch.object(w,'cli'),patch.object(w,'set_visible',return_value=True),patch.object(w,'run_js',side_effect=[True,{'url':'https://chatgpt.com/c/abc-def'}]):
+        with patch.object(w,'ensure_browser'),patch.object(w,'cli'),patch.object(w,'set_visible',return_value=True),patch.object(w,'run_js',side_effect=[True,True,True,{'url':'https://chatgpt.com/c/abc-def'}]):
             first=w.start(prompt='hello',request_id='retry-1',output_dir=str(self.data))
         job=json.loads(w.job_path(first['job_id']).read_text(encoding='utf-8'))
         job['status']='complete'
@@ -240,7 +245,7 @@ class Contracts(unittest.TestCase):
             self.assertEqual(result['error']['code'],'invalid_request_id')
 
     def test_uncertain_request_is_reused(self):
-        with patch.object(w,'ensure_browser'),patch.object(w,'cli'),patch.object(w,'run_js',side_effect=[True,w.ImageError('browser_timeout','timeout')]):
+        with patch.object(w,'ensure_browser'),patch.object(w,'cli'),patch.object(w,'run_js',side_effect=[True,True,True,w.ImageError('browser_timeout','timeout')]):
             first=w.start(prompt='hello',request_id='uncertain-1')
         self.assertEqual(first['status'],'submission_uncertain')
         with patch.object(w,'ensure_browser') as browser:
@@ -249,7 +254,7 @@ class Contracts(unittest.TestCase):
         self.assertEqual(second['job_id'],first['job_id'])
 
     def test_window_failure_after_submission_keeps_active_job(self):
-        with patch.object(w,'ensure_browser'),patch.object(w,'cli'),patch.object(w,'run_js',side_effect=[True,{'url':'https://chatgpt.com/c/abc-def'}]),patch.object(w,'set_visible',side_effect=w.ImageError('browser_timeout','timeout')):
+        with patch.object(w,'ensure_browser'),patch.object(w,'cli'),patch.object(w,'run_js',side_effect=[True,True,True,{'url':'https://chatgpt.com/c/abc-def'}]),patch.object(w,'set_visible',side_effect=w.ImageError('browser_timeout','timeout')):
             first=w.start(prompt='hello')
         self.assertEqual(first['status'],'submission_uncertain')
         self.assertIsNotNone(w.active_job())
@@ -306,7 +311,7 @@ class Contracts(unittest.TestCase):
         self.assertEqual(result['downloaded_count'],0)
 
     def test_default_auth_is_optional(self):
-        with patch.object(w,'AUTH',None),patch.object(w,'cli') as cli,patch.object(w,'run_js',side_effect=[w.ImageError('browser_not_open','closed'),True,{'logged_in':False}]):
+        with patch.object(w,'AUTH',None),patch.object(w,'cli') as cli,patch.object(w,'run_js',side_effect=[w.ImageError('browser_not_open','closed'),True,{'logged_in':False},{'logged_in':False}]):
             result=w.safe_call(w.ensure_browser)
         self.assertEqual(result['error']['code'],'login_required')
         self.assertFalse(any(c.args[0][0]=='state-load' for c in cli.call_args_list))

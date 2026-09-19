@@ -1,37 +1,23 @@
-# ChatGPT Web Images
+# ChatGPT Web Images 0.7.1
 
-[中文](README.md)
+Parallelism update: concurrency is the number of browser lanes, not the number of accounts. `account-scale --account-id primary --lanes 4` gives one signed-in login four isolated lanes that run in parallel, and `auto` work is balanced across logins so one account does not absorb a whole burst. An idle lane closes its browser after five minutes and reopens it from its persistent profile, because each open lane costs roughly 0.6 GB. Total lanes are capped at 16: the limit is the machine, not the website.
 
-A local, unofficial **Windows MCP server** that generates images through your own ChatGPT web account and saves the original downloads. Tool responses contain text metadata, never image base64.
+Throughput update: a paused job no longer holds its account. After 120 unattended seconds it is `parked` — the browser is handed back while the same account, conversation and downloaded files are kept — so queued jobs proceed immediately. Parked jobs are re-observed automatically after 60/300/900 seconds, at most three times, and never resend a prompt. An identity mismatch now reloads the recorded conversation before refusing to continue, so recovery is reachable when it is needed. An unhealthy account re-checks itself on the same backoff instead of staying offline until a human intervenes. `account-clone` adds another isolated browser lane for an account that is already signed in: the concurrency limit comes from one browser page per profile, not from ChatGPT.
 
-Requirements: Python 3.11+, Node.js 18+ with npm, installed Google Chrome, and your own ChatGPT account with image generation available.
+Reliability update: pending account actions coalesce and alternate with job work; asynchronous MCP waits do not occupy executor threads. Cross-process launch reservations prevent worker startup storms. Browser preparation/generation failures pause account admission until an explicit successful check. Queue results explain blocking accounts, and worker health distinguishes a live heartbeat from an operation stalled for over 300 seconds. Stalled browser operations are reported, not force-killed or resubmitted. Explicit resume renews observation time and refreshes only the verified original conversation; active jobs prevent account switching. Restart workers between operations and reload existing MCP sessions to activate these changes.
 
-```powershell
-python -m venv .venv
-& .\.venv\Scripts\python.exe -m pip install .
-& .\.venv\Scripts\chatgpt-web-images.exe setup
-& .\.venv\Scripts\chatgpt-web-images.exe open
-# Sign in yourself in the dedicated browser, then:
-& .\.venv\Scripts\chatgpt-web-images.exe status
-$imagePython = (Resolve-Path .\.venv\Scripts\python.exe).Path
-codex mcp add chatgpt-web-images -- $imagePython -m web_images mcp
-```
+Unofficial Windows stdio MCP for your own ChatGPT web accounts. Original files are saved locally; tool results contain text and paths, never image base64. See [the complete setup guide](README.md).
 
-Set `tool_timeout_sec = 180` in Codex's `[mcp_servers.chatgpt-web-images]` configuration table and start a new thread. For another stdio client, use the venv Python's absolute path with args `["-m", "web_images", "mcp"]` and a tool timeout of at least 180 seconds. [Official Codex MCP configuration](https://learn.chatgpt.com/zh-Hans/docs/extend/mcp)
+All local agents share a durable SQLite queue. Each account has its own worker, browser data and login. Each account executes one job; additional callers queue. Workers keep generating, downloading and finalizing after MCP clients disconnect. They restart on a subsequent client call after a crash or OS restart; this release does not install a Windows startup service.
 
-Tools: `image_generate`, `image_poll`, `image_status`, `image_open`, `image_cancel`.
+Register the same Python entrypoint (`-m web_images mcp`) and `CHATGPT_WEB_IMAGES_POOL` directory in Claude Code, Codex or other stdio MCP clients. Existing Codex plugin users should update the plugin instead of adding a duplicate server. The MCP descriptions contain the workflow, so loading a vendor-specific skill is optional.
 
-- `count=1..20` requests separate images in **one** web submission. Default 1; the LLM may choose 3–5 for related variants. The local cap is not a website quota or guarantee. Number each requested image in the prompt; do not accept a collage as multiple files.
-- Use exactly one of `prompt` / UTF-8 `prompt_file`. Reference images (up to 5 PNG/JPEG/WebP files) and output directories must use absolute paths.
-- A stable `request_id` reuses the original job for identical retries, even after completion. Changed input with the same ID is an error. Use a new ID for a new task.
-- `image_poll(job_id, wait_seconds=40)` waits internally. The 0–45 second polling budget excludes a browser operation already in flight. Keep polling the same job if unfinished; do not resubmit uncertain requests.
-- Compact responses preserve output paths, actual dimensions, bytes, hashes and counts. Use `detail=true` for complete provenance. Download checkpoints preserve progress after interruptions.
-- Missing images return `partial`; extra images return `count_mismatch`. Both are explicit MCP errors with saved files. Exact counts return `complete`.
+Create an isolated config directory per account with a `settings.json` containing absolute `data_dir`, installed `cli_entry` and `output_dir`. Register with `account-add --account-id primary --data-dir ... --config-dir ...`. Never copy another account's auth state. `open --account-id ...` queues a browser login action; after user login, run `check --account-id ...` and inspect `status`.
 
-Default data: `%LOCALAPPDATA%\ChatGPTWebImages`; outputs: its `output` subdirectory. Configuration: `~/.config/chatgpt-web-images/settings.json`. Use `configure --data-dir`, `--output-dir`, `--cli-entry`, or `--auth-file` for explicit local overrides. `doctor` checks runtime availability. Environment overrides are documented in the Chinese README.
+Submit once using a stable globally unique `request_id`. `queued`, `dispatching` and `running` are normal. Poll the same job (default 20 seconds, maximum 45); browser operations do not extend this budget. Use `account_id=auto` or a configured alias. Do not change accounts or request IDs to retry an uncertain submission. `needs_attention` pauses that lane briefly and then becomes `parked`, which releases the lane while keeping the job's account and conversation; `auto_retry_at` and `auto_retry_attempts_left` describe the unattended retries. After inspection, `image_resume` continues the same job. Cancel only on user request and verify the final cancelled state.
 
-`setup` installs pinned `@playwright/cli@0.1.19` in the dedicated data directory. No global npm installation and no npx lookup during generation. Sign in manually with `open`; no other application's cookies are imported by default. Optional storage-state import only reads the user-selected source file.
+Tools: `image_status`, `image_generate`, `image_poll`, `image_open`, `image_account_check`, `image_select_account`, `image_resume`, `image_cancel`. The first-party backend image model is unverified; website quotas and actual generation speed are not guaranteed. Count 1–20 is a local input bound, not a concurrency or website quota promise.
 
-Only one active generation job per data directory. No model switching, authentication/challenge bypass, automatic resubmission, upscaling, or screenshots passed off as originals. The internal image model is unverified; website limits and DOM changes still apply. Windows only in v0.2. Batch submission reduces orchestration overhead; generation speedup has not been benchmarked. Text prompts and metadata still consume context.
+`import-legacy --account-id primary` adopts observation of an existing job without recreating or resending its prompt. Original low-level CLI behavior remains available with `--legacy` for historical jobs. Keep private queue databases, profiles and generated output out of source control.
 
-See [validation](docs/VALIDATION.md), [release procedure](docs/RELEASING.md), [privacy](SECURITY.md), and [changelog](CHANGELOG.md). MIT licensed. Microsoft Playwright CLI and the official MCP Python SDK are installed separately under their own licenses.
+Tests: `test_web_images.py`, `test_mcp_protocol.py`, `test_image_pool.py`, `test_pool_protocol.py`, `test_account_contracts.py`, `test_throughput.py`, `test_account_browser.py` in scripts/. Synthetic browser fixtures validate contracts and process lifetime, not real-account image generation.

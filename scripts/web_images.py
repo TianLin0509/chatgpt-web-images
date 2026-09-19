@@ -17,8 +17,9 @@ import time
 import uuid
 from typing import Annotated
 from pydantic import Field
+from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.2.0'
+VERSION = '0.7.1'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -44,6 +45,9 @@ SESSION = 'chatgpt-web-images'
 CLI_ENTRY = setting('CHATGPT_WEB_IMAGES_CLI','cli_entry',DATA/'runtime'/'node_modules'/'@playwright'/'cli'/'playwright-cli.js')
 DEFAULT_OUTPUT = setting('CHATGPT_WEB_IMAGES_OUTPUT','output_dir',DATA/'output')
 TERMINAL = {'complete','failed','preparation_failed','cancelled','partial','count_mismatch'}
+CONVERSATION_URL = r'https://chatgpt\.com/c/[a-zA-Z0-9-]+'
+# Forced reloads spent on an identity mismatch before refusing to observe the conversation.
+IDENTITY_RETRIES = 2
 
 
 class ImageError(RuntimeError):
@@ -61,6 +65,26 @@ def write_json(path, value):
 
 def prompt_hash(text):
     return hashlib.sha256(text.replace('\r\n','\n').strip('\ufeff \t\r\n').encode('utf-8')).hexdigest()
+
+
+def loose_hash(text):
+    """Identity that survives how a browser laid the text out, not how we sent it.
+
+    innerText reports what a reader sees. A soft wrap inside a hyphenated word such as
+    On-Device comes back as 'On- Device', so the inserted space sits INSIDE a word and
+    merely collapsing whitespace runs would not remove it. Dropping whitespace entirely
+    is what makes the comparison independent of layout, and the remaining thousand-odd
+    characters still identify the prompt beyond any doubt.
+    """
+    return hashlib.sha256(re.sub(r'\s+', '', text).encode('utf-8')).hexdigest()
+
+
+def identity_matches(job, text):
+    """True when the open conversation really is this job's own request."""
+    if prompt_hash(text) == job.get('identity_hash', job['prompt_sha256']):
+        return True
+    expected = job.get('identity_loose')
+    return bool(expected) and loose_hash(text) == expected
 
 
 @contextlib.contextmanager
@@ -106,9 +130,17 @@ def cli(args, timeout=55):
         raise ImageError('browser_protocol_error', f'Playwright returned invalid JSON (exit {proc.returncode}); raw output withheld.') from exc
     if proc.returncode or envelope.get('isError'):
         # Do not echo traces, page HTML, signed URLs or potentially secret response bodies.
-        message = str(envelope.get('error', ''))
+        # The CLI may put the error in text content rather than `error`.
+        # Classify it locally; never expose traces, signed URLs or response bodies.
+        message = json.dumps(envelope, ensure_ascii=False)
         if 'not open' in message or 'No browser' in message:
             code = 'browser_not_open'
+        elif 'strict mode violation' in message:
+            code = 'browser_locator_ambiguous'
+        elif 'Target page, context or browser has been closed' in message or 'Target closed' in message:
+            code = 'browser_closed'
+        elif 'IMAGE_TOOL_UNAVAILABLE' in message:
+            code = 'image_tool_unavailable'
         elif 'Timeout' in message:
             code = 'browser_timeout'
         else:
@@ -136,14 +168,7 @@ def run_js(source, timeout=55):
         target.unlink(missing_ok=True)
 
 
-STATUS_JS = r'''async (page) => {
- const title=await page.title();
- const profile=page.getByTestId('accounts-profile-button');
- return {url:page.url(), logged_in:await profile.count()>0,
-   composer:await page.locator('#prompt-textarea').count()>0,
-   challenge:/Just a moment|checking your browser/i.test(title),
-   browser_session:'chatgpt-web-images', provider:'chatgpt-web', image_model_verified:false};
-}'''
+STATUS_JS = ACCOUNT_STATUS_JS
 
 
 def set_visible(visible):
@@ -176,7 +201,7 @@ def set_visible(visible):
     return bool(user32.IsWindowVisible(found[0])) == visible
 
 
-def ensure_browser():
+def ensure_browser(*, require_login=True, account_name=None):
     try:
         state = run_js(STATUS_JS)
     except ImageError as exc:
@@ -197,8 +222,22 @@ def ensure_browser():
           return true;
         }''')
         state = run_js(STATUS_JS)
+    if not any(state.get(key) for key in ('logged_in','account_chooser','challenge','credential_required')):
+        state = run_js(SETTLE_JS)
+    authorized = SETTINGS.get('account_name', '') if account_name is None else account_name
+    if state.get('account_chooser') and authorized and not state.get('challenge'):
+        state = run_js(selection_code(authorized))
+        if state.get('error_code') and require_login:
+            code = state['error_code']
+            raise ImageError(code, ERROR_MESSAGES[code])
+    state.update(browser_session=SESSION, provider='chatgpt-web', image_model_verified=False)
+    if not require_login:
+        return state
     if state.get('challenge'):
         raise ImageError('browser_challenge', 'Complete the verification in the dedicated browser using open.')
+    if state.get('account_chooser') or state.get('credential_required'):
+        code = state['auth_state']
+        raise ImageError(code, ERROR_MESSAGES[code])
     if not state.get('logged_in'):
         raise ImageError('login_required', 'Sign in in the dedicated browser using open.')
     return state
@@ -218,7 +257,7 @@ def job_path(job_id):
 def public_job(job):
     keys = ['job_id', 'status', 'conversation_url', 'output_dir', 'files', 'error',
             'provider', 'image_model_verified', 'prompt_sha256', 'created_at', 'updated_at',
-            'reference_count', 'window_hidden', 'requested_count', 'observed_count', 'count_match', 'submitted_prompt_sha256']
+            'reference_count', 'window_hidden', 'requested_count', 'observed_count', 'count_match', 'submitted_prompt_sha256', 'operation_stage']
     result={k:job[k] for k in keys if k in job}
     result['requested_count']=job.get('requested_count',1)
     result['downloaded_count']=len(job.get('files',[]))
@@ -232,7 +271,104 @@ def save_job(job):
     write_json(job_path(job['job_id']), job)
 
 
-def start(prompt='', prompt_file='', output_dir='', name='image', reference_images=None, count=1, request_id=''):
+def recover_existing(request_id):
+    """Observe an existing durable request; never execute prompt preparation or send."""
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', request_id):
+        raise ImageError('invalid_request_id', 'Invalid recovery request ID.')
+    with locked():
+        index = json.loads((DATA/'requests'/(request_id+'.json')).read_text(encoding='utf-8'))
+        job = json.loads(job_path(index['job_id']).read_text(encoding='utf-8'))
+        verify_outputs(job)
+        return public_job(job)
+
+
+def resume_existing(job_id):
+    """Explicitly renew only the observation deadline; keep the same conversation."""
+    with locked():
+        job = json.loads(job_path(job_id).read_text(encoding='utf-8'))
+        if job['status'] in TERMINAL:
+            return public_job(job)
+        active = active_job()
+        if not active or active['job_id'] != job_id:
+            raise ImageError('job_not_active', 'The original job no longer owns this browser.')
+        job['wait_started_at'] = time.time()
+        job['refresh_requested'] = True
+        if job['status'] == 'needs_attention':
+            job['status'] = 'generating'
+        job.pop('error', None)
+        save_job(job)
+        return public_job(job)
+
+
+def park(job_id):
+    """Release browser ownership of a stalled job without abandoning its conversation.
+
+    A paused job used to hold its account until a human intervened, which idled the
+    whole lane. Parking keeps the runtime record, the conversation URL and every
+    downloaded file, and only gives the browser back so queued work can proceed.
+    """
+    with locked():
+        job = json.loads(job_path(job_id).read_text(encoding='utf-8'))
+        if job['status'] in TERMINAL:
+            return public_job(job)
+        active = active_job()
+        if active and active['job_id'] == job_id:
+            (DATA / 'active.json').unlink(missing_ok=True)
+        job['parked_at'] = time.time()
+        job.pop('refresh_requested', None)
+        save_job(job)
+        return public_job(job)
+
+
+def adopt(job_id):
+    """Re-take browser ownership of a parked job; observation only, never resends."""
+    with locked():
+        job = json.loads(job_path(job_id).read_text(encoding='utf-8'))
+        if job['status'] in TERMINAL:
+            return public_job(job)
+        active = active_job()
+        if active and active['job_id'] != job_id:
+            raise ImageError('job_active', f"Job {active['job_id']} owns the browser; adopt this job later.")
+        url = job.get('conversation_url', '')
+        if not re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+', url):
+            raise ImageError('adopt_without_conversation', 'This job never recorded a conversation; inspect the browser manually.')
+        ensure_browser()
+        cli(['goto', url])
+        run_js('''async page => {
+          await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+          return true;
+        }''')
+        write_json(DATA / 'active.json', {'job_id': job_id})
+        job['wait_started_at'] = time.time()
+        job.pop('parked_at', None)
+        job.pop('identity_retry', None)
+        job.pop('error', None)
+        if job['status'] == 'needs_attention':
+            job['status'] = 'generating'
+        save_job(job)
+        return public_job(job)
+
+
+def release_browser():
+    """Close an idle lane's browser so many lanes do not all hold memory at once.
+
+    The persistent profile keeps the login, so the next job reopens it through
+    ensure_browser without another sign-in. Never closes a browser that owns a job.
+    """
+    with locked():
+        active = active_job()
+        if active:
+            raise ImageError('job_active', f"Job {active['job_id']} owns this browser; it will not be closed.")
+        try:
+            cli(['close'])
+        except ImageError as exc:
+            if exc.code != 'browser_not_open':
+                raise
+            return {'closed': False, 'reason': 'browser_not_open'}
+        return {'closed': True}
+
+
+def validate_request(prompt='', prompt_file='', output_dir='', name='image', reference_images=None, count=1, request_id='', conversation_url=''):
     if request_id and not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',request_id):
         raise ImageError('invalid_request_id','request_id must contain 1-100 ASCII letters, numbers, underscores or hyphens.')
     if request_id.upper() in {'CON','PRN','AUX','NUL',*(f'COM{i}' for i in range(1,10)),*(f'LPT{i}' for i in range(1,10))}:
@@ -263,10 +399,24 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
         refs.append(str(ref))
     if len(refs)>5:
         raise ImageError('invalid_reference', 'At most five reference images per job.')
+    if conversation_url and not re.fullmatch(CONVERSATION_URL, conversation_url):
+        raise ImageError('invalid_conversation','conversation_url must be an existing ChatGPT conversation link.')
     # Content identity binds a retry key to its exact request, including reference bytes.
+    # A follow-up into another conversation is a different request, so it is hashed in too.
     request_hash=hashlib.sha256(json.dumps({'prompt':prompt,'count':count,'output_dir':str(out.resolve()),
-        'name':name,'references':[(p,hashlib.sha256(Path(p).read_bytes()).hexdigest()) for p in refs]},
+        'name':name,'conversation':conversation_url,
+        'references':[(p,hashlib.sha256(Path(p).read_bytes()).hexdigest()) for p in refs]},
         sort_keys=True,ensure_ascii=False).encode('utf-8')).hexdigest()
+    return dict(prompt=prompt, output_dir=str(out.resolve()), name=name,
+                reference_images=refs, count=count, request_id=request_id,
+                conversation_url=conversation_url), request_hash
+
+
+def start(prompt='', prompt_file='', output_dir='', name='image', reference_images=None, count=1, request_id='', conversation_url=''):
+    validated, request_hash = validate_request(prompt, prompt_file, output_dir, name, reference_images, count, request_id, conversation_url)
+    prompt = validated['prompt']
+    out = Path(validated['output_dir'])
+    refs = validated['reference_images']
     original_hash=hashlib.sha256(prompt.encode('utf-8')).hexdigest()
     if count>1:
         prompt += (f'\n\n[图片交付数量要求]\n本次请求需要 {count} 张独立生成的图片，'
@@ -294,40 +444,70 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
                    created_at=time.time(), output_dir=str(out.resolve()), name=name,
                    prompt_sha256=original_hash, requested_count=count, observed_count=0,
                    submitted_prompt_sha256=hashlib.sha256(prompt.encode('utf-8')).hexdigest(),
-                   identity_hash=prompt_hash(prompt),
+                   identity_hash=prompt_hash(prompt), identity_loose=loose_hash(prompt),
                    reference_count=len(refs), files=[])
         save_job(job)
         write_json(DATA / 'active.json', {'job_id':job_id})
         if request_id:
             write_json(previous_path,{'request_hash':request_hash,'job_id':job_id})
         try:
-            cli(['goto','https://chatgpt.com/'])
+            job['operation_stage'] = 'continue_conversation' if conversation_url else 'new_conversation'
+            job['conversation_url'] = conversation_url or job.get('conversation_url', '')
+            save_job(job)
+            cli(['goto', conversation_url or 'https://chatgpt.com/'])
+            job['operation_stage'] = 'wait_composer'
+            save_job(job)
+            # A follow-up lands after messages that are already in the thread, so waiting
+            # for 'a user message exists' would return instantly. Count them while waiting
+            # for the composer, which costs no extra browser round trip.
+            before = run_js(r'''async page => {
+              await page.locator('#prompt-textarea').waitFor({state:'visible',timeout:45000});
+              await page.getByTestId('composer-plus-btn').waitFor({state:'visible',timeout:5000});
+              return await page.evaluate(() => document.querySelectorAll('[data-message-author-role="user"]').length);
+            }''')
+            before = before if type(before) is int else 0
+            job['operation_stage'] = 'fill_prompt'
+            save_job(job)
+            run_js(FILL_PROMPT_JS.replace('__PROMPT__',json.dumps(prompt)))
+            job['operation_stage'] = 'select_image_tool'
+            save_job(job)
             run_js(r'''async page => {
-              await page.locator('#prompt-textarea').waitFor({timeout:20000});
-              await page.getByTestId('composer-plus-btn').click();
-              await page.getByText('Create image',{exact:true}).click();
+              await page.getByTestId('composer-plus-btn').press('Enter',{timeout:10000});
+              // The sidebar can contain a chat also titled 'Create image'.
+              // Only the open composer action group/menu is a valid tool entry.
+              const tool=page.locator('[role="menu"], [role="group"]')
+                .getByText(/^(Create image|Create images|创建图片|创建图像|生成图片)$/);
+              try { await tool.click({timeout:15000}); }
+              catch(e) { throw new Error('IMAGE_TOOL_UNAVAILABLE: '+e.name); }
+              await page.locator('#prompt-textarea [data-inline-selection-pill][data-system-hint-type="picture_v2"]').waitFor({state:'attached',timeout:10000});
               return true;
             }''')
             if refs:
+                job['operation_stage'] = 'upload_references'
+                save_job(job)
                 run_js('''async page => {
                   const input=page.locator('input[type="file"]').first();
                   await input.setInputFiles(''' + json.dumps(refs) + ''');
                   return {uploaded:''' + str(len(refs)) + '''};
                 }''')
             job['status']='submitting'
+            job['operation_stage']='submit_prompt'
             save_job(job)
             result=run_js(r'''async page => {
-              const prompt=__PROMPT__;
               const composer=page.locator('#prompt-textarea');
-              await composer.fill(prompt);
+              // Filling here would erase ChatGPT's inline image-tool selection.
+              if(!await composer.locator('[data-inline-selection-pill][data-system-hint-type="picture_v2"]').count())
+                throw new Error('IMAGE_TOOL_UNAVAILABLE');
               const button=page.getByTestId('send-button');
               await button.waitFor({state:'visible', timeout:20000});
               await button.click({timeout:20000});
-              await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+              await page.waitForFunction(n => document.querySelectorAll('[data-message-author-role="user"]').length > n,
+                                         __BEFORE__, {timeout:20000});
               await page.waitForURL(/^https:\/\/chatgpt\.com\/c\/[a-zA-Z0-9-]+$/, {timeout:20000});
               return {url:page.url()};
-            }'''.replace('__PROMPT__',json.dumps(prompt)))
+            }'''.replace('__BEFORE__', str(int(before))))
             job['status']='generating'
+            job['operation_stage']='observe_images'
             job['conversation_url']=result['url']
             job['window_hidden']=set_visible(False)
             save_job(job)
@@ -341,6 +521,12 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
                 (DATA/'active.json').unlink(missing_ok=True)
         return public_job(job)
 
+
+FILL_PROMPT_JS = r'''async page => {
+ const composer=page.locator('#prompt-textarea');
+ await composer.fill(__PROMPT__);
+ return true;
+}'''
 
 DOM_IMAGES_JS = r"""
 function ownedImages() {
@@ -371,19 +557,38 @@ POLL_JS = r'''async page => {
  return await page.evaluate(()=>{
    __DOM__
    const users=Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+   const lastUser=users.at(-1);
+   // Collapsed long messages include a Show more/less button outside the prompt.
+   // Read the full content container, never UI labels. Keep exact identity checks.
+   const userContent=lastUser?.querySelector('[data-testid="collapsible-user-message-content"]')||lastUser;
+   let userText=userContent?.innerText||'';
+   if(userContent?.querySelector('[data-inline-selection-pill][data-id="picture_v2"]')) {
+     // The image tool is rendered inside the user message but is not prompt text.
+     // Remove only its typed DOM marker, never matching words in the user's text.
+     const copy=userContent.cloneNode(true);
+     copy.querySelectorAll('[data-inline-selection-pill][data-id="picture_v2"]').forEach(n=>n.remove());
+     userText=copy.textContent||'';
+   }
    const turns=Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"]'));
    const assets=ownedImages();
+   // A turn only grows its action footer once it is finished. copy-turn-action-button
+   // is present on both image replies and text replies, so it is the shared signal.
+   // Containment, not order, is what distinguishes 'the user's own turn is last'.
+   const lastTurn=turns.at(-1);
+   const turnComplete=!!lastTurn&&!!lastTurn.querySelector('[data-testid="copy-turn-action-button"]')
+     &&!!lastUser&&!!(lastUser.compareDocumentPosition(lastTurn)&Node.DOCUMENT_POSITION_FOLLOWING);
    return {url:location.href,stop:!!document.querySelector('[data-testid="stop-button"]'),
+     turn_complete:turnComplete,
      images:assets.filter(a=>a.ready).map(({node,...a})=>a),
      pending_images:assets.filter(a=>!a.ready).length,
-     text:(turns.at(-1)?.innerText||'').slice(-1600),user_count:users.length,user_text:users.at(-1)?.innerText||''};
+     text:(turns.at(-1)?.innerText||'').slice(-1600),user_count:users.length,user_text:userText};
  });
 }'''.replace('__DOM__',DOM_IMAGES_JS)
 
 DOWNLOAD_JS = r'''async page => {
  const dialog=page.getByRole('dialog').filter({has:page.getByRole('button',{name:/^Save$|^保存$/})});
  if(await dialog.count()) {
-   await dialog.getByRole('button',{name:/^Close$|^关闭$/}).click({timeout:10000});
+   await dialog.getByRole('button',{name:/^Close$|^Close fullscreen view$|^关闭$|^关闭全屏视图$/}).click({timeout:10000});
    await dialog.waitFor({state:'hidden',timeout:10000});
  }
  const key=__KEY__;
@@ -409,10 +614,20 @@ DOWNLOAD_JS = r'''async page => {
  }
  await img.click({timeout:10000});
  await dialog.waitFor({state:'visible',timeout:15000});
- const [download]=await Promise.all([
-   page.waitForEvent('download',{timeout:30000}),
-   dialog.getByRole('button',{name:/^Save$|^保存$/}).click({timeout:10000})
- ]);
+ const downloadPromise=page.waitForEvent('download',{timeout:30000});
+ // Some multi-image editors now open a download menu instead of downloading immediately.
+ const download=await Promise.all([
+   downloadPromise,
+   (async()=>{
+     await dialog.getByRole('button',{name:/^Save$|^保存$/}).click({timeout:10000});
+     const single=page.getByRole('menuitem',{name:/^Download image$|^下载图片$/});
+     const menu=await Promise.race([
+       downloadPromise.then(()=>null),
+       single.waitFor({state:'visible',timeout:10000}).then(()=>single)
+     ]);
+     if(menu)await menu.click({timeout:10000});
+   })()
+ ]).then(results=>results[0]);
  if(await download.failure())throw new Error('Image download failed');
  await download.saveAs(__TARGET__);
  return {saved:true};
@@ -496,9 +711,30 @@ def poll(job_id):
               return true;
             }''')
         result=run_js(POLL_JS)
-        expected=job.get('identity_hash',job['prompt_sha256'])
-        if result['user_count'] and prompt_hash(result['user_text'])!=expected:
+        if job.pop('refresh_requested', False):
+            # An explicit resume, or a first identity mismatch, may be looking at a stale
+            # DOM. Reload the RECORDED conversation before judging identity: validating
+            # first would make this recovery path unreachable exactly when it is needed,
+            # and reloading whatever page is open cannot repair a drifted browser.
+            save_job(job)
+            if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',url):
+                cli(['goto',url])
+                run_js('''async page => {
+                  await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+                  return true;
+                }''')
+                result=run_js(POLL_JS)
+        if result['user_count'] and not identity_matches(job,result['user_text']):
+            # A half-rendered or stale conversation is indistinguishable from a different
+            # one. Spend a bounded number of forced reloads before refusing to continue;
+            # a real mismatch still pauses without downloading or resending anything.
+            if job.get('identity_retry',0) < IDENTITY_RETRIES and re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',url):
+                job['identity_retry']=job.get('identity_retry',0)+1
+                job['refresh_requested']=True
+                save_job(job)
+                return public_job(job)
             raise ImageError('conversation_changed','The browser contains a different prompt; do not download or resend. Open the recorded conversation and poll again.')
+        job.pop('identity_retry',None)
         if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',result['url']):
             job['conversation_url']=result['url']
         # Deduplicate repeated DOM representations of the same generated asset.
@@ -506,14 +742,19 @@ def poll(job_id):
         job['observed_count']=len(assets)
         pending=result.get('pending_images',0)
         if not result['user_count'] or not assets or result['stop'] or pending:
-            if time.time()-job['created_at']>900:
+            if time.time()-job.get('wait_started_at',job['created_at'])>900:
                 job['status']='needs_attention'
                 job['error']={'code':'generation_wait_exceeded','message':'Generation has not settled after 15 minutes. Inspect the existing conversation; the prompt has not been resent.'}
-            if not result['stop'] and result['user_count'] and re.search(
-                r"unable to generate|couldn.t generate|can.t generate|image generation limit|too many requests|无法生成|达到.*上限",
-                result['text'],re.I) and not assets and not pending:
+            if (not result['stop'] and result['user_count'] and not assets and not pending
+                    and result.get('turn_complete')):
+                # ChatGPT finished answering and produced no image. Waiting the full
+                # observation budget here taught the caller nothing; its own words are
+                # the useful reply, so hand them over and let the caller adjust.
+                refused=re.search(r"unable to generate|couldn.t generate|can.t generate|image generation limit|"
+                                  r"too many requests|无法生成|不能生成|达到.*上限", result['text'], re.I)
                 job['status']='failed'
-                job['error']={'code':'generation_failed','message':result['text'][:800]}
+                job['error']={'code':'generation_failed' if refused else 'no_image_in_reply',
+                              'message':result['text'][:800]}
                 (DATA/'active.json').unlink(missing_ok=True)
             save_job(job)
             return public_job(job)
@@ -584,23 +825,33 @@ def compact_result(result,detail=False):
 
 def status():
     with locked():
-        result=ensure_browser()
-        cli(['state-save',str(DATA/'auth-state.json')])
+        result=ensure_browser(require_login=False)
+        if result.get('logged_in'):
+            cli(['state-save',str(DATA/'auth-state.json')])
         result['active_job']=active_job()
-        result['window_hidden']=set_visible(False)
+        result['window_hidden']=set_visible(False) if result.get('logged_in') else False
         return result
 
 
 def open_browser():
     with locked():
-        try:
-            result=ensure_browser()
-        except ImageError as exc:
-            if exc.code not in {'login_required','browser_challenge'}:
-                raise
-            result={'logged_in':False,'error':exc.code}
+        result=ensure_browser(require_login=False)
         result['visible']=set_visible(True)
         return result
+
+
+def select_account(account_name, remember=True):
+    # The explicit argument is the user's authorization, never a guessed identity.
+    selection_code(account_name)
+    with locked():
+        result = ensure_browser(account_name=account_name.strip())
+        cli(['state-save',str(DATA/'auth-state.json')])
+        if remember:
+            settings = load_settings()
+            settings['account_name'] = account_name.strip()
+            write_json(CONFIG_FILE, settings)
+            SETTINGS.update(settings)
+        return {**result, 'account_name':account_name.strip(), 'remembered':remember}
 
 
 def cancel(job_id):
@@ -611,7 +862,7 @@ def cancel(job_id):
             raise ImageError('job_not_active','This job does not own the browser.')
         ensure_browser()
         result=run_js(POLL_JS)
-        if result['user_count'] and prompt_hash(result['user_text'])!=job.get('identity_hash',job['prompt_sha256']):
+        if result['user_count'] and not identity_matches(job,result['user_text']):
             raise ImageError('conversation_changed','A different prompt is open; refusing to stop it.')
         if result['stop']:
             run_js('''async page => {
@@ -667,6 +918,10 @@ def create_mcp():
         """Show only the dedicated image browser for login or inspecting a failed job."""
         return call(open_browser)
     @mcp.tool(structured_output=False)
+    def image_select_account(account_name: str, remember: bool=True) -> str:
+        """Select an explicitly user-authorized remembered ChatGPT account. Wait if already signing in. Optionally remember its name for automatic recovery; never handles passwords or verification codes."""
+        return call(select_account,account_name=account_name,remember=remember)
+    @mcp.tool(structured_output=False)
     def image_generate(prompt: str='', prompt_file: str='', output_dir: str='', name: str='image', reference_images: list[str]|None=None, count: Annotated[int,Field(strict=True,ge=1,le=20)]=1, request_id: str='', detail: bool=False) -> str:
         """One web request for count independent images. Choose count; 1-20 is a local cap. Use paths for references and a unique request_id; identical retries reuse the job. Poll to save originals."""
         return call(start,detail=detail,prompt=prompt,prompt_file=prompt_file,output_dir=output_dir,name=name,reference_images=reference_images,count=count,request_id=request_id)
@@ -681,16 +936,30 @@ def create_mcp():
     return mcp
 
 
-def serve():
-    create_mcp().run(transport='stdio')
+def serve(legacy=False):
+    if legacy:
+        create_mcp().run(transport='stdio')
+    else:
+        from image_service import create_mcp as pooled_mcp
+        pooled_mcp().run(transport='stdio')
 
 
 def main():
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
+    if '--legacy' in sys.argv:
+        sys.argv.remove('--legacy')
+        legacy = True
+    else:
+        legacy = False
+    if not legacy and (len(sys.argv) == 1 or sys.argv[1] not in {'setup','doctor','configure','--version'}):
+        from image_service import main as pool_main
+        return pool_main(sys.argv[1:] or ['--help'])
     parser=argparse.ArgumentParser()
     parser.add_argument('--version',action='version',version=VERSION)
-    parser.add_argument('command',choices=['mcp','status','open','generate','poll','cancel','setup','doctor','configure'])
+    parser.add_argument('command',choices=['mcp','status','open','select-account','generate','poll','cancel','setup','doctor','configure'])
+    parser.add_argument('--account-name',default='')
+    parser.add_argument('--no-remember',action='store_true')
     parser.add_argument('--prompt-file',default='')
     parser.add_argument('--output-dir',default='')
     parser.add_argument('--name',default='image')
@@ -705,10 +974,12 @@ def main():
     parser.add_argument('--auth-file',default='')
     args=parser.parse_args()
     if args.command=='mcp':
-        serve()
+        serve(legacy=legacy)
         return 0
     if args.command=='generate':
         result=safe_call(start,prompt_file=args.prompt_file,output_dir=args.output_dir,name=args.name,reference_images=args.reference,count=args.count,request_id=args.request_id)
+    elif args.command=='select-account':
+        result=safe_call(select_account,account_name=args.account_name,remember=not args.no_remember)
     elif args.command in {'poll','cancel'}:
         result=safe_call(poll_wait,job_id=args.job_id,wait_seconds=args.wait_seconds) if args.command=='poll' else safe_call(cancel,job_id=args.job_id)
     elif args.command in {'setup','doctor','configure'}:

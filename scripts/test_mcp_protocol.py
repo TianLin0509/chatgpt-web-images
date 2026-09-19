@@ -21,7 +21,7 @@ def fixture_server():
                 'downloaded_count':5,'missing_count':0,'extra_count':0,'count_match':True,'files':[],
                 'prompt_sha256':'a'*64,'provider':'chatgpt-web','image_model_verified':False}
         with patch.object(w,'poll',side_effect=poll),patch.object(w,'ensure_browser',return_value={'logged_in':True}),patch.object(w,'cli'),patch.object(w,'set_visible',return_value=True),patch.object(w,'run_js',side_effect=lambda source,**kw: {'url':'https://chatgpt.com/c/fixture'} if 'button.click' in source else True):
-            w.serve()
+            w.serve(legacy=True)
 
 
 async def check():
@@ -33,7 +33,9 @@ async def check():
         async with ClientSession(read,write,read_timeout_seconds=timedelta(seconds=30)) as session:
             await session.initialize()
             catalog=await session.list_tools()
-            assert len(catalog.tools)==5
+            assert len(catalog.tools)==6
+            account=next(t for t in catalog.tools if t.name=='image_select_account')
+            assert 'account_name' in account.inputSchema['required']
             gen=next(t for t in catalog.tools if t.name=='image_generate')
             poll=next(t for t in catalog.tools if t.name=='image_poll')
             assert gen.inputSchema['properties']['count']['maximum']==20

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatgpt-web-images"
-version = "0.2.0"
+version = "0.7.1"
 description = "Local Windows MCP for ChatGPT web image generation, without image base64 in tool responses"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,5 +21,5 @@ Repository = "https://github.com/TianLin0509/chatgpt-web-images"
 Issues = "https://github.com/TianLin0509/chatgpt-web-images/issues"
 
 [tool.setuptools]
-py-modules = ["web_images", "web_images_setup"]
+py-modules = ["web_images", "web_images_setup", "chatgpt_account", "image_pool", "image_worker", "image_service"]
 package-dir = {"" = "scripts"}
