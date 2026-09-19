@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from pathlib import Path
 import sys
 from typing import Annotated
 
@@ -147,10 +148,11 @@ def create_mcp(pool=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['mcp','status','open','check','select-account','generate','poll','cancel','resume','account-add','account-clone','account-scale','account-reseed','account-enable','import-legacy'])
+    parser.add_argument('command', choices=['mcp','status','open','check','select-account','generate','generate-batch','poll','cancel','resume','account-add','account-clone','account-scale','account-reseed','account-enable','import-legacy'])
     parser.add_argument('--account-id', default='auto')
     parser.add_argument('--clone-from', default='')
     parser.add_argument('--lanes', type=int, default=0)
+    parser.add_argument('--requests-file', default='')
     parser.add_argument('--account-name', default='')
     parser.add_argument('--no-remember', action='store_true')
     parser.add_argument('--prompt-file', default='')
@@ -197,6 +199,16 @@ def main(argv=None):
         if args.command == 'generate':
             return pool.submit(account_id=args.account_id, prompt=args.prompt, prompt_file=args.prompt_file, output_dir=args.output_dir,
                                name=args.name, reference_images=args.reference, count=args.count, request_id=args.request_id)
+        if args.command == 'generate-batch':
+            source = Path(args.requests_file)
+            if not source.is_absolute() or not source.is_file():
+                raise w.ImageError('invalid_batch', '--requests-file must be an existing absolute JSON file.')
+            requests = json.loads(source.read_text(encoding='utf-8-sig'))
+            shared = {'count': args.count}
+            if args.output_dir:
+                shared['output_dir'] = args.output_dir
+            merged = [{**shared, **entry} if isinstance(entry, dict) else entry for entry in requests]
+            return pool.submit_many(merged, account_id=args.account_id)
         if args.command == 'poll':
             start_errors = pool.ensure_workers()
             if len(args.job_id) > 1:
