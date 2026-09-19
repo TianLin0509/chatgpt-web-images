@@ -19,7 +19,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.4.0'
+VERSION = '0.5.0'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -326,6 +326,25 @@ def adopt(job_id):
             job['status'] = 'generating'
         save_job(job)
         return public_job(job)
+
+
+def release_browser():
+    """Close an idle lane's browser so many lanes do not all hold memory at once.
+
+    The persistent profile keeps the login, so the next job reopens it through
+    ensure_browser without another sign-in. Never closes a browser that owns a job.
+    """
+    with locked():
+        active = active_job()
+        if active:
+            raise ImageError('job_active', f"Job {active['job_id']} owns this browser; it will not be closed.")
+        try:
+            cli(['close'])
+        except ImageError as exc:
+            if exc.code != 'browser_not_open':
+                raise
+            return {'closed': False, 'reason': 'browser_not_open'}
+        return {'closed': True}
 
 
 def validate_request(prompt='', prompt_file='', output_dir='', name='image', reference_images=None, count=1, request_id=''):

@@ -25,7 +25,10 @@ PARKED = 'parked'
 PARK_AFTER_SECONDS = 120
 # Unattended re-observation delays for a parked job; afterwards it waits for a human.
 ADOPT_BACKOFF = (60, 300, 900)
-VERSION = '0.4.0'
+# Every lane is a full browser profile (~0.6 GB resident), so the cap is about the
+# machine, not about ChatGPT. Raising it without free memory only causes swapping.
+MAX_LANES = 16
+VERSION = '0.5.0'
 
 
 @contextlib.contextmanager
@@ -49,6 +52,11 @@ def launch_lock(path):
 def pool_root():
     return Path(os.environ.get('CHATGPT_WEB_IMAGES_POOL') or
                 w.SETTINGS.get('pool_dir') or w.DATA.parent / 'ChatGPTWebImagesPool').resolve()
+
+
+def login_group(account):
+    """The ChatGPT login a lane belongs to; several lanes can share one login."""
+    return account['login_group'] or account['id']
 
 
 def identifier(value):
@@ -90,6 +98,10 @@ class Pool:
                                 ('retry_after', 'REAL NOT NULL DEFAULT 0')):
                 if column not in known:
                     db.execute('ALTER TABLE jobs ADD COLUMN ' + column + ' ' + ddl)
+            # A lane is one browser profile. Several lanes can share one ChatGPT login,
+            # and login_group is what the website rate-limits, so scheduling balances on it.
+            if 'login_group' not in {row['name'] for row in db.execute('PRAGMA table_info(accounts)')}:
+                db.execute("ALTER TABLE accounts ADD COLUMN login_group TEXT NOT NULL DEFAULT ''")
             db.execute('CREATE INDEX IF NOT EXISTS jobs_parked ON jobs(account_id, status, retry_after)')
 
     def connect(self):
@@ -160,8 +172,52 @@ class Pool:
         w.write_json(config / 'settings.json', settings)
         shutil.copy2(auth, data / 'auth-state.json')
         row = self.add_account(account_id, str(data), str(config), enabled=enabled)
-        return {'ok': True, 'account_id': row['id'], 'cloned_from': source_id, 'data_dir': row['data_dir'],
-                'enabled': bool(row['enabled']), 'next_action': 'image_account_check'}
+        group = login_group(source)
+        with self.connect() as db:
+            db.execute('UPDATE accounts SET login_group=?,updated=? WHERE id=?', (group, time.time(), account_id))
+        return {'ok': True, 'account_id': row['id'], 'login_group': group, 'cloned_from': source_id,
+                'data_dir': row['data_dir'], 'enabled': bool(row['enabled']), 'next_action': 'image_account_check'}
+
+    def scale_account(self, account_id, lanes, enabled=True):
+        """Give one ChatGPT login the requested number of parallel browser lanes.
+
+        Surplus lanes are disabled, never deleted: their profiles hold a real login and
+        possibly an unfinished conversation, so removing them is the user's decision.
+        """
+        if type(lanes) is not int or not 1 <= lanes <= MAX_LANES:
+            raise w.ImageError('invalid_lane_count', 'Choose 1 to %d lanes; each lane is a full browser profile.' % MAX_LANES)
+        group = login_group(self.account(account_id))
+        with self.connect() as db:
+            rows = [dict(r) for r in db.execute('SELECT * FROM accounts ORDER BY id')]
+        mine = {r['id'] for r in rows if login_group(r) == group}
+        if len(rows) - len(mine) + lanes > MAX_LANES:
+            raise w.ImageError('lane_budget_exceeded', 'Total lanes would exceed %d; scale another login down first.' % MAX_LANES)
+        wanted = [group] + [group + '-' + str(index) for index in range(2, lanes + 1)]
+        added = [self.clone_account(group, lane, enabled=enabled)['account_id'] for lane in wanted if lane not in mine]
+        disabled = [lane for lane in sorted(mine) if lane not in wanted]
+        for lane in disabled:
+            self.enable(lane, False)
+        for lane in wanted:
+            if lane in mine:
+                self.enable(lane, enabled)
+        return {'ok': True, 'login_group': group, 'lanes': wanted, 'added': added, 'disabled': disabled,
+                'next_action': 'image_account_check_each_new_lane' if added else 'image_status'}
+
+    def reseed_account(self, account_id):
+        """Refresh an idle lane's saved login from its group leader after a re-login."""
+        lane = self.account(account_id)
+        group = login_group(lane)
+        if lane['id'] == group:
+            raise w.ImageError('reseed_leader', 'The group leader holds the original login; check it instead.')
+        with self.connect() as db:
+            if db.execute("SELECT 1 FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')", (account_id,)).fetchone():
+                raise w.ImageError('account_busy', 'A job owns this lane; do not replace its login identity now.')
+        auth = Path(self.account(group)['data_dir']) / 'auth-state.json'
+        if not auth.is_file():
+            raise w.ImageError('clone_without_login', 'Check the group leader first so its login state is saved.')
+        shutil.copy2(auth, Path(lane['data_dir']) / 'auth-state.json')
+        self.account_state(account_id, 'not_checked', False)
+        return {'ok': True, 'account_id': account_id, 'login_group': group, 'next_action': 'image_account_check'}
 
     def enable(self, account_id, enabled):
         self.account(account_id)
@@ -258,9 +314,10 @@ class Pool:
                 result['queue_position'] = db.execute("SELECT COUNT(*) FROM jobs WHERE status='queued' AND created<=?", (row['created'],)).fetchone()[0]
             lanes = self.status()['accounts']
             lanes = [a for a in lanes if row['preferred'] in ('auto', a['id'])]
-            result['blocking_accounts'] = [
-                {k: a[k] for k in ('id', 'state', 'worker_alive', 'worker_stalled', 'active_job_id', 'active_job_status')}
-                for a in lanes if not a['enabled'] or not a['ready'] or not a['worker_alive'] or a['worker_stalled'] or a['active_job_id']]
+            blocking = [{k: a[k] for k in ('id', 'login_group', 'state', 'worker_alive', 'worker_stalled', 'active_job_id', 'active_job_status')}
+                        for a in lanes if not a['enabled'] or not a['ready'] or not a['worker_alive'] or a['worker_stalled'] or a['active_job_id']]
+            result['blocking_lane_count'] = len(blocking)
+            result['blocking_accounts'] = blocking[:5]
             if lanes and all(not a['enabled'] or not a['ready'] or a['worker_stalled'] or
                              a['active_job_status'] == 'needs_attention' for a in lanes):
                 result['next_action'] = 'inspect_blocking_accounts'
@@ -366,11 +423,37 @@ class Pool:
             account = db.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
             if not account or not account['enabled'] or not account['ready']:
                 return None
-            queued = db.execute("SELECT * FROM jobs WHERE status='queued' AND preferred IN ('auto',?) ORDER BY created,id LIMIT 1", (account_id,)).fetchone()
+            group = login_group(account)
+            # An explicit pin names either this lane or its login, and always wins.
+            queued = db.execute("SELECT * FROM jobs WHERE status='queued' AND preferred IN (?,?) ORDER BY created,id LIMIT 1",
+                                (account_id, group)).fetchone()
+            if not queued:
+                # Spreading auto work evenly over logins is what keeps one ChatGPT account
+                # from absorbing a whole burst, so a busier login lets the other go first.
+                if not self.fair_turn(db, group):
+                    return None
+                queued = db.execute("SELECT * FROM jobs WHERE status='queued' AND preferred='auto' ORDER BY created,id LIMIT 1").fetchone()
             if not queued:
                 return None
             db.execute("UPDATE jobs SET status='dispatching',account_id=?,updated=? WHERE id=?", (account_id, time.time(), queued['id']))
             return dict(db.execute('SELECT * FROM jobs WHERE id=?', (queued['id'],)).fetchone())
+
+    def fair_turn(self, db, group):
+        """True unless another login with a free lane is carrying strictly less work.
+
+        Fails open: a login whose worker is not heartbeating is not counted as free, so a
+        dead lane can never stall the queue waiting for its turn.
+        """
+        load, free = {}, {group}
+        alive = time.time() - 20
+        for row in db.execute('SELECT * FROM accounts'):
+            name = login_group(row)
+            busy = db.execute("SELECT 1 FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention') LIMIT 1",
+                              (row['id'],)).fetchone()
+            load[name] = load.get(name, 0) + (1 if busy else 0)
+            if not busy and row['enabled'] and row['ready'] and row['heartbeat'] > alive:
+                free.add(name)
+        return load.get(group, 0) <= min(load.get(name, 0) for name in free)
 
     def account_state(self, account_id, state, ready=False, error=None):
         with self.connect() as db:
@@ -425,6 +508,7 @@ class Pool:
             accounts = []
             for row in db.execute('SELECT * FROM accounts ORDER BY id'):
                 account = {k: row[k] for k in ('id','enabled','ready','state','heartbeat','updated')}
+                account['login_group'] = login_group(row)
                 account['worker_alive'] = time.time() - row['heartbeat'] < 20
                 health = self.worker_health(row['id'])
                 account['worker_version'] = health.get('version', 'unknown')
@@ -444,7 +528,17 @@ class Pool:
                     account['last_control']['result'] = json.loads(control['result'] or '{}')
                 accounts.append(account)
             counts = {r['status']: r['n'] for r in db.execute('SELECT status,COUNT(*) n FROM jobs GROUP BY status')}
+        groups = {}
+        for account in accounts:
+            slot = groups.setdefault(account['login_group'], {'login_group': account['login_group'],
+                                     'lanes': 0, 'enabled_lanes': 0, 'usable_lanes': 0, 'busy_lanes': 0, 'parked_jobs': 0})
+            slot['lanes'] += 1
+            slot['enabled_lanes'] += bool(account['enabled'])
+            slot['usable_lanes'] += bool(account['enabled'] and account['ready'] and account['worker_alive'] and not account['worker_stalled'])
+            slot['busy_lanes'] += bool(account['active_job_id'])
+            slot['parked_jobs'] += account['parked_jobs']
         return {'ok': True, 'service': 'local-durable-pool', 'version': VERSION, 'accounts': accounts, 'jobs': counts,
+                'logins': sorted(groups.values(), key=lambda g: g['login_group']),
                 'configured_capacity': sum(bool(a['enabled']) for a in accounts),
                 'parallel_capacity': sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and not a['worker_stalled'] and a['active_job_status'] != 'needs_attention') for a in accounts)}
 

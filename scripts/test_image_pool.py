@@ -21,6 +21,7 @@ class FakeRuntime:
         self.starts = 0
         self.polls = 0
         self.adopts = 0
+        self.released = 0
         self.failed = False
         self.uncertain = False
         self.adopt_fails = False
@@ -61,6 +62,10 @@ class FakeRuntime:
     def cancel(self, job_id):
         self.active = None
         return {'job_id': job_id, 'status': 'cancelled', 'files': []}
+
+    def release_browser(self):
+        self.released += 1
+        return {'closed': True}
 
     def park(self, job_id):
         self.active = None

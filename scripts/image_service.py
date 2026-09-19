@@ -37,7 +37,8 @@ def create_mcp(pool=None):
         'Shared persistent local image queue for ALL agents. Submit once with a stable request_id. '
         'queued/running are normal: workers continue after you disconnect. Poll the SAME job_id '
         'with wait_seconds=20; never resend or switch accounts for uncertain submissions. '
-        'account_id=auto selects an available independent account. needs_attention requires '
+        'account_id=auto picks a free lane and balances work across ChatGPT logins; '
+        'concurrency equals the number of lanes, not the number of accounts. needs_attention requires '
         'browser inspection then image_resume; parked means the job released its lane so '
         'the queue keeps moving and is re-observed automatically. Only cancel on user request. '
         'Outputs are original local file paths and text metadata, never image base64.'))
@@ -53,7 +54,7 @@ def create_mcp(pool=None):
 
     @server.tool(structured_output=False)
     async def image_status() -> str:
-        """Read cached account health, running jobs, queue and account-action results. Does not navigate browsers."""
+        """Read cached lane health, per-login load, running jobs, queue and account-action results. Does not navigate browsers."""
         return await call(lambda: wake(pool, pool.status()))
 
     @server.tool(structured_output=False)
@@ -76,7 +77,7 @@ def create_mcp(pool=None):
                              reference_images: list[str] | None = None,
                              count: Annotated[int, Field(strict=True, ge=1, le=20)] = 1,
                              request_id: str = '', detail: bool = False, account_id: str = 'auto') -> str:
-        """Persist one image request and return job_id immediately. Stable request_id deduplicates retries. Multiple callers queue safely; workers generate/download independently. count is images in one request."""
+        """Persist one image request and return job_id immediately. Stable request_id deduplicates retries. Many callers may submit at once: every free lane runs a job in parallel and auto balances across logins. account_id accepts auto, a lane alias or a login name. count is images in one request."""
         return await call(lambda: wake(pool, pool.submit(account_id=account_id, prompt=prompt, prompt_file=prompt_file,
                                                        output_dir=output_dir, name=name, reference_images=reference_images,
                                                        count=count, request_id=request_id)))
@@ -112,9 +113,10 @@ def create_mcp(pool=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['mcp','status','open','check','select-account','generate','poll','cancel','resume','account-add','account-clone','account-enable','import-legacy'])
+    parser.add_argument('command', choices=['mcp','status','open','check','select-account','generate','poll','cancel','resume','account-add','account-clone','account-scale','account-reseed','account-enable','import-legacy'])
     parser.add_argument('--account-id', default='auto')
     parser.add_argument('--clone-from', default='')
+    parser.add_argument('--lanes', type=int, default=0)
     parser.add_argument('--account-name', default='')
     parser.add_argument('--no-remember', action='store_true')
     parser.add_argument('--prompt-file', default='')
@@ -144,6 +146,10 @@ def main(argv=None):
             if not args.clone_from:
                 raise w.ImageError('invalid_account_id', 'Pass --clone-from with the logged-in account to add a lane for.')
             return pool.clone_account(args.clone_from, account, enabled=not args.disabled)
+        if args.command == 'account-scale':
+            return pool.scale_account(account, args.lanes, enabled=not args.disabled)
+        if args.command == 'account-reseed':
+            return pool.reseed_account(account)
         if args.command == 'account-enable':
             return pool.enable(account, not args.disabled)
         if args.command == 'import-legacy':

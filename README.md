@@ -1,4 +1,12 @@
-# ChatGPT Web Images 0.4.0
+# ChatGPT Web Images 0.5.0
+
+## 并行度与账号均衡（0.5.0）
+
+- 并发等于**车道数**，不等于账号数。一条车道 = 一个独立浏览器 Profile，一次一个任务。
+- `account-scale --account-id primary --lanes 4` 一次把某个已登录账号扩到 4 条车道；减少数量时只停用不删除 Profile。
+- auto 任务按**登录账号**均衡派发：某个账号已经在跑的任务更多时，它的空闲车道让另一个账号先拿。显式指定账号名仍然优先，并且可以落到该账号的任意一条车道。
+- 空闲车道 5 分钟后主动关闭浏览器交还内存，下次有活从持久 Profile 重开，不需要重新登录。实测一条车道常驻约 0.6 GB，16 条就是约 10 GB，这条回收是大车道池可用的前提。
+- 车道总数上限 16，限制来自本机内存，不是 ChatGPT。`status` 里 `logins` 给出每个账号的车道数、可用车道和在跑任务数。
 
 ## 吞吐与卡死修复（0.4.0）
 
@@ -27,14 +35,21 @@
 
 所有 stdio MCP 客户端共用 SQLite 持久队列。每账号一个独立后台进程、独立 Profile，同时执行一个任务。多个 agent 可同时提交，空闲账号领取，其余排队。后台自主检查生成、下载和收尾，客户端断开不会终止任务。
 
-**并发上限等于车道数，不等于账号数。** 一条车道是一个浏览器 Profile，一次只做一个任务；单个任务从提交到下载完通常要几分钟。想提高并发，给同一个已登录账号再加车道：
+**并发上限等于车道数，不等于账号数。** 一条车道是一个浏览器 Profile，一次只做一个任务；单个任务从提交到下载完通常要几分钟。想提高并发，给已登录账号加车道：
 
 ```powershell
-chatgpt-web-images account-clone --account-id primary2 --clone-from primary
-chatgpt-web-images check --account-id primary2
+# 每个账号 4 条车道，合计 8 路并发
+chatgpt-web-images account-scale --account-id primary --lanes 4
+chatgpt-web-images account-scale --account-id secondary --lanes 4
+# 每条新车道各做一次登录检查
+chatgpt-web-images check --account-id primary-2
 ```
 
-克隆会新建独立 Profile 并复制源账号已保存的登录态，源账号必须先 check 过一次。ChatGPT 侧会看到同一账号的多个并发会话，与手工多开窗口等价；额度、限流和网页可用性仍由服务决定，加车道不会让单张图更快。
+扩容会新建独立 Profile 并复制该账号已保存的登录态，源账号必须先 check 过一次；缩容只停用车道，不删除 Profile。账号重新登录后，用 `account-reseed --account-id primary-2` 把新登录态同步给空闲车道。
+
+auto 任务在**登录账号**之间均衡：正在跑得多的账号会让空闲车道先给另一个账号，这正是把压力摊到两个账号、少碰官方限流的手段。指定 `account_id=primary` 仍然可以钉死到某个账号，并落在它的任意车道上。
+
+代价说清楚：ChatGPT 侧会看到同一账号的多个并发会话，与手工多开多个窗口等价；额度、限流和网页可用性仍由服务决定。加车道只让更多张图同时跑，不会让单张图更快。一条车道常驻约 0.6 GB 内存，空闲 5 分钟自动关闭回收。
 
 支持本机的标准 stdio MCP 客户端，不等于认证所有 agent 或提供远程服务。两个账号的实际速度、额度和网页可用性仍由服务决定。
 

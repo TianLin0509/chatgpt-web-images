@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0
+
+- Decouple concurrency from account count: one ChatGPT login can own many browser lanes, and `account-scale --lanes N` provisions or retires them in one call.
+- Balance `auto` work across logins instead of letting whichever lane polls first take everything, so a burst is shared between the two accounts.
+- Accept a login name wherever a lane alias is accepted, so pinning reaches any lane of that login.
+- Release an idle lane's browser after five minutes and reopen it from the persistent profile on the next job, so a large lane pool does not hold memory while idle.
+- Report per-login lane counts, usable lanes and load in `status`; cap total lanes at 16 because each lane is a full browser profile.
+- Add `account-reseed` to refresh an idle lane's saved login from its group leader after a re-login.
+
 ## 0.4.0
 
 - Park a paused job instead of letting it hold its account: the browser is released while the same account, conversation and downloaded files are kept, so the queue keeps draining.

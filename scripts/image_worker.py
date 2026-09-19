@@ -16,6 +16,9 @@ from image_pool import ADOPT_BACKOFF, PARK_AFTER_SECONDS, PARKED, Pool, TERMINAL
 IDLE_TICK, WATCH_TICK = 3, 10
 # A browser failure used to take its account offline until a human checked it.
 RECHECK_BACKOFF = (60, 300, 900)
+# Each open lane holds a full browser in memory, so an idle one gives it back.
+# The profile keeps the login; the next job reopens it without a sign-in.
+IDLE_BROWSER_SECONDS = 300
 UNHEALTHY = {'browser_unhealthy', 'worker_error'}
 
 
@@ -48,6 +51,8 @@ class Worker:
         self.control_turn = True
         self.recoveries = 0
         self.delay = IDLE_TICK
+        self.idle_since = time.monotonic()
+        self.browser_released = False
 
     def log(self, event, **fields):
         print(json.dumps({'event': event, 'account_id': self.account_id, **fields}), flush=True)
@@ -106,6 +111,18 @@ class Worker:
             db.execute('UPDATE controls SET status=?,result=?,updated=? WHERE id=?', (state, json.dumps(safe), time.time(), row['id']))
         self.last_check = time.monotonic()
         return True
+
+    def release_idle_browser(self):
+        """Hand an idle lane's memory back; work reopens the browser from the profile."""
+        if self.browser_released or time.monotonic() - self.idle_since < IDLE_BROWSER_SECONDS:
+            return
+        try:
+            self.runtime.release_browser()
+            self.log('browser_released')
+        except Exception as exc:
+            self.log('browser_release_failed', error_code=error_value(exc)['code'])
+        # Either way, stop retrying until this lane has work again.
+        self.browser_released = True
 
     def park(self, job):
         """Hand the lane back to the queue while keeping this job's conversation."""
@@ -172,7 +189,10 @@ class Worker:
                 return
         job = self.pool.claim(self.account_id)
         if not job:
+            self.release_idle_browser()
             return
+        self.idle_since = time.monotonic()
+        self.browser_released = False
         if job['status'] == 'needs_attention' and not job['cancel_requested']:
             # Waiting for a human while holding the lane stalls every queued job behind
             # it. Park instead: same account, same conversation, no prompt resent.

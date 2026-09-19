@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.4.0
+# ChatGPT Web Images 0.5.0
+
+Parallelism update: concurrency is the number of browser lanes, not the number of accounts. `account-scale --account-id primary --lanes 4` gives one signed-in login four isolated lanes that run in parallel, and `auto` work is balanced across logins so one account does not absorb a whole burst. An idle lane closes its browser after five minutes and reopens it from its persistent profile, because each open lane costs roughly 0.6 GB. Total lanes are capped at 16: the limit is the machine, not the website.
 
 Throughput update: a paused job no longer holds its account. After 120 unattended seconds it is `parked` — the browser is handed back while the same account, conversation and downloaded files are kept — so queued jobs proceed immediately. Parked jobs are re-observed automatically after 60/300/900 seconds, at most three times, and never resend a prompt. An identity mismatch now reloads the recorded conversation before refusing to continue, so recovery is reachable when it is needed. An unhealthy account re-checks itself on the same backoff instead of staying offline until a human intervenes. `account-clone` adds another isolated browser lane for an account that is already signed in: the concurrency limit comes from one browser page per profile, not from ChatGPT.
 

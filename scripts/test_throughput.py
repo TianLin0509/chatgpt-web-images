@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import web_images as w
 import image_worker
-from image_pool import ADOPT_BACKOFF, PARK_AFTER_SECONDS, PARKED
+from image_pool import ADOPT_BACKOFF, MAX_LANES, PARK_AFTER_SECONDS, PARKED, login_group
 import test_image_pool as fixtures
 import test_web_images as contracts
 
@@ -184,6 +184,182 @@ class ExtraLanes(fixtures.QueueContracts):
         self.assertEqual(self.pool.row(overflow['job_id'])['status'], 'queued')
         self.worker('primary2').tick()
         self.assertEqual(self.pool.row(overflow['job_id'])['account_id'], 'primary2')
+
+
+class LoginBalance(fixtures.QueueContracts):
+    """Concurrency comes from lanes; fairness comes from spreading lanes over logins."""
+
+    def lanes(self, group, count):
+        auth = Path(self.pool.account(group)['data_dir']) / 'auth-state.json'
+        auth.parent.mkdir(parents=True, exist_ok=True)
+        if not auth.exists():
+            auth.write_text('{"cookies":[]}', encoding='utf-8')
+        result = self.pool.scale_account(group, count)
+        for lane in result['lanes']:
+            self.pool.account_state(lane, 'authenticated', True)
+            self.pool.heartbeat(lane)
+            self.runtimes.setdefault(lane, fixtures.FakeRuntime(self.pool.account(lane)['data_dir']))
+        return result['lanes']
+
+    def group_of(self, job):
+        owner = self.pool.row(job['job_id'])['account_id']
+        return owner and login_group(self.pool.account(owner))
+
+    def drive(self, lanes, rounds=8):
+        for _ in range(rounds):
+            for lane in lanes:
+                self.worker(lane).tick()
+
+    def test_eight_lanes_run_eight_jobs_at_the_same_time(self):
+        lanes = self.lanes('primary', 4) + self.lanes('secondary', 4)
+        for lane in lanes:
+            self.runtimes[lane].poll = lambda job_id: {'job_id': job_id, 'status': 'generating', 'files': []}
+        jobs = [self.submit('bulk%d' % index) for index in range(8)]
+        self.drive(lanes)
+        owners = [self.pool.row(job['job_id'])['account_id'] for job in jobs]
+        self.assertNotIn(None, owners)
+        self.assertEqual(len(set(owners)), 8)
+        self.assertEqual([self.group_of(job) for job in jobs].count('primary'), 4)
+
+    def test_auto_work_alternates_between_logins(self):
+        lanes = self.lanes('primary', 2) + self.lanes('secondary', 2)
+        jobs = [self.submit('job%d' % index) for index in range(4)]
+        self.drive(lanes)
+        groups = [self.group_of(job) for job in jobs]
+        self.assertEqual(sorted(groups), ['primary', 'primary', 'secondary', 'secondary'])
+        self.assertNotEqual(groups[0], groups[1])
+
+    def test_a_login_already_carrying_more_waits_for_the_other(self):
+        primary = self.lanes('primary', 2)
+        secondary = self.lanes('secondary', 2)
+        self.submit('first')
+        self.worker(primary[0]).tick()
+        second = self.submit('second')
+        self.worker(primary[1]).tick()
+        self.assertEqual(self.pool.row(second['job_id'])['status'], 'queued')
+        self.worker(secondary[0]).tick()
+        self.assertEqual(self.group_of(second), 'secondary')
+
+    def test_fairness_never_stalls_on_a_login_without_a_live_worker(self):
+        primary = self.lanes('primary', 2)
+        secondary = self.lanes('secondary', 1)
+        with self.pool.connect() as db:
+            db.execute('UPDATE accounts SET heartbeat=0 WHERE id=?', (secondary[0],))
+        jobs = [self.submit('dead%d' % index) for index in range(2)]
+        self.drive(primary, rounds=2)
+        self.assertEqual([self.group_of(job) for job in jobs], ['primary', 'primary'])
+
+    def test_pinning_a_login_reaches_any_of_its_lanes(self):
+        lanes = self.lanes('primary', 3)
+        self.lanes('secondary', 1)
+        job = self.submit('pinned', 'primary')
+        self.worker(lanes[2]).tick()
+        self.assertEqual(self.pool.row(job['job_id'])['account_id'], lanes[2])
+
+    def test_status_reports_load_per_login(self):
+        self.lanes('primary', 3)
+        self.lanes('secondary', 2)
+        status = self.pool.status()
+        logins = {group['login_group']: group for group in status['logins']}
+        self.assertEqual(logins['primary']['lanes'], 3)
+        self.assertEqual(logins['secondary']['lanes'], 2)
+        self.assertEqual(status['configured_capacity'], 5)
+
+
+class LaneScaling(fixtures.QueueContracts):
+    def login(self, account_id='primary'):
+        auth = Path(self.pool.account(account_id)['data_dir']) / 'auth-state.json'
+        auth.parent.mkdir(parents=True, exist_ok=True)
+        auth.write_text('{"cookies":[]}', encoding='utf-8')
+        return auth
+
+    def test_scale_adds_lanes_and_disables_surplus_without_deleting(self):
+        self.login()
+        grown = self.pool.scale_account('primary', 4)
+        self.assertEqual(grown['lanes'], ['primary', 'primary-2', 'primary-3', 'primary-4'])
+        self.assertEqual(grown['added'], ['primary-2', 'primary-3', 'primary-4'])
+        shrunk = self.pool.scale_account('primary', 2)
+        self.assertEqual(shrunk['disabled'], ['primary-3', 'primary-4'])
+        self.assertFalse(self.pool.account('primary-4')['enabled'])
+        self.assertTrue(Path(self.pool.account('primary-4')['data_dir']).exists())
+
+    def test_scaling_again_reuses_existing_lanes(self):
+        self.login()
+        self.pool.scale_account('primary', 3)
+        again = self.pool.scale_account('primary', 3)
+        self.assertEqual(again['added'], [])
+        self.assertEqual(again['disabled'], [])
+
+    def test_lane_count_is_capped_by_the_machine_not_the_website(self):
+        self.login()
+        with self.assertRaises(w.ImageError) as caught:
+            self.pool.scale_account('primary', MAX_LANES + 1)
+        self.assertEqual(caught.exception.code, 'invalid_lane_count')
+
+    def test_total_lane_budget_is_enforced_across_logins(self):
+        self.login()
+        with self.assertRaises(w.ImageError) as caught:
+            self.pool.scale_account('primary', MAX_LANES)
+        self.assertEqual(caught.exception.code, 'lane_budget_exceeded')
+
+    def test_reseed_refreshes_a_lane_login_but_never_while_it_is_busy(self):
+        leader = self.login()
+        lanes = self.pool.scale_account('primary', 2)['lanes']
+        leader.write_text('{"cookies":[],"session":"renewed"}', encoding='utf-8')
+        self.pool.reseed_account(lanes[1])
+        copied = Path(self.pool.account(lanes[1])['data_dir']) / 'auth-state.json'
+        self.assertEqual(copied.read_text(encoding='utf-8'), leader.read_text(encoding='utf-8'))
+        self.assertFalse(self.pool.account(lanes[1])['ready'])
+        self.pool.account_state(lanes[1], 'authenticated', True)
+        self.submit('busy', lanes[1])
+        self.pool.claim(lanes[1])
+        with self.assertRaises(w.ImageError) as caught:
+            self.pool.reseed_account(lanes[1])
+        self.assertEqual(caught.exception.code, 'account_busy')
+
+    def test_reseeding_the_group_leader_is_refused(self):
+        self.login()
+        self.pool.scale_account('primary', 2)
+        with self.assertRaises(w.ImageError) as caught:
+            self.pool.reseed_account('primary')
+        self.assertEqual(caught.exception.code, 'reseed_leader')
+
+
+class IdleMemory(fixtures.QueueContracts):
+    """Many lanes are only affordable when the idle ones are not holding a browser."""
+
+    def test_idle_lane_gives_its_browser_back_after_the_grace_period(self):
+        worker = self.worker('primary')
+        worker.tick()
+        self.assertEqual(self.runtimes['primary'].released, 0)
+        worker.idle_since = time.monotonic() - image_worker.IDLE_BROWSER_SECONDS - 1
+        worker.tick()
+        self.assertEqual(self.runtimes['primary'].released, 1)
+
+    def test_a_released_lane_does_not_keep_retrying(self):
+        worker = self.worker('primary')
+        worker.idle_since = time.monotonic() - image_worker.IDLE_BROWSER_SECONDS - 1
+        for _ in range(5):
+            worker.tick()
+        self.assertEqual(self.runtimes['primary'].released, 1)
+
+    def test_a_lane_with_work_never_closes_its_browser(self):
+        self.submit('busy', 'primary')
+        worker = self.worker('primary')
+        worker.idle_since = time.monotonic() - image_worker.IDLE_BROWSER_SECONDS - 1
+        worker.tick()
+        self.assertEqual(self.runtimes['primary'].released, 0)
+        self.assertFalse(worker.browser_released)
+
+    def test_new_work_re_arms_the_grace_period(self):
+        worker = self.worker('primary')
+        worker.idle_since = time.monotonic() - image_worker.IDLE_BROWSER_SECONDS - 1
+        worker.tick()
+        self.assertTrue(worker.browser_released)
+        self.submit('later', 'primary')
+        worker.tick()
+        self.assertFalse(worker.browser_released)
+        self.assertEqual(self.runtimes['primary'].released, 1)
 
 
 class PollCadence(fixtures.QueueContracts):
