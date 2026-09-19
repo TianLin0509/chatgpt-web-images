@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1
+
+- Point callers at `count=N` when several single-image jobs for one output directory are in flight at once: alternates of one prompt belong in one ChatGPT request, which costs one lane and one account request instead of N.
+- Count only in-flight jobs for that hint, so retrying a finished job is never mistaken for a batch.
+- State the request-shape rule in the tool description and skill: one prompt with several options is one request; genuinely different prompts stay separate jobs.
+
 ## 0.5.0
 
 - Decouple concurrency from account count: one ChatGPT login can own many browser lanes, and `account-scale --lanes N` provisions or retires them in one call.

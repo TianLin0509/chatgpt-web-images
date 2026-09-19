@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 import web_images as w
 import image_worker
-from image_pool import ADOPT_BACKOFF, MAX_LANES, PARK_AFTER_SECONDS, PARKED, login_group
+from image_pool import (ADOPT_BACKOFF, BATCH_HINT_SIBLINGS, MAX_LANES, PARK_AFTER_SECONDS,
+                        PARKED, login_group)
 import test_image_pool as fixtures
 import test_web_images as contracts
 
@@ -360,6 +361,49 @@ class IdleMemory(fixtures.QueueContracts):
         worker.tick()
         self.assertFalse(worker.browser_released)
         self.assertEqual(self.runtimes['primary'].released, 1)
+
+
+class BatchShape(fixtures.QueueContracts):
+    """One prompt wanting N alternates is one request, not N jobs."""
+
+    def singles(self, how_many, folder='shared'):
+        return [self.pool.submit(prompt='Draw option %d.' % index, request_id='opt%d' % index,
+                                 output_dir=str(self.root / folder), account_id='auto')
+                for index in range(how_many)]
+
+    def test_several_in_flight_single_image_jobs_suggest_one_request(self):
+        results = self.singles(BATCH_HINT_SIBLINGS)
+        self.assertNotIn('hint', results[0])
+        self.assertEqual(results[-1]['hint']['code'], 'consider_one_multi_image_request')
+        self.assertEqual(results[-1]['hint']['in_flight_single_image_jobs'], BATCH_HINT_SIBLINGS)
+
+    def test_a_multi_image_request_is_never_hinted(self):
+        self.singles(BATCH_HINT_SIBLINGS)
+        batched = self.pool.submit(prompt='Draw four options.', count=4, request_id='batched',
+                                   output_dir=str(self.root / 'shared'))
+        self.assertNotIn('hint', batched)
+
+    def test_retrying_finished_jobs_is_never_called_a_batch(self):
+        done = self.singles(BATCH_HINT_SIBLINGS)
+        for job in done:
+            self.pool.save_result(job['job_id'], {'status': 'failed', 'files': [],
+                                                  'error': {'code': 'browser_timeout', 'message': 'fixture'}})
+        retry = self.pool.submit(prompt='Draw option 0.', request_id='opt0-retry',
+                                 output_dir=str(self.root / 'shared'))
+        self.assertNotIn('hint', retry)
+
+    def test_jobs_for_different_folders_are_not_one_batch(self):
+        for index in range(BATCH_HINT_SIBLINGS):
+            result = self.pool.submit(prompt='Draw %d.' % index, request_id='sep%d' % index,
+                                      output_dir=str(self.root / ('folder%d' % index)))
+        self.assertNotIn('hint', result)
+
+    def test_resubmitting_the_same_request_never_repeats_the_hint(self):
+        self.singles(BATCH_HINT_SIBLINGS)
+        again = self.pool.submit(prompt='Draw option 0.', request_id='opt0',
+                                 output_dir=str(self.root / 'shared'))
+        self.assertTrue(again['reused_request'])
+        self.assertNotIn('hint', again)
 
 
 class PollCadence(fixtures.QueueContracts):

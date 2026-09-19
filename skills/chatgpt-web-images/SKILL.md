@@ -9,7 +9,8 @@ description: 使用用户自己的 ChatGPT 网页账号生成图片、制作参�
 
 1. 首次使用调用 `image_status`，读取账号健康、活动任务和最近账号操作结果，不访问网页。未登录时 `image_open(account_id)`；用户登录后 `image_account_check(account_id)`，再查看 status。账号操作返回 queued 只表示已接收。
 2. 长提示词保存为带日期、任务标识的 UTF-8 文件。`image_generate(prompt_file=绝对路径, count=张数, request_id=全局唯一任务标识, output_dir=绝对路径, name=任务名, account_id="auto")`。prompt 与 prompt_file 二选一；reference_images 接受至多五个 PNG/JPEG/WebP 绝对路径，排队期间保持文件不变。
-3. count=1..20 是一次网页请求的图片数量，不是账号并发数或额度保证。遵从指定张数，多图要求独立附件，不能用拼图或裁切代替，不静默压缩或降低要求。
+3. count=1..20 是**一次网页请求**产出的图片数量，不是账号并发数或额度保证。遵从指定张数，多图要求独立附件，不能用拼图或裁切代替，不静默压缩或降低要求。
+   判据：**同一提示词要多张备选**（例如一页 PPT 的若干方案）就用一个 count=N 请求，不要拆成 N 个任务——一个请求只占一条车道、只消耗账号一次请求额度，固定的提交与导航开销也只付一次。**提示词确实不同**（不同页、不同主题）才分成多个任务。提交结果里出现 `hint.code=consider_one_multi_image_request` 时，先回答"这些是不是同一提示词的备选"，是就合并重提，不是就照常继续。失败后重投同一任务属于重试，与本条无关。
 4. 提交立即返回 job_id；queued、dispatching、running 是正常状态。多个 agent 可以同时提交，每条车道执行一个任务，其余持久排队。auto 分配空闲车道，也可明确指定已经配置的账号别名。并发上限是车道数（一个浏览器 Profile 一条），不是账号数，也不随排队时长变化；排队久属正常，不要改 ID 重投。auto 会在登录账号之间自动均衡，不要为了"换个账号试试"而改 account_id。`image_status` 的 `logins` 给出每个账号的车道数与在跑数量；车道不够时由用户决定是否扩容，agent 不自行扩。
 5. 保持同一 request_id 和参数；超时重试返回原任务。ID 应含日期、任务或席位标识。不得自动换 ID 或账号重发不确定提交。
 6. `image_poll(job_id, wait_seconds=20)` 等待结果。后台自主执行、下载、收尾，agent 断开仍会继续。无需额外 shell 循环、高频 status 或自建后台任务。phase 是浏览器实际阶段。查询自己的任务，不接管其他人的任务。

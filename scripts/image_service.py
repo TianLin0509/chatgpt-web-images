@@ -77,7 +77,7 @@ def create_mcp(pool=None):
                              reference_images: list[str] | None = None,
                              count: Annotated[int, Field(strict=True, ge=1, le=20)] = 1,
                              request_id: str = '', detail: bool = False, account_id: str = 'auto') -> str:
-        """Persist one image request and return job_id immediately. Stable request_id deduplicates retries. Many callers may submit at once: every free lane runs a job in parallel and auto balances across logins. account_id accepts auto, a lane alias or a login name. count is images in one request."""
+        """Persist one image request and return job_id immediately. Stable request_id deduplicates retries. Many callers may submit at once: every free lane runs a job in parallel and auto balances across logins. account_id accepts auto, a lane alias or a login name. count=N asks ONE ChatGPT request for N independent images: use it for alternates of the same prompt (for example several options for one slide) instead of submitting N jobs, because it costs one lane and one account request rather than N. Submit separate jobs only when the prompts genuinely differ."""
         return await call(lambda: wake(pool, pool.submit(account_id=account_id, prompt=prompt, prompt_file=prompt_file,
                                                        output_dir=output_dir, name=name, reference_images=reference_images,
                                                        count=count, request_id=request_id)))

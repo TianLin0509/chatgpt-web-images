@@ -25,10 +25,14 @@ PARKED = 'parked'
 PARK_AFTER_SECONDS = 120
 # Unattended re-observation delays for a parked job; afterwards it waits for a human.
 ADOPT_BACKOFF = (60, 300, 900)
+# A caller splitting one picture request into many single-image jobs pays the whole
+# submit-and-navigate cost per image and spends one account request per image.
+BATCH_HINT_WINDOW = 900
+BATCH_HINT_SIBLINGS = 3
 # Every lane is a full browser profile (~0.6 GB resident), so the cap is about the
 # machine, not about ChatGPT. Raising it without free memory only causes swapping.
 MAX_LANES = 16
-VERSION = '0.5.0'
+VERSION = '0.5.1'
 
 
 @contextlib.contextmanager
@@ -247,9 +251,33 @@ class Pool:
                 db.execute('INSERT INTO jobs(id,request_id,request_hash,payload,preferred,status,created,updated) VALUES(?,?,?,?,?,?,?,?)',
                            (job_id, request_id, digest, json.dumps(payload, ensure_ascii=False), account_id, 'queued', now, now))
                 reused = False
+                hint = self.batch_hint(db, payload)
         result = self.get(job_id)
         result['reused_request'] = reused
+        if not reused and hint:
+            result['hint'] = hint
         return result
+
+    def batch_hint(self, db, payload):
+        """Flag single-image jobs a caller could have asked for as one count=N request.
+
+        Only jobs still in flight are counted. A retry of a finished job looks exactly
+        like a sibling, and telling an agent to merge a retry would be wrong advice.
+        """
+        if payload['count'] != 1:
+            return None
+        rows = db.execute(
+            "SELECT id FROM jobs WHERE status IN ('queued','dispatching','running') AND created>?"
+            " AND json_extract(payload,'$.count')=1 AND json_extract(payload,'$.output_dir')=?",
+            (time.time() - BATCH_HINT_WINDOW, payload['output_dir'])).fetchall()
+        if len(rows) < BATCH_HINT_SIBLINGS:
+            return None
+        return {'code': 'consider_one_multi_image_request', 'in_flight_single_image_jobs': len(rows),
+                'window_seconds': BATCH_HINT_WINDOW,
+                'message': 'Several single-image jobs are in flight for this output_dir. If they are '
+                           'alternates of one prompt, one image_generate with count=N delivers them from a '
+                           'single ChatGPT request: one lane instead of N, and one request against the '
+                           'account limit instead of N. Keep separate jobs when the prompts really differ.'}
 
     def import_legacy(self, account_id):
         account = self.account(account_id)
