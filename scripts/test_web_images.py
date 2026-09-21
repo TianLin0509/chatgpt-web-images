@@ -311,7 +311,18 @@ class Contracts(unittest.TestCase):
         self.assertEqual(result['downloaded_count'],0)
 
     def test_default_auth_is_optional(self):
-        with patch.object(w,'AUTH',None),patch.object(w,'cli') as cli,patch.object(w,'run_js',side_effect=[w.ImageError('browser_not_open','closed'),True,{'logged_in':False},{'logged_in':False}]):
+        # Dispatch on what each script does, not on how many there are: the count changes
+        # whenever the browser gains a step such as hiding its window.
+        opened=[]
+        def js(source,**kwargs):
+            if not opened:
+                opened.append(True)
+                raise w.ImageError('browser_not_open','closed')
+            # Only the two state probes report state; everything else is a plain action.
+            if source in (w.STATUS_JS, w.SETTLE_JS):
+                return {'logged_in':False}
+            return True
+        with patch.object(w,'AUTH',None),patch.object(w,'cli') as cli,patch.object(w,'run_js',side_effect=js):
             result=w.safe_call(w.ensure_browser)
         self.assertEqual(result['error']['code'],'login_required')
         self.assertFalse(any(c.args[0][0]=='state-load' for c in cli.call_args_list))

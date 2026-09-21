@@ -980,6 +980,130 @@ class PublicationHygiene(unittest.TestCase):
                               '%s looks like it contains a real conversation link' % name)
 
 
+class QuietWindows(contracts.Contracts):
+    """A lane must be invisible from the moment it opens, not from the moment it submits."""
+
+    def open_path(self, **kwargs):
+        """Drive ensure_browser through its cold-open branch, recording call order."""
+        events = []
+
+        def js(source, **_):
+            if not events:
+                events.append('probe')
+                raise runtime.ImageError('browser_not_open', 'closed')
+            if source in (runtime.STATUS_JS, runtime.SETTLE_JS):
+                return {'logged_in': True, 'auth_state': 'authenticated'}
+            return True
+
+        def browser_cli(args, **_):
+            events.append(args[0])
+            return True
+
+        def hide(value):
+            events.append('hide' if value is False else 'show')
+            return True
+
+        with patch.object(runtime, 'cli', side_effect=browser_cli) as browser, \
+             patch.object(runtime, 'run_js', side_effect=js), \
+             patch.object(runtime, 'set_visible', side_effect=hide) as visible:
+            state = runtime.ensure_browser(**kwargs)
+        return state, events, visible
+
+    def test_a_cold_open_hides_the_window_before_it_navigates(self):
+        # Ordering is the property that matters: hiding after the navigation leaves the
+        # window on screen for the whole page load, which is most of a cold open.
+        state, events, visible = self.open_path()
+        self.assertIn('open', events)
+        self.assertIn('hide', events)
+        self.assertLess(events.index('hide'), events.index('goto'))
+        self.assertTrue(state['window_hidden'])
+
+    def test_the_login_entry_point_still_shows_its_window(self):
+        _, events, visible = self.open_path(require_login=False, hide_on_open=False)
+        self.assertNotIn('hide', events)
+        visible.assert_not_called()
+
+    def test_failing_to_hide_never_fails_the_lane(self):
+        script = []
+
+        def js(source, **_):
+            script.append(source)
+            if len(script) == 1:
+                raise runtime.ImageError('browser_not_open', 'closed')
+            if 'waitForFunction' in source:
+                return True
+            return {'logged_in': True, 'auth_state': 'authenticated'}
+
+        with patch.object(runtime, 'cli'), patch.object(runtime, 'run_js', side_effect=js), \
+             patch.object(runtime, 'set_visible', side_effect=RuntimeError('no window')):
+            state = runtime.ensure_browser()
+        self.assertTrue(state['logged_in'])
+        self.assertFalse(state['window_hidden'])
+
+    def test_adopting_a_parked_conversation_leaves_nothing_on_screen(self):
+        job = self.job()
+        job.update(created_at=time.time(), conversation_url='https://chatgpt.com/c/abc-def')
+        runtime.save_job(job)
+        runtime.park(job['job_id'])
+        with patch.object(runtime, 'ensure_browser'), patch.object(runtime, 'cli'), \
+             patch.object(runtime, 'run_js'), patch.object(runtime, 'set_visible', return_value=True) as visible:
+            runtime.adopt(job['job_id'])
+        visible.assert_called_once_with(False)
+
+    def test_the_window_lookup_retries_before_giving_up(self):
+        # The title is published asynchronously; one miss used to leave a lane on screen.
+        self.assertGreater(runtime.WINDOW_LOOKUP_TRIES, 1)
+        import inspect
+        source = inspect.getsource(runtime.set_visible)
+        self.assertIn('WINDOW_LOOKUP_TRIES', source)
+        self.assertIn('found.clear()', source)
+
+    def test_the_browser_must_stay_headed(self):
+        # Measured 2026-09-21 on a scratch profile seeded with a real login: opening
+        # without --headed lands on Cloudflare's "Just a moment..." interstitial with
+        # auth_state=browser_challenge, so the app is never reached. Invisibility comes
+        # from hiding the window, not from running headless.
+        import inspect
+        source = inspect.getsource(runtime.ensure_browser)
+        self.assertIn("'--headed'", source)
+        self.assertIn('Cloudflare', source)
+
+
+class OffscreenBirth(contracts.Contracts):
+    """A lane window must never be on screen, not even for the first second."""
+
+    def test_the_launch_position_is_off_screen(self):
+        args = ' '.join(runtime.BROWSER_ARGS)
+        self.assertIn('--window-position=%d,%d' % runtime.OFFSCREEN, args)
+        self.assertLess(runtime.OFFSCREEN[0], -10000)
+        self.assertLess(runtime.OFFSCREEN[1], -10000)
+
+    def test_chrome_is_told_not_to_open_its_own_windows(self):
+        args = ' '.join(runtime.BROWSER_ARGS)
+        for switch in ('--hide-crash-restore-bubble', '--disable-session-crashed-bubble',
+                       '--no-first-run', '--no-default-browser-check'):
+            self.assertIn(switch, args)
+
+    def test_every_lane_gets_the_config_before_its_browser_opens(self):
+        import inspect
+        source = inspect.getsource(runtime.ensure_browser)
+        self.assertLess(source.index('ensure_cli_config()'), source.index("'open', 'about:blank'"))
+
+    def test_the_config_is_written_next_to_the_profile(self):
+        path = runtime.ensure_cli_config()
+        self.assertEqual(path, self.data / '.playwright' / 'cli.config.json')
+        written = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual(written['browser']['launchOptions']['args'], runtime.BROWSER_ARGS)
+
+    def test_showing_a_window_also_brings_it_back_on_screen(self):
+        # Without this, image_open would "show" a window the user still cannot see.
+        import inspect
+        source = inspect.getsource(runtime.set_visible)
+        self.assertIn('SetWindowPos', source)
+        self.assertIn('ONSCREEN', source)
+        self.assertGreater(runtime.ONSCREEN[0], 0)
+
+
 class PollCadence(fixtures.QueueContracts):
     def test_tick_slows_down_only_while_generation_cannot_change(self):
         self.submit('slow', 'primary')

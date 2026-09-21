@@ -19,7 +19,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.1'
+VERSION = '0.7.2'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -48,6 +48,24 @@ TERMINAL = {'complete','failed','preparation_failed','cancelled','partial','coun
 CONVERSATION_URL = r'https://chatgpt\.com/c/[a-zA-Z0-9-]+'
 # Forced reloads spent on an identity mismatch before refusing to observe the conversation.
 IDENTITY_RETRIES = 2
+# Windows needs a moment to publish a freshly set window title.
+WINDOW_LOOKUP_TRIES = 4
+# Two separate reasons a lane used to be seen, both settled at launch:
+#
+# 1. Chrome's own windows are not ours to hide. After an unclean shutdown it shows a
+#    crash-restore bubble titled "Restore pages?", which set_visible cannot match and so
+#    never hides. The first switches stop Chrome opening those windows at all.
+# 2. Hiding can only happen once the window exists, and reaching that point costs two
+#    child processes (open, then the script that titles the page), so a cold lane flashed
+#    on screen for seconds. Measured 2026-09-21 with a 0.3s sampler: a window launched at
+#    this position is never on screen at any sample, while hiding alone left it visible
+#    through the whole cold open. Hiding still runs, to keep it out of the taskbar too.
+OFFSCREEN = (-32000, -32000)
+BROWSER_ARGS = ['--hide-crash-restore-bubble', '--disable-session-crashed-bubble',
+                '--no-first-run', '--no-default-browser-check',
+                '--window-position=%d,%d' % OFFSCREEN, '--window-size=1280,900']
+# Where a window goes when the user actually asked to see it.
+ONSCREEN = (80, 60)
 
 
 class ImageError(RuntimeError):
@@ -85,6 +103,19 @@ def identity_matches(job, text):
         return True
     expected = job.get('identity_loose')
     return bool(expected) and loose_hash(text) == expected
+
+
+def ensure_cli_config():
+    """Per-lane Playwright config; cli() runs with cwd=DATA so this is picked up there."""
+    path = DATA / '.playwright' / 'cli.config.json'
+    desired = {'browser': {'launchOptions': {'args': BROWSER_ARGS}}}
+    try:
+        if json.loads(path.read_text(encoding='utf-8')) == desired:
+            return path
+    except (OSError, ValueError):
+        pass
+    write_json(path, desired)
+    return path
 
 
 @contextlib.contextmanager
@@ -193,21 +224,47 @@ def set_visible(visible):
         if buf.value.startswith(title + ' -') or buf.value == title:
             found.append(hwnd)
         return True
-    user32.EnumWindows(visit, 0)
+    for attempt in range(WINDOW_LOOKUP_TRIES):
+        found.clear()
+        user32.EnumWindows(visit, 0)
+        if len(found) == 1:
+            break
+        # The title travels from the page to the window asynchronously; a miss here is
+        # the difference between an invisible lane and one that stays on screen.
+        time.sleep(0.25)
     if len(found) != 1:
         return False
+    if visible:
+        # The window was created off-screen on purpose, so showing it is not enough.
+        user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        SWP_NOSIZE, SWP_NOZORDER = 0x0001, 0x0004
+        user32.SetWindowPos(found[0], None, ONSCREEN[0], ONSCREEN[1], 0, 0, SWP_NOSIZE | SWP_NOZORDER)
     user32.ShowWindowAsync(found[0], 5 if visible else 0)
     time.sleep(0.2)
     return bool(user32.IsWindowVisible(found[0])) == visible
 
 
-def ensure_browser(*, require_login=True, account_name=None):
+def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True):
     try:
         state = run_js(STATUS_JS)
     except ImageError as exc:
         if exc.code != 'browser_not_open':
             raise
+        # --headed is mandatory, not a leftover: measured 2026-09-21, a headless browser
+        # is met by Cloudflare's "Just a moment..." interstitial and never signs in.
+        # The window is therefore hidden right here instead of being left on screen
+        # until some later step happens to hide it.
+        ensure_cli_config()
         cli(['open', 'about:blank', '--headed', '--persistent', '--profile', str(DATA/'profile')])
+        if hide_on_open:
+            # Hide while the page is still about:blank. Waiting until ChatGPT has loaded
+            # leaves the window on screen for the whole navigation, which is most of the
+            # time a cold lane is visible at all.
+            try:
+                set_visible(False)
+            except Exception:
+                pass
         auth = DATA/'auth-state.json'
         if not auth.is_file():
             auth = AUTH
@@ -222,6 +279,13 @@ def ensure_browser(*, require_login=True, account_name=None):
           return true;
         }''')
         state = run_js(STATUS_JS)
+        if hide_on_open:
+            # Cosmetic only. A lane that cannot hide its window is still a working lane,
+            # so this must never turn into a browser preparation failure.
+            try:
+                state['window_hidden'] = set_visible(False)
+            except Exception:
+                state['window_hidden'] = False
     if not any(state.get(key) for key in ('logged_in','account_chooser','challenge','credential_required')):
         state = run_js(SETTLE_JS)
     authorized = SETTINGS.get('account_name', '') if account_name is None else account_name
@@ -339,6 +403,7 @@ def adopt(job_id):
           return true;
         }''')
         write_json(DATA / 'active.json', {'job_id': job_id})
+        job['window_hidden'] = set_visible(False)
         job['wait_started_at'] = time.time()
         job.pop('parked_at', None)
         job.pop('identity_retry', None)
@@ -835,7 +900,7 @@ def status():
 
 def open_browser():
     with locked():
-        result=ensure_browser(require_login=False)
+        result=ensure_browser(require_login=False, hide_on_open=False)
         result['visible']=set_visible(True)
         return result
 
