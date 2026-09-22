@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatgpt-web-images"
-version = "0.7.1"
+version = "0.7.2"
 description = "Local Windows MCP for ChatGPT web image generation, without image base64 in tool responses"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-web-images",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Agent-neutral ChatGPT image MCP with durable queue and isolated account workers.",
   "author": {
     "name": "TianLin0509"

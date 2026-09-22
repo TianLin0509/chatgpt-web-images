@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.2
+
+- Launch every lane window off screen. Hiding can only happen once a window exists, and reaching that point costs two child processes, so a cold lane used to flash on screen for seconds; with four lanes starting at once that was four windows. Measured with a 0.5s sampler over 150s of cold opens: 0 windows on screen, against 4 before.
+- Stop Chrome opening its own windows: after an unclean shutdown it showed a crash-restore bubble titled "Restore pages?", which the window lookup cannot match and therefore never hid.
+- Hide a lane's window the moment the browser opens rather than after a prompt has been submitted, and hide it again after adopting a parked conversation. Hiding still runs so a lane stays out of the taskbar as well.
+- Bring a window back on screen when `image_open` asks for it, since it is now created off screen.
+- Retry the window lookup: the title is published to Windows asynchronously, and a single miss left that lane visible permanently.
+- Treat hiding as cosmetic — a lane that cannot hide is still a working lane, and the failure no longer propagates.
+- Keep `--headed` deliberately. Measured on a scratch profile seeded with a real login: a headless browser is answered by Cloudflare's "Just a moment..." interstitial and never reaches the app, so invisibility comes from window placement, not from running headless.
+
 ## 0.7.1
 
 - Share one preparation path between `image_generate` and `image_generate_batch`, so a batch entry may use `continue_from` instead of raising an opaque error.

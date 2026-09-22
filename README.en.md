@@ -1,4 +1,4 @@
-# ChatGPT Web Images 0.7.1
+# ChatGPT Web Images 0.7.2
 
 Parallelism update: concurrency is the number of browser lanes, not the number of accounts. `account-scale --account-id primary --lanes 4` gives one signed-in login four isolated lanes that run in parallel, and `auto` work is balanced across logins so one account does not absorb a whole burst. An idle lane closes its browser after five minutes and reopens it from its persistent profile, because each open lane costs roughly 0.6 GB. Total lanes are capped at 16: the limit is the machine, not the website.
 
