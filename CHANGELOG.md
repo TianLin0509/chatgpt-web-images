@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.7
+
+- Distinguish a throttled sidebar or background conversation refetch from a blocked generation. A rendered authenticated conversation remains observable and downloadable; prompt ownership is still checked before accepting images. Unreadable conversations and generation HTTP 429 retain shared cooldown.
+- Pair with the Hub browser transport fix using Playwright `noDefaults: true`: attaching to one owned tab must not simulate focus across every ChatGPT tab and trigger a refetch storm. No additional dependencies, account changes or prompt resubmission.
+
 ## 0.7.6
 
 - Recognize observed ChatGPT HTTP 429 responses without sending an extra probe. Keep rate limits separate from sign-out and page loading.

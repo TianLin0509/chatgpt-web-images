@@ -119,7 +119,7 @@ class Worker:
                     fn=getattr(self.runtime,'probe_rate_limit',fn)
                 result = fn(**args)
             # Browser URLs and title are unnecessary in the shared status surface.
-            safe = {k: result[k] for k in ('logged_in','auth_state','visible','remembered') if k in result}
+            safe = {k: result[k] for k in ('logged_in','auth_state','visible','remembered','background_rate_limited') if k in result}
             safe['ok'] = True
             if result.get('auth_state')=='rate_limited':
                 error=({'code':'rate_limited','retry_at':cooldown['retry_after']} if result.get('cooldown_cached') else self.pool.defer_rate_limit(self.account_id))

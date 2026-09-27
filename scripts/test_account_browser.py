@@ -89,6 +89,39 @@ class AccountBrowser(unittest.TestCase):
         self.page.set_content('<button aria-label="Open profile menu">Profile</button><div contenteditable="true" data-composer-markdown></div>')
         self.assertEqual(self.state()['auth_state'],'authenticated')
 
+    def signed_page(self, *, turn=False):
+        self.page.set_content('<button aria-label="Open profile menu">Profile</button><div contenteditable="true" data-composer-markdown>draft</div>' + ('<div data-user-message-bubble>Owned prompt</div>' if turn else ''))
+
+    def rate_response(self, path):
+        self.page.route('**'+path,lambda r:r.fulfill(status=429,body='too many requests'))
+        self.page.evaluate('async path=>await(await fetch(path)).text()',path)
+
+    def test_history_sidebar_429_does_not_block_a_usable_page(self):
+        self.signed_page()
+        self.rate_response('/backend-api/conversations')
+        state=self.state()
+        self.assertEqual(state['auth_state'],'authenticated')
+        self.assertFalse(state['rate_limited'])
+        self.assertTrue(state['background_rate_limited'])
+
+    def test_current_conversation_refetch_429_does_not_hide_rendered_turn(self):
+        self.page.goto('https://chatgpt.com/c/fixture-current')
+        self.signed_page(turn=True)
+        self.rate_response('/backend-api/conversations/fixture-current')
+        self.assertFalse(self.state()['rate_limited'])
+        self.assertTrue(self.state()['background_rate_limited'])
+
+    def test_unloaded_current_conversation_429_still_blocks(self):
+        self.page.goto('https://chatgpt.com/c/fixture-current')
+        self.signed_page()
+        self.rate_response('/backend-api/conversations/fixture-current')
+        self.assertEqual(self.state()['auth_state'],'rate_limited')
+
+    def test_generation_429_still_blocks_even_with_a_rendered_turn(self):
+        self.signed_page(turn=True)
+        self.rate_response('/backend-api/conversation')
+        self.assertEqual(self.state()['auth_state'],'rate_limited')
+
     def test_password_and_challenge_are_reported(self):
         self.page.set_content('<input type="password">')
         self.assertEqual(self.state()['auth_state'],'credential_required')

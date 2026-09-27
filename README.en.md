@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.6
+# ChatGPT Web Images 0.7.7
+
+Version 0.7.7 separates sidebar/background refetch throttling from blocked generation. Rendered conversations remain observable with exact prompt verification; unreadable pages and generation HTTP 429 still cool down. The companion Hub transport uses `noDefaults: true` so attaching does not simulate focus and refetch every ChatGPT tab.
 
 Version 0.7.6 observes existing HTTP 429 resource timing metadata and shares durable 5/15/30-minute cooling across all lanes of a login. Only one lane probes after a cooldown. Task identity is retained and progress reports the retry time; parked batches never imply that missing images were delivered.
 

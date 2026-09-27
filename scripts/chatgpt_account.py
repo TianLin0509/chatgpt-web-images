@@ -22,13 +22,25 @@ STATE_FUNCTION = r'''() => {
  const profile = nodes('[data-testid="accounts-profile-button"],button[aria-label="Open profile menu"]').length > 0;
  const composer = nodes('#prompt-textarea,[contenteditable="true"][data-composer-markdown]').length > 0;
  const trusted = location.origin === 'https://chatgpt.com';
- const rate_limited=performance.getEntriesByType('resource').some(e=>{
-   try{return e.responseStatus===429&&new URL(e.name).origin==='https://chatgpt.com'&&new URL(e.name).pathname.startsWith('/backend-api/')&&performance.now()-e.responseEnd<120000}catch{return false;}
- });
  const logged_in = trusted && profile && composer && !login && !chooser && !challenge && !credential;
+ const current=location.pathname.match(/^\/c\/([^/]+)\/?$/)?.[1];
+ const rendered=nodes('[data-user-message-bubble],[data-message-author-role="user"]').length>0;
+ let rate_limited=false,background_rate_limited=false;
+ for(const e of performance.getEntriesByType('resource')) {
+   try {
+     const u=new URL(e.name);
+     if(e.responseStatus!==429||u.origin!=='https://chatgpt.com'||!u.pathname.startsWith('/backend-api/')||performance.now()-e.responseEnd>=120000)continue;
+     // The sidebar can fail while the requested conversation and its generated
+     // images are already readable. Poll still verifies the exact prompt before
+     // accepting any image. Generation and unreadable-page failures stay blocking.
+     const readCurrent=current&&['/backend-api/conversations/','/backend-api/conversation/'].some(p=>u.pathname===p+current);
+     if(logged_in&&(u.pathname==='/backend-api/conversations'||(readCurrent&&rendered)))background_rate_limited=true;
+     else rate_limited=true;
+   } catch { /* Non-URL performance entries do not describe provider responses. */ }
+ }
  return {url:location.href,title:document.title,logged_in,composer,account_chooser:chooser,
    login_in_progress:chooser && /Logging in|Signing in|正在登录|登录中/i.test(document.body.innerText),
-   challenge,cloudflare:challenge,credential_required:credential,rate_limited,
+   challenge,cloudflare:challenge,credential_required:credential,rate_limited,background_rate_limited,
    auth_state:challenge?'browser_challenge':credential?'credential_required':chooser?'account_selection_required':
      rate_limited?'rate_limited':logged_in?'authenticated':login?'login_required':'page_not_ready'};
 }'''
