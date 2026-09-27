@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.4
+
+- Support the current user-turn markup and generated-image galleries alongside legacy message nodes. Scope originals to the verified latest prompt, deduplicate preview/thumbnail copies and keep stable keys across page reloads.
+- Download verified gallery originals from the authenticated page, including fsns assets and cached responses with empty CDP bodies. Compare SHA-256 with the displayed asset, cache candidate hashes and return metadata only over MCP.
+- Bound unreadable-conversation waiting separately from generation; expose observation and download stages and refuse cancellation without prompt identity evidence.
+- Stop automatic idle health navigation and repeated login/challenge checks. Keep explicit account actions and bounded recovery for queued work. Poll idle local queues every three seconds.
+- Preserve generic stdio MCP, account separation, request deduplication, batch generation, references, continuations and checkpoints. Add real headless Chromium fixtures for gallery, download and recovery contracts.
+
+## 0.7.3
+
+- Save verified full-size generated assets from authenticated browser responses; preserve original bytes and retain UI fallback for unrecognized sources.
+- Exclude uploaded references and transient action-footer text from completion checks. Skip redundant cold navigation, observe generation every three seconds and complete immediately after the last saved image.
+- Retry transient Windows state-file sharing violations and keep health telemetry from terminating workers. Record preparation substeps and timing metadata.
+
 ## 0.7.2
 
 - Launch every lane window off screen. Hiding can only happen once a window exists, and reaching that point costs two child processes, so a cold lane used to flash on screen for seconds; with four lanes starting at once that was four windows. Measured with a 0.5s sampler over 150s of cold opens: 0 windows on screen, against 4 before.

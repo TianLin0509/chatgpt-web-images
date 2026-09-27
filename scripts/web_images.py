@@ -21,7 +21,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.3'
+VERSION = '0.7.4'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -374,6 +374,7 @@ def resume_existing(job_id):
             raise ImageError('job_not_active', 'The original job no longer owns this browser.')
         job['wait_started_at'] = time.time()
         job['refresh_requested'] = True
+        job.pop('unreadable_since', None)
         if job['status'] == 'needs_attention':
             job['status'] = 'generating'
         job.pop('error', None)
@@ -416,13 +417,14 @@ def adopt(job_id):
         ensure_browser()
         cli(['goto', url])
         run_js('''async page => {
-          await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+          await page.locator(':is([data-message-author-role="user"],[data-user-message-bubble])').last().waitFor({timeout:20000});
           return true;
         }''')
         write_json(DATA / 'active.json', {'job_id': job_id})
         job['window_hidden'] = set_visible(False)
         job['wait_started_at'] = time.time()
         job.pop('parked_at', None)
+        job.pop('unreadable_since', None)
         job.pop('identity_retry', None)
         job.pop('error', None)
         if job['status'] == 'needs_attention':
@@ -550,7 +552,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
             before = run_js(r'''async page => {
               await page.locator('#prompt-textarea').waitFor({state:'visible',timeout:45000});
               await page.getByTestId('composer-plus-btn').waitFor({state:'visible',timeout:5000});
-              return await page.evaluate(() => document.querySelectorAll('[data-message-author-role="user"]').length);
+              return await page.evaluate(() => document.querySelectorAll(':is([data-message-author-role="user"],[data-user-message-bubble])').length);
             }''')
             before = before if type(before) is int else 0
             job['operation_stage'] = 'fill_prompt'
@@ -588,7 +590,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
               const button=page.getByTestId('send-button');
               await button.waitFor({state:'visible', timeout:20000});
               await button.click({timeout:20000});
-              await page.waitForFunction(n => document.querySelectorAll('[data-message-author-role="user"]').length > n,
+              await page.waitForFunction(n => document.querySelectorAll(':is([data-message-author-role="user"],[data-user-message-bubble])').length > n,
                                          __BEFORE__, {timeout:20000});
               await page.waitForURL(/^https:\/\/chatgpt\.com\/c\/[a-zA-Z0-9-]+$/, {timeout:20000});
               return {url:page.url()};
@@ -615,66 +617,11 @@ FILL_PROMPT_JS = r'''async page => {
  return true;
 }'''
 
-DOM_IMAGES_JS = r"""
-function ownedImages() {
- const users=Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
- const user=users.at(-1);
- if(!user)return [];
- const seen=new Set(), assets=[];
- const selector='[data-testid^="conversation-turn-"] img[alt^="Generated image"], [data-testid^="conversation-turn-"] img[alt^="生成的图片"]';
- for(const node of document.querySelectorAll(selector)) {
-   if(!(user.compareDocumentPosition(node)&Node.DOCUMENT_POSITION_FOLLOWING))continue;
-   if(node.closest('[data-message-author-role="user"]')||node.closest('[data-testid^="conversation-turn-"]')===user.closest('[data-testid^="conversation-turn-"]'))continue;
-   const source=node.currentSrc||node.src;
-   if(!source)continue;
-   const url=new URL(source,location.href);
-   const id=url.searchParams.get('id')||url.searchParams.get('file_id');
-   const key=url.origin+url.pathname+(id?'?id='+id:'');
-   if(seen.has(key))continue;
-   seen.add(key);
-   assets.push({node,key,alt:node.alt,width:node.naturalWidth,height:node.naturalHeight,
-     ready:node.complete&&node.naturalWidth>=256&&node.naturalHeight>=256});
- }
- return assets;
-}
-"""
+from chatgpt_dom import DOM_IMAGES_JS, POLL_JS, MODERN_DOWNLOAD_JS
 
-POLL_JS = r'''async page => {
- // Trigger lazy-loaded generated images without returning image bytes.
- await page.evaluate(()=>{__DOM__ for(const a of ownedImages())if(!a.ready)a.node.scrollIntoView({block:'center'});});
- return await page.evaluate(()=>{
-   __DOM__
-   const users=Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
-   const lastUser=users.at(-1);
-   // Collapsed long messages include a Show more/less button outside the prompt.
-   // Read the full content container, never UI labels. Keep exact identity checks.
-   const userContent=lastUser?.querySelector('[data-testid="collapsible-user-message-content"]')||lastUser;
-   let userText=userContent?.innerText||'';
-   if(userContent?.querySelector('[data-inline-selection-pill][data-id="picture_v2"]')) {
-     // The image tool is rendered inside the user message but is not prompt text.
-     // Remove only its typed DOM marker, never matching words in the user's text.
-     const copy=userContent.cloneNode(true);
-     copy.querySelectorAll('[data-inline-selection-pill][data-id="picture_v2"]').forEach(n=>n.remove());
-     userText=copy.textContent||'';
-   }
-   const turns=Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"]'));
-   const assets=ownedImages();
-   // A turn only grows its action footer once it is finished. copy-turn-action-button
-   // is present on both image replies and text replies, so it is the shared signal.
-   // Containment, not order, is what distinguishes 'the user's own turn is last'.
-   const lastTurn=turns.at(-1);
-   const turnComplete=!!lastTurn&&!!lastTurn.querySelector('[data-testid="copy-turn-action-button"]')
-     &&!!lastUser&&!!(lastUser.compareDocumentPosition(lastTurn)&Node.DOCUMENT_POSITION_FOLLOWING);
-   const stopButton=document.querySelector('[data-testid="stop-button"]');
-   return {url:location.href,stop:!!stopButton&&!!stopButton.getClientRects().length&&getComputedStyle(stopButton).visibility!=='hidden',
-     turn_complete:turnComplete,
-     images:assets.filter(a=>a.ready).map(({node,...a})=>a),
-     pending_images:assets.filter(a=>!a.ready).length,
-     text:(turns.at(-1)?.innerText||'').slice(-1600),user_count:users.length,user_text:userText};
- });
-}'''.replace('__DOM__',DOM_IMAGES_JS)
 
-DOWNLOAD_JS = r'''async page => {
+DOWNLOAD_JS = (r'''async page => {
+__MODERN__
  // Fetch only the exact authenticated ORIGINAL asset already owned by this turn.
  // No screenshot, canvas conversion, resize parameter, thumbnail or base64.
  try {
@@ -767,7 +714,7 @@ DOWNLOAD_JS = r'''async page => {
  if(await download.failure())throw new Error('Image download failed');
  await download.saveAs(__TARGET__);
  return {saved:true};
-}'''.replace('__DOM__',DOM_IMAGES_JS)
+}'''.replace('__DOM__',DOM_IMAGES_JS).replace('__MODERN__',MODERN_DOWNLOAD_JS))
 
 
 def image_info(path):
@@ -847,14 +794,16 @@ def download_asset(job, asset):
         temporary=stem.with_suffix('.download')
         started=time.perf_counter()
         with original_receiver(temporary) as endpoint:
-            method=run_js(DOWNLOAD_JS.replace('__KEY__',json.dumps(asset['key'])).replace('__TARGET__',json.dumps(str(temporary))).replace('__TRANSFER__',json.dumps(endpoint)),timeout=55)
+            method=run_js(DOWNLOAD_JS.replace('__KEY__',json.dumps(asset['key'])).replace('__TARGET__',json.dumps(str(temporary))).replace('__TRANSFER__',json.dumps(endpoint)).replace('__USED_ORIGINALS__',json.dumps([f['original_id'] for f in job['files'] if f.get('original_id')])),timeout=55)
         job.setdefault('timings',{})['download_seconds']=round(job.get('timings',{}).get('download_seconds',0)+time.perf_counter()-started,3)
         if isinstance(method,dict):job['timings']['download_method']=method.get('method','ui_original')
         extension,meta=image_info(temporary)
-        if isinstance(method,dict) and method.get('method')=='authenticated_original' and (meta['width']<asset.get('width',0) or meta['height']<asset.get('height',0)):
+        if isinstance(method,dict) and method.get('method') in {'authenticated_original','authenticated_gallery_original'} and (meta['width']<asset.get('width',0) or meta['height']<asset.get('height',0)):
             raise ImageError('original_resolution_mismatch','Downloaded image is smaller than the observed asset; it is not accepted as an original.')
         target=stem.with_suffix(extension)
         record={'path':str(target.resolve()),**meta,'source_id':source_id,'index':plan['index']}
+        if isinstance(method,dict) and re.fullmatch(r'file[_-][A-Za-z0-9_-]+',method.get('original_id','')):
+            record['original_id']=method['original_id']
         plan['verified']=record
         save_job(job)  # recovery can recognize the final file after a crash during rename
         if target.exists():
@@ -881,7 +830,7 @@ def poll(job_id):
         if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',url) and browser['url']!=url:
             cli(['goto',url])
             run_js('''async page => {
-              await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+              await page.locator(':is([data-message-author-role="user"],[data-user-message-bubble])').last().waitFor({timeout:20000});
               return true;
             }''')
         result=run_js(POLL_JS)
@@ -894,7 +843,7 @@ def poll(job_id):
             if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',url):
                 cli(['goto',url])
                 run_js('''async page => {
-                  await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+                  await page.locator(':is([data-message-author-role="user"],[data-user-message-bubble])').last().waitFor({timeout:20000});
                   return true;
                 }''')
                 result=run_js(POLL_JS)
@@ -909,13 +858,25 @@ def poll(job_id):
                 return public_job(job)
             raise ImageError('conversation_changed','The browser contains a different prompt; do not download or resend. Open the recorded conversation and poll again.')
         job.pop('identity_retry',None)
-        if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',result['url']):
-            job['conversation_url']=result['url']
         # Deduplicate repeated DOM representations of the same generated asset.
         assets=list({a['key']:a for a in result['images']}.values())
         job['observed_count']=len(assets)
         pending=result.get('pending_images',0)
-        if not result['user_count'] or not assets or result['stop'] or pending:
+        if not result['user_count']:
+            # A logged-in shell is not proof that its conversation loaded. Bound
+            # this separately from the image-generation budget; never resend.
+            job.setdefault('unreadable_since',time.time())
+            job['operation_stage']='read_conversation'
+            if time.time()-job['unreadable_since']>=60:
+                job['status']='needs_attention'
+                job['error']={'code':'conversation_not_readable','message':'The recorded conversation has no readable user message after 60 seconds. Inspect page loading or DOM compatibility; the prompt has not been resent.'}
+            save_job(job)
+            return public_job(job)
+        job.pop('unreadable_since',None)
+        if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',result['url']):
+            job['conversation_url']=result['url']
+        job['operation_stage']='observe_images'
+        if not assets or result['stop'] or pending:
             if time.time()-job.get('wait_started_at',job['created_at'])>900:
                 job['status']='needs_attention'
                 job['error']={'code':'generation_wait_exceeded','message':'Generation has not settled after 15 minutes. Inspect the existing conversation; the prompt has not been resent.'}
@@ -947,6 +908,7 @@ def poll(job_id):
         if time.time()-job.get('stable_since',time.time())<settle_seconds:
             return public_job(job)
         job['status']='downloading'
+        job['operation_stage']='download_originals'
         save_job(job)
         # Bound each poll; subsequent polls resume from the per-file checkpoint.
         deadline=time.monotonic()+35
@@ -1039,11 +1001,13 @@ def cancel(job_id):
             raise ImageError('job_not_active','This job does not own the browser.')
         ensure_browser()
         result=run_js(POLL_JS)
+        if not result['user_count']:
+            raise ImageError('conversation_not_readable','Cannot confirm the current prompt; refusing to stop an unidentified conversation.')
         if result['user_count'] and not identity_matches(job,result['user_text']):
             raise ImageError('conversation_changed','A different prompt is open; refusing to stop it.')
         if result['stop']:
             run_js('''async page => {
-              const stop=page.getByTestId('stop-button');
+              const stop=page.locator('[data-testid="stop-button"],button[aria-label="Stop generating"],button[aria-label="Stop streaming"],button[aria-label="Stop response"]').filter({visible:true}).first();
               await stop.click({timeout:10000});
               await stop.waitFor({state:'hidden',timeout:15000});
               return {stopped:true};

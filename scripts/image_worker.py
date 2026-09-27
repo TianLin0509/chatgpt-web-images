@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import sqlite3
 
 import web_images as w
 from image_pool import ADOPT_BACKOFF, PARK_AFTER_SECONDS, PARKED, Pool, TERMINAL, VERSION
@@ -19,7 +20,6 @@ RECHECK_BACKOFF = (60, 300, 900)
 # Each open lane holds a full browser in memory, so an idle one gives it back.
 # The profile keeps the login; the next job reopens it without a sign-in.
 IDLE_BROWSER_SECONDS = 300
-UNHEALTHY = {'browser_unhealthy', 'worker_error'}
 
 
 @contextlib.contextmanager
@@ -40,8 +40,11 @@ def worker_lock(path):
 
 
 def error_value(exc):
-    return {'code': exc.code if isinstance(exc, w.ImageError) else 'worker_error',
-            'message': str(exc) if isinstance(exc, w.ImageError) else type(exc).__name__}
+    result = {'code': exc.code if isinstance(exc, w.ImageError) else 'worker_error',
+              'message': str(exc) if isinstance(exc, w.ImageError) else type(exc).__name__}
+    if isinstance(exc,sqlite3.Error):
+        result['sqlite_error']=getattr(exc,'sqlite_errorname','SQLITE_UNKNOWN')
+    return result
 
 
 class Worker:
@@ -61,14 +64,26 @@ class Worker:
         """Decide whether to re-check a not-ready account, with backoff when unhealthy."""
         if not account['enabled']:
             return False
+        # Human authentication failures cannot be repaired by visiting the login
+        # page every 30 seconds. Explicit open/check/select controls still work.
+        error=account.get('error') or {}
+        if isinstance(error,str):error=json.loads(error)
+        manual={'login_required','browser_challenge','account_selection_required','credential_required','legacy_job_active'}
+        if account['state'] in manual or error.get('code') in manual:
+            return False
         waited = time.monotonic() - self.last_check
-        if account['state'] not in UNHEALTHY:
-            return waited >= 30
         # A browser hiccup should not take the lane offline until a human notices it,
         # but a genuinely broken profile must not be retried forever either.
         if self.recoveries >= len(RECHECK_BACKOFF):
             return False
         return waited >= RECHECK_BACKOFF[self.recoveries]
+
+    def has_waiting_work(self):
+        # Idle lanes never navigate browsers just to refresh a health badge.
+        group=self.pool.account(self.account_id).get('login_group') or self.account_id
+        with self.pool.connect() as db:
+            return bool(db.execute("SELECT 1 FROM jobs WHERE (account_id=? AND (status IN ('dispatching','running','needs_attention') OR (status='parked' AND park_count<=? AND retry_after<=?))) OR (status='queued' AND preferred IN ('auto',?,?)) LIMIT 1",
+                                   (self.account_id,len(ADOPT_BACKOFF),time.time(),self.account_id,group)).fetchone())
 
     def record_result(self, job_id, result, runtime_id=None):
         previous = self.pool.row(job_id)
@@ -141,6 +156,7 @@ class Worker:
         """Re-observe one parked job that is due; never resubmits its prompt."""
         job = self.pool.due_parked(self.account_id)
         if not job:
+            self.delay = 3  # cheap local queue polling while idle; no browser navigation
             return False
         if not job['runtime_id']:
             # It never reached the browser, so the normal dispatch path applies. start()
@@ -167,10 +183,9 @@ class Worker:
         self.control_turn = True
         account = self.pool.account(self.account_id)
         # Disabled accounts are touched only when the user asks to open/check them.
-        if not account['ready'] and self.recheck_due(account):
-            if account['state'] in UNHEALTHY:
-                self.recoveries += 1
-                self.log('account_recovery', state=account['state'], attempt=self.recoveries)
+        if not account['ready'] and self.has_waiting_work() and self.recheck_due(account):
+            self.recoveries += 1
+            self.log('account_recovery', state=account['state'], attempt=self.recoveries)
             self.pool.control(self.account_id, 'check')
             self.last_check = time.monotonic()
             return
@@ -282,7 +297,7 @@ def main():
                                 with pool.connect() as db:
                                     db.execute("UPDATE jobs SET result=? WHERE id=? AND status='dispatching'",(json.dumps(w.public_job(live),ensure_ascii=False),active['id']))
                 except Exception as exc:
-                    print(json.dumps({'event': 'heartbeat_error', 'type': type(exc).__name__}), flush=True)
+                    print(json.dumps({'event': 'heartbeat_error', 'error': error_value(exc)}), flush=True)
                 stop.wait(3)
         thread = threading.Thread(target=pulse, daemon=True)
         thread.start()

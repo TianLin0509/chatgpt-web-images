@@ -9,6 +9,22 @@ import test_web_images as fixtures
 w=fixtures.w
 
 class Latency(fixtures.Contracts):
+    def test_unreadable_conversation_has_bounded_wait_without_submission(self):
+        job=self.job();job['created_at']=time.time();w.save_job(job)
+        snapshot={'user_count':0,'user_text':'','url':'https://chatgpt.com/c/abc','stop':False,'images':[]}
+        with patch.object(w,'ensure_browser',return_value={'url':snapshot['url']}),patch.object(w,'run_js',return_value=snapshot),patch.object(w,'start') as submit:
+            first=w.poll(job['job_id']);self.assertEqual(first['operation_stage'],'read_conversation')
+            stored=json.loads(w.job_path(job['job_id']).read_text());stored['unreadable_since']=time.time()-61;w.save_job(stored)
+            result=w.poll(job['job_id'])
+            self.assertEqual(result['status'],'needs_attention');self.assertEqual(result['error']['code'],'conversation_not_readable');submit.assert_not_called()
+
+    def test_cannot_cancel_a_conversation_without_identity_evidence(self):
+        job=self.job()
+        with patch.object(w,'ensure_browser'),patch.object(w,'run_js',return_value={'user_count':0,'stop':True}) as run:
+            result=w.safe_call(w.cancel,job_id=job['job_id'])
+        self.assertEqual(result['error']['code'],'conversation_not_readable');self.assertEqual(run.call_count,1)
+        self.assertIsNotNone(w.active_job())
+
     def test_ui_only_footer_is_not_a_no_image_failure(self):
         job=self.job();job['created_at']=time.time();w.save_job(job)
         snapshot={'user_count':1,'user_text':'my prompt','url':'https://chatgpt.com/c/abc','stop':False,'turn_complete':True,'pending_images':0,'images':[],'text':'Worked for 1m 47s\nEdit'}
