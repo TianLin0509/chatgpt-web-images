@@ -17,9 +17,11 @@ from image_pool import ADOPT_BACKOFF, PARK_AFTER_SECONDS, PARKED, Pool, TERMINAL
 IDLE_TICK, WATCH_TICK = 1, 3
 # A browser failure used to take its account offline until a human checked it.
 RECHECK_BACKOFF = (60, 300, 900)
-# Each open lane holds a full browser in memory, so an idle one gives it back.
-# The profile keeps the login; the next job reopens it without a sign-in.
-IDLE_BROWSER_SECONDS = 300
+# A released browser costs the next job a cold start (Chrome launch, Cloudflare check,
+# ChatGPT load), and cold starts were where most browser_timeout/browser_not_open
+# failures happened. With one lane per account the memory saved is small, so an idle
+# lane now keeps its warm browser for hours; set the variable to trade memory back.
+IDLE_BROWSER_SECONDS = int(os.environ.get('CHATGPT_WEB_IMAGES_IDLE_RELEASE_SECONDS') or 6 * 3600)
 
 
 @contextlib.contextmanager

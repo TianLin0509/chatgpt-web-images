@@ -21,7 +21,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.11'
+VERSION = '0.7.12'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -63,8 +63,18 @@ WINDOW_LOOKUP_TRIES = 4
 #    this position is never on screen at any sample, while hiding alone left it visible
 #    through the whole cold open. Hiding still runs, to keep it out of the taskbar too.
 OFFSCREEN = (-32000, -32000)
+# An off-screen or hidden window is treated by Chrome as a background page: timers are
+# throttled, lazy images never load and focus-dependent menus stall. These switches keep
+# the lane's renderer running at foreground speed without ever showing the window
+# (chrome-launcher "flags for tools"; CalculateNativeWinOcclusion is the Windows-only
+# occlusion tracker that otherwise marks a covered or off-screen window as hidden).
+BACKGROUND_SAFE_ARGS = ['--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-features=CalculateNativeWinOcclusion']
 BROWSER_ARGS = ['--hide-crash-restore-bubble', '--disable-session-crashed-bubble',
                 '--no-first-run', '--no-default-browser-check',
+                *BACKGROUND_SAFE_ARGS,
                 '--window-position=%d,%d' % OFFSCREEN, '--window-size=1280,900']
 # Where a window goes when the user actually asked to see it.
 ONSCREEN = (80, 60)

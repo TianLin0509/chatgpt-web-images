@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.12
+
+- Launch lane browsers with Chrome's background-safe switches (no timer throttling, no occluded-window backgrounding, no renderer backgrounding, Windows occlusion tracking off), so an off-screen lane runs at foreground speed instead of relying on per-step focus emulation.
+- Keep an idle lane's browser warm for 6 hours by default (`CHATGPT_WEB_IMAGES_IDLE_RELEASE_SECONDS`). Releasing after 5 minutes forced a cold Chrome/Cloudflare/ChatGPT start on most jobs, which is where most browser_timeout and browser_not_open failures occurred.
+
 ## 0.7.11
 
 - Handle the observed hidden-but-focused Chrome state: temporarily emulate visibility for owned-page input even when document.hasFocus() remains true.
