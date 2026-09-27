@@ -11,7 +11,9 @@ def interactive(source):
  const session=await page.context().newCDPSession(page);
  let emulated=false;
  try {
-   if(!await page.evaluate(()=>document.hasFocus())) {
+   // Chrome can report hasFocus=true even while an OS-hidden page is invisible.
+   // Menus need visibility emulation in that case too.
+   if(!await page.evaluate(()=>document.hasFocus()&&!document.hidden)) {
      await session.send('Emulation.setFocusEmulationEnabled',{enabled:true});
      emulated=true;
    }

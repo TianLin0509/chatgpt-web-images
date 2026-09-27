@@ -8,14 +8,14 @@ def test_focus_targets_owned_page_and_restores_on_success_and_failure():
     script = r'''
 const assert=require('assert');const spec=JSON.parse(require('fs').readFileSync(0,'utf8'));
 (async()=>{
- for(const focused of [false,true])for(const fail of [false,true]){
-  const events=[];const page={evaluate:async()=>focused,context:()=>({newCDPSession:async target=>{
+ for(const focused of [false,true])for(const hidden of [false,true])for(const fail of [false,true]){
+  const events=[];global.document={hasFocus:()=>focused,hidden};const page={evaluate:async fn=>fn(),context:()=>({newCDPSession:async target=>{
    assert.strictEqual(target,page);events.push('own');return{send:async(method,p)=>events.push([method,p.enabled]),detach:async()=>events.push('detach')};}})};
   const fn=new Function('return ('+spec[fail?'failure':'success']+')')();
   if(fail)await assert.rejects(()=>fn(page),/original failure/);else assert.equal(await fn(page),42);
-  assert.deepEqual(events,focused?['own','detach']:['own',['Emulation.setFocusEmulationEnabled',true],['Emulation.setFocusEmulationEnabled',false],'detach']);
+  assert.deepEqual(events,focused&&!hidden?['own','detach']:['own',['Emulation.setFocusEmulationEnabled',true],['Emulation.setFocusEmulationEnabled',false],'detach']);
  }
- console.log('4 scoped focus cases passed');
+ console.log('8 scoped focus cases passed');
 })().catch(e=>{console.error(e);process.exit(1)});
 '''
     result = subprocess.run([shutil.which('node'), '-e', script], input=json.dumps({

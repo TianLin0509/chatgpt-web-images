@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.11
+
+- Handle the observed hidden-but-focused Chrome state: temporarily emulate visibility for owned-page input even when document.hasFocus() remains true.
+
+
 ## 0.7.10
 
 - Temporarily emulate focus only in the owned page during prompt input, image-tool selection and submission. Background polls stay passive; hidden composer menus work without waking other tabs.
