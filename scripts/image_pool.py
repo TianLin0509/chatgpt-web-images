@@ -46,13 +46,14 @@ ACTIONABLE = {
     'job_state_unreadable': 'human',
     'generation_wait_exceeded': 'retry', 'browser_locator_ambiguous': 'retry',
     'conversation_not_readable': 'retry',
+    'page_not_ready': 'retry',
     'login_required': 'human', 'browser_challenge': 'human', 'account_selection_required': 'human',
     'credential_required': 'human', 'image_tool_unavailable': 'human', 'output_exists': 'human',
     'output_changed': 'human', 'conversation_changed': 'human', 'legacy_job_active': 'human',
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.4'
+VERSION = '0.7.5'
 
 
 @contextlib.contextmanager

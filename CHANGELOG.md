@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.5
+
+- Distinguish an authenticated page shell that has not loaded its composer from an explicit sign-in page. Report `page_not_ready` instead of falsely declaring the account logged out.
+- During a real task or explicit account check, refresh the same owned ChatGPT page once after the loading wait expires. Never resend its prompt; persistent loading remains bounded and retryable.
+- Recognize both current and legacy profile/composer elements directly in the shared account inspector.
+
 ## 0.7.4
 
 - Support the current user-turn markup and generated-image galleries alongside legacy message nodes. Scope originals to the verified latest prompt, deduplicate preview/thumbnail copies and keep stable keys across page reloads.

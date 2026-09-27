@@ -72,6 +72,16 @@ class AccountBrowser(unittest.TestCase):
     def test_sign_in_page_is_not_authenticated(self):
         self.page.set_content('<button data-testid="accounts-profile-button">Profile</button><div id="prompt-textarea">draft</div><button>Log in</button>')
         self.assertFalse(self.state()['logged_in'])
+        self.assertEqual(self.state()['auth_state'],'login_required')
+
+    def test_loading_shell_does_not_claim_signed_out(self):
+        self.page.set_content('<button aria-label="Open profile menu">Profile</button><div>Loading...</div>')
+        self.assertEqual(self.state()['auth_state'],'page_not_ready')
+        self.assertFalse(self.state()['logged_in'])
+
+    def test_modern_profile_and_composer_are_authenticated_without_hub_adapter(self):
+        self.page.set_content('<button aria-label="Open profile menu">Profile</button><div contenteditable="true" data-composer-markdown></div>')
+        self.assertEqual(self.state()['auth_state'],'authenticated')
 
     def test_password_and_challenge_are_reported(self):
         self.page.set_content('<input type="password">')

@@ -19,15 +19,15 @@ STATE_FUNCTION = r'''() => {
  const challenge = /Just a moment|checking your browser/i.test(document.title) ||
    nodes('iframe[src*="challenges.cloudflare.com"]').length > 0;
  const credential = nodes('input[type="password"],input[autocomplete="one-time-code"],input[name="code"]').length > 0;
- const profile = nodes('[data-testid="accounts-profile-button"]').length > 0;
- const composer = nodes('#prompt-textarea').length > 0;
+ const profile = nodes('[data-testid="accounts-profile-button"],button[aria-label="Open profile menu"]').length > 0;
+ const composer = nodes('#prompt-textarea,[contenteditable="true"][data-composer-markdown]').length > 0;
  const trusted = location.origin === 'https://chatgpt.com';
  const logged_in = trusted && profile && composer && !login && !chooser && !challenge && !credential;
  return {url:location.href,title:document.title,logged_in,composer,account_chooser:chooser,
    login_in_progress:chooser && /Logging in|Signing in|正在登录|登录中/i.test(document.body.innerText),
    challenge,cloudflare:challenge,credential_required:credential,
    auth_state:challenge?'browser_challenge':credential?'credential_required':chooser?'account_selection_required':
-     logged_in?'authenticated':'login_required'};
+     logged_in?'authenticated':login?'login_required':'page_not_ready'};
 }'''
 
 STATUS_JS = 'async page => await page.evaluate(' + STATE_FUNCTION + ')'
@@ -36,11 +36,22 @@ SETTLE_JS = r'''async page => {
  try {
    await page.waitForFunction(() => {
      const state = (__STATE__)();
-     return state.logged_in || state.account_chooser || state.challenge || state.credential_required;
+     return state.logged_in || state.account_chooser || state.challenge || state.credential_required || state.auth_state==='login_required';
    }, null, {timeout:10000});
  } catch(error) { if(error.name !== 'TimeoutError') throw error; }
  return await page.evaluate(__STATE__);
 }'''.replace('__STATE__', STATE_FUNCTION)
+
+# A stalled authenticated shell is different from an explicit sign-in page.
+# Refresh only the same owned ChatGPT URL, once during an actual operation.
+RECOVER_LOADING_JS = r'''async page => {
+ if(new URL(page.url()).origin!=='https://chatgpt.com')return await page.evaluate(__STATE__);
+ await page.reload({waitUntil:'domcontentloaded',timeout:20000});
+ try {
+   await page.waitForFunction(()=>{const s=(__STATE__)();return s.logged_in||s.account_chooser||s.challenge||s.credential_required||s.auth_state==='login_required'},null,{timeout:15000});
+ } catch(e) {if(e.name!=='TimeoutError')throw e;}
+ return await page.evaluate(__STATE__);
+}'''.replace('__STATE__',STATE_FUNCTION)
 
 
 def selection_code(account_name: str) -> str:

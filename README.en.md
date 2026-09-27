@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.4
+# ChatGPT Web Images 0.7.5
+
+Version 0.7.5 distinguishes a loading shell from an explicit sign-in screen and permits one same-page refresh during a task or explicit account check, without resending the prompt.
 
 Version 0.7.4 supports current ChatGPT turns and multi-image galleries alongside legacy markup. It verifies original bytes before saving, preserves stable checkpoints across reloads, exposes bounded conversation-loading progress, and stops automatic idle login checks. Claude and Codex continue to share the same standard stdio MCP and durable queue. See CHANGELOG.md for details.
 

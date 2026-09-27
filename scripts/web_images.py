@@ -21,7 +21,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.4'
+VERSION = '0.7.5'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -300,6 +300,9 @@ def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True):
                 state['window_hidden'] = False
     if not any(state.get(key) for key in ('logged_in','account_chooser','challenge','credential_required')):
         state = run_js(SETTLE_JS)
+    if state.get('auth_state')=='page_not_ready':
+        from chatgpt_account import RECOVER_LOADING_JS
+        state = run_js(RECOVER_LOADING_JS)
     authorized = SETTINGS.get('account_name', '') if account_name is None else account_name
     if state.get('account_chooser') and authorized and not state.get('challenge'):
         state = run_js(selection_code(authorized))
@@ -315,6 +318,8 @@ def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True):
         code = state['auth_state']
         raise ImageError(code, ERROR_MESSAGES[code])
     if not state.get('logged_in'):
+        if state.get('auth_state')=='page_not_ready':
+            raise ImageError('page_not_ready','The account page has not finished loading; this is not proof of a signed-out account. The existing page was refreshed once without resubmitting a prompt.')
         raise ImageError('login_required', 'Sign in in the dedicated browser using open.')
     return state
 
