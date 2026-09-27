@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.8
+
+- Load pending generated gallery assets eagerly in hidden/offscreen Chrome. This avoids waiting forever for lazy thumbnails while retaining hidden windows and checking exact prompt identity before downloading. User uploads and earlier turns are excluded; no window focus changes or prompt resubmission.
+
 ## 0.7.7
 
 - Distinguish a throttled sidebar or background conversation refetch from a blocked generation. A rendered authenticated conversation remains observable and downloadable; prompt ownership is still checked before accepting images. Unreadable conversations and generation HTTP 429 retain shared cooldown.

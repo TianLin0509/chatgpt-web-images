@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.7
+# ChatGPT Web Images 0.7.8
+
+Version 0.7.8 loads pending generated gallery assets in hidden/offscreen Chrome without changing window focus. Only the current turn's generated assets are touched; earlier turns and user uploads are excluded.
 
 Version 0.7.7 separates sidebar/background refetch throttling from blocked generation. Rendered conversations remain observable with exact prompt verification; unreadable pages and generation HTTP 429 still cool down. The companion Hub transport uses `noDefaults: true` so attaching does not simulate focus and refetch every ChatGPT tab.
 

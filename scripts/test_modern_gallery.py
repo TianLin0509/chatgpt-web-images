@@ -43,6 +43,28 @@ class GalleryDOM(unittest.TestCase):
         self.fixture();self.page.locator('button[aria-label="Show generated image 5"] img').evaluate("i=>Object.defineProperties(i,{naturalWidth:{value:0},currentSrc:{value:''},complete:{value:false}})")
         r=self.observe();self.assertEqual(len(r['images']),4);self.assertEqual(r['pending_images'],1)
 
+    def test_offscreen_lazy_gallery_loads_without_loading_uploads_or_old_turns(self):
+        from io import BytesIO
+        from PIL import Image
+        data=BytesIO();Image.new('RGB',(320,320),'blue').save(data,format='PNG')
+        requested=[]
+        def route(r):
+            if r.request.url.endswith('.png'):
+                requested.append(r.request.url.rsplit('/',1)[1]);r.fulfill(body=data.getvalue(),content_type='image/png')
+            else:r.fulfill(body='<html><body></body></html>',content_type='text/html')
+        self.page.route('**/*',route);self.page.goto('https://chatgpt.com/c/fixture')
+        self.page.set_content('''<style>img{position:fixed;top:100000px;width:60px;height:60px}</style>
+          <div data-turn-key="old"><div data-user-message-bubble>Old</div><img loading="lazy" src="/old.png"></div>
+          <div data-turn-key="current"><div data-user-message-bubble>Current<img loading="lazy" src="/upload.png"></div>
+          <div data-chatgpt-search-message-ids="current-response"><div role="group" aria-label="Generated images">
+          <button aria-label="Show generated image 1"><img loading="lazy" src="/generated.png"></button></div></div></div>''')
+        self.assertEqual(self.page.locator('img[src="/generated.png"]').evaluate('n=>n.naturalWidth'),0)
+        self.observe()
+        self.page.wait_for_function('document.querySelector(\'img[src="/generated.png"]\').naturalWidth===320',timeout=2000)
+        result=self.observe()
+        self.assertEqual(len(result['images']),1);self.assertEqual(result['pending_images'],0)
+        self.assertEqual(requested,['generated.png'])
+
     def test_regenerated_blob_urls_keep_checkpoint_identity(self):
         self.fixture();before=[a['key'] for a in self.observe()['images']]
         self.page.evaluate("()=>{for(const i of document.images)Object.defineProperty(i,'currentSrc',{value:'blob:https://chatgpt.com/reloaded-'+Math.random()})}")

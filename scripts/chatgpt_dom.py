@@ -45,7 +45,9 @@ function ownedImages() {
 '''
 
 POLL_JS = r'''async page => {
- await page.evaluate(()=>{__DOM__ for(const a of ownedImages())if(!a.ready)a.node.scrollIntoView({block:'center'});});
+ // Hidden/offscreen Chrome does not load lazy gallery thumbnails after scrolling.
+ // Request only this turn's already-present generated assets, without focus changes.
+ await page.evaluate(()=>{__DOM__ for(const a of ownedImages())if(!a.ready){a.node.loading='eager';a.node.scrollIntoView({block:'center'});}});
  return await page.evaluate(()=>{
    __DOM__
    const users=messageUsers(),lastUser=users.at(-1);
