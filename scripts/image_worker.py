@@ -13,7 +13,7 @@ import web_images as w
 from image_pool import ADOPT_BACKOFF, PARK_AFTER_SECONDS, PARKED, Pool, TERMINAL, VERSION
 
 # Waiting for generation is minutes long, so tick fast only when something can change.
-IDLE_TICK, WATCH_TICK = 3, 10
+IDLE_TICK, WATCH_TICK = 1, 3
 # A browser failure used to take its account offline until a human checked it.
 RECHECK_BACKOFF = (60, 300, 900)
 # Each open lane holds a full browser in memory, so an idle one gives it back.
@@ -55,7 +55,7 @@ class Worker:
         self.browser_released = False
 
     def log(self, event, **fields):
-        print(json.dumps({'event': event, 'account_id': self.account_id, **fields}), flush=True)
+        print(json.dumps({'event': event, 'at':time.time(), 'account_id': self.account_id, **fields}), flush=True)
 
     def recheck_due(self, account):
         """Decide whether to re-check a not-ready account, with backoff when unhealthy."""
@@ -79,7 +79,7 @@ class Worker:
         elif phase in {'complete', 'partial', 'count_mismatch', 'cancelled'}:
             self.pool.account_state(self.account_id, 'authenticated', True)
         if json.loads(previous['result'] or '{}').get('status') != phase:
-            print(json.dumps({'event': 'job_phase', 'job_id': job_id, 'account_id': self.account_id,
+            print(json.dumps({'event': 'job_phase', 'at':time.time(), 'job_id': job_id, 'account_id': self.account_id,
                               'phase': phase, 'operation_stage': result.get('operation_stage'),
                               'error_code': (result.get('error') or {}).get('code')}), flush=True)
 
@@ -266,6 +266,21 @@ def main():
             while not stop.is_set():
                 try:
                     pool.heartbeat(account_id)
+                    # Surface the actual preparation substep while start() owns
+                    # the browser. Read metadata only; never touch that browser.
+                    with pool.connect() as db:
+                        active=db.execute("SELECT id,payload FROM jobs WHERE account_id=? AND status='dispatching'",(account_id,)).fetchone()
+                    if active:
+                        request=json.loads(active['payload'])['request_id']
+                        index=w.DATA/'requests'/(request+'.json')
+                        if index.exists():
+                            runtime_id=json.loads(index.read_text(encoding='utf-8'))['job_id']
+                            live=json.loads(w.job_path(runtime_id).read_text(encoding='utf-8'))
+                            # Do not publish terminal results before main tick
+                            # finishes; it is the sole owner of job transitions.
+                            if live['status'] not in TERMINAL:
+                                with pool.connect() as db:
+                                    db.execute("UPDATE jobs SET result=? WHERE id=? AND status='dispatching'",(json.dumps(w.public_job(live),ensure_ascii=False),active['id']))
                 except Exception as exc:
                     print(json.dumps({'event': 'heartbeat_error', 'type': type(exc).__name__}), flush=True)
                 stop.wait(3)
@@ -278,7 +293,8 @@ def main():
             while not (pool.root / ('stop-' + account_id)).exists():
                 try:
                     health['tick_started'] = time.time()
-                    w.write_json(health_path, health)
+                    try:w.write_json(health_path, health)
+                    except OSError:pass  # best-effort telemetry must not stop a worker
                     worker.tick()
                 except Exception as exc:
                     error = error_value(exc)
@@ -286,7 +302,8 @@ def main():
                     pool.account_state(account_id, 'worker_error', False, error)
                 finally:
                     health['tick_finished'] = time.time()
-                    w.write_json(health_path, health)
+                    try:w.write_json(health_path, health)
+                    except OSError:pass
                 stop.wait(worker.delay)
         finally:
             stop.set()

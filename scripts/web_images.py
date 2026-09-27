@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import http.server
 import json
 import os
 from pathlib import Path
@@ -13,13 +14,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.2'
+VERSION = '0.7.3'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -78,7 +80,17 @@ def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix('.tmp-' + uuid.uuid4().hex)
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    os.replace(temp, path)
+    # Windows readers can briefly hold the destination without delete sharing.
+    # Never let a telemetry write kill the worker or lose its active request.
+    for attempt in range(6):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt==5:
+                temp.unlink(missing_ok=True)
+                raise
+            time.sleep(.01*(attempt+1))
 
 
 def prompt_hash(text):
@@ -148,7 +160,7 @@ def cli(args, timeout=55):
         proc = subprocess.run(
             [command, str(CLI_ENTRY), '--session', SESSION, '--json', *args],
             cwd=DATA, capture_output=True, text=True, encoding='utf-8', errors='replace',
-            env={**os.environ, 'NO_COLOR': '1', 'FORCE_COLOR': '0'}, timeout=timeout,
+            env={**os.environ, 'NO_COLOR': '1', 'FORCE_COLOR': '0', 'NO_UPDATE_NOTIFIER':'1'}, timeout=timeout,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except subprocess.TimeoutExpired as exc:
@@ -321,7 +333,7 @@ def job_path(job_id):
 def public_job(job):
     keys = ['job_id', 'status', 'conversation_url', 'output_dir', 'files', 'error',
             'provider', 'image_model_verified', 'prompt_sha256', 'created_at', 'updated_at',
-            'reference_count', 'window_hidden', 'requested_count', 'observed_count', 'count_match', 'submitted_prompt_sha256', 'operation_stage']
+            'reference_count', 'window_hidden', 'requested_count', 'observed_count', 'count_match', 'submitted_prompt_sha256', 'operation_stage', 'timeline', 'timings']
     result={k:job[k] for k in keys if k in job}
     result['requested_count']=job.get('requested_count',1)
     result['downloaded_count']=len(job.get('files',[]))
@@ -332,6 +344,11 @@ def public_job(job):
 
 def save_job(job):
     job['updated_at'] = time.time()
+    timeline=job.setdefault('timeline',[])
+    current={'status':job['status'],'operation':job.get('operation_stage','')}
+    if not timeline or any(timeline[-1].get(k)!=v for k,v in current.items()):
+        timeline.append({'at':job['updated_at'],**current})
+        del timeline[:-40]
     write_json(job_path(job['job_id']), job)
 
 
@@ -502,7 +519,9 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
         active = active_job()
         if active:
             raise ImageError('job_active', f"Job {active['job_id']} is active; poll it before starting another.")
-        ensure_browser()
+        bootstrap_started=time.perf_counter()
+        browser=ensure_browser()
+        bootstrap_seconds=time.perf_counter()-bootstrap_started
         out.mkdir(parents=True, exist_ok=True)
         job_id = time.strftime('%Y%m%d') + '-' + uuid.uuid4().hex[:12]
         job = dict(job_id=job_id, status='preparing', provider='chatgpt-web', image_model_verified=False,
@@ -510,7 +529,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
                    prompt_sha256=original_hash, requested_count=count, observed_count=0,
                    submitted_prompt_sha256=hashlib.sha256(prompt.encode('utf-8')).hexdigest(),
                    identity_hash=prompt_hash(prompt), identity_loose=loose_hash(prompt),
-                   reference_count=len(refs), files=[])
+                   reference_count=len(refs), files=[],timings={'browser_bootstrap':round(bootstrap_seconds,3)})
         save_job(job)
         write_json(DATA / 'active.json', {'job_id':job_id})
         if request_id:
@@ -519,7 +538,10 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
             job['operation_stage'] = 'continue_conversation' if conversation_url else 'new_conversation'
             job['conversation_url'] = conversation_url or job.get('conversation_url', '')
             save_job(job)
-            cli(['goto', conversation_url or 'https://chatgpt.com/'])
+            # A cold browser already navigated to the empty ChatGPT composer.
+            # Do not reload it a second time, but never reuse a previous thread.
+            if conversation_url or browser.get('url','').rstrip('/')!='https://chatgpt.com':
+                cli(['goto', conversation_url or 'https://chatgpt.com/'])
             job['operation_stage'] = 'wait_composer'
             save_job(job)
             # A follow-up lands after messages that are already in the thread, so waiting
@@ -602,6 +624,7 @@ function ownedImages() {
  const selector='[data-testid^="conversation-turn-"] img[alt^="Generated image"], [data-testid^="conversation-turn-"] img[alt^="生成的图片"]';
  for(const node of document.querySelectorAll(selector)) {
    if(!(user.compareDocumentPosition(node)&Node.DOCUMENT_POSITION_FOLLOWING))continue;
+   if(node.closest('[data-message-author-role="user"]')||node.closest('[data-testid^="conversation-turn-"]')===user.closest('[data-testid^="conversation-turn-"]'))continue;
    const source=node.currentSrc||node.src;
    if(!source)continue;
    const url=new URL(source,location.href);
@@ -642,7 +665,8 @@ POLL_JS = r'''async page => {
    const lastTurn=turns.at(-1);
    const turnComplete=!!lastTurn&&!!lastTurn.querySelector('[data-testid="copy-turn-action-button"]')
      &&!!lastUser&&!!(lastUser.compareDocumentPosition(lastTurn)&Node.DOCUMENT_POSITION_FOLLOWING);
-   return {url:location.href,stop:!!document.querySelector('[data-testid="stop-button"]'),
+   const stopButton=document.querySelector('[data-testid="stop-button"]');
+   return {url:location.href,stop:!!stopButton&&!!stopButton.getClientRects().length&&getComputedStyle(stopButton).visibility!=='hidden',
      turn_complete:turnComplete,
      images:assets.filter(a=>a.ready).map(({node,...a})=>a),
      pending_images:assets.filter(a=>!a.ready).length,
@@ -651,6 +675,53 @@ POLL_JS = r'''async page => {
 }'''.replace('__DOM__',DOM_IMAGES_JS)
 
 DOWNLOAD_JS = r'''async page => {
+ // Fetch only the exact authenticated ORIGINAL asset already owned by this turn.
+ // No screenshot, canvas conversion, resize parameter, thumbnail or base64.
+ try {
+   const key=__KEY__;
+   const source=await page.evaluate(key=>{
+     __DOM__
+     const asset=ownedImages().find(a=>a.key===key);
+     if(!asset||!asset.ready)throw Error('original_not_ready');
+     const u=new URL(asset.node.currentSrc||asset.node.src,location.href);
+     if(u.origin!=='https://chatgpt.com'||u.pathname!=='/backend-api/estuary/content'||u.searchParams.get('p')!=='fs'||!/^file[_-]/.test(u.searchParams.get('id')||''))throw Error('unsupported_original_source');
+     const allowed=new Set(['id','ts','p','cid','sig','v']);
+     for(const k of u.searchParams.keys())if(!allowed.has(k))throw Error('unverified_asset_variant');
+     return u.href;
+   },key);
+   // Read the browser's authenticated response unchanged. Forward its binary
+   // body locally through Playwright, avoiding Chrome's unstable save dialog.
+   if(__TRANSFER__) {
+     const waiting=page.waitForResponse(r=>r.url()===source&&r.request().method()==='GET',{timeout:20000});
+     const [response]=await Promise.all([waiting,page.evaluate(url=>fetch(url,{credentials:'same-origin',signal:AbortSignal.timeout(20000)}).then(r=>r.arrayBuffer()).then(()=>true),source)]);
+     const type=response.headers()['content-type']||'';
+     if(!response.ok()||!/^image\/(png|jpeg|webp)(?:;|$)/i.test(type))throw Error('original_response_invalid');
+     const bytes=await response.body();
+     if(!bytes.length||bytes.length>50*1024*1024)throw Error('original_size_invalid');
+     const saved=await page.request.post(__TRANSFER__,{data:bytes,headers:{'Content-Type':'application/octet-stream'},timeout:5000});
+     if(!saved.ok())throw Error('local_original_save_failed');
+     return {saved:true,method:'authenticated_original'};
+   }
+   const downloadPromise=page.waitForEvent('download',{timeout:25000});
+   const trigger=page.evaluate(async url=>{
+     const response=await fetch(url,{credentials:'same-origin',signal:AbortSignal.timeout(20000)});
+     if(!response.ok||new URL(response.url).origin!=='https://chatgpt.com'||new URL(response.url).pathname!=='/backend-api/estuary/content')throw Error('original_fetch_failed');
+     const blob=await response.blob();
+     if(!/^image\/(png|jpeg|webp)/i.test(blob.type)||!blob.size||blob.size>50*1024*1024)throw Error('original_type_or_size');
+     const href=URL.createObjectURL(blob),a=document.createElement('a');a.href=href;a.download='chatgpt-original';document.body.append(a);a.click();a.remove();
+     setTimeout(()=>URL.revokeObjectURL(href),60000);
+     return blob.size;
+   },source);
+   const [download]=await Promise.all([downloadPromise,trigger]);
+   if(await download.failure())throw Error('original_download_failed');
+   await download.saveAs(__TARGET__);
+   return {saved:true,method:'authenticated_original'};
+ } catch(error) {
+   // Unrecognized source layouts keep the original UI download as a fallback.
+ }
+ // Close a newer full-screen viewer as well as the older image editor.
+ const closeView=page.getByRole('button',{name:/^Close fullscreen view$|^关闭全屏视图$/});
+ if(await closeView.isVisible().catch(()=>false))await closeView.click({timeout:3000});
  const dialog=page.getByRole('dialog').filter({has:page.getByRole('button',{name:/^Save$|^保存$/})});
  if(await dialog.count()) {
    await dialog.getByRole('button',{name:/^Close$|^Close fullscreen view$|^关闭$|^关闭全屏视图$/}).click({timeout:10000});
@@ -720,6 +791,38 @@ def verify_outputs(job):
             raise ImageError('output_changed','A downloaded output is missing or changed; it will not be overwritten.')
 
 
+@contextlib.contextmanager
+def original_receiver(target):
+    """One bounded binary transfer on loopback; never expose cookies or image JSON."""
+    token=uuid.uuid4().hex+uuid.uuid4().hex
+    received=False
+    class Receiver(http.server.BaseHTTPRequestHandler):
+        def log_message(self,*args):pass
+        def do_POST(self):
+            nonlocal received
+            self.connection.settimeout(5)
+            if self.path!='/'+token or self.headers.get('Origin'):
+                self.send_error(403);return
+            if received:
+                self.send_error(409);return
+            try:size=int(self.headers.get('Content-Length','0'))
+            except ValueError:size=0
+            if not 0<size<=50*1024*1024:
+                self.send_error(413);return
+            raw=self.rfile.read(size)
+            if len(raw)!=size:
+                self.send_error(400);return
+            target.write_bytes(raw)
+            received=True
+            self.send_response(200);self.end_headers();self.wfile.write(b'ok')
+    server=http.server.HTTPServer(('127.0.0.1',0),Receiver)
+    thread=threading.Thread(target=lambda:server.serve_forever(poll_interval=.05),daemon=True)
+    thread.start()
+    try:yield 'http://127.0.0.1:'+str(server.server_port)+'/'+token
+    finally:
+        server.shutdown();server.server_close();thread.join(timeout=6)
+
+
 def download_asset(job, asset):
     source_id=hashlib.sha256(asset['key'].encode('utf-8')).hexdigest()
     if any(f.get('source_id')==source_id for f in job['files']):
@@ -742,8 +845,14 @@ def download_asset(job, asset):
             if stem.with_suffix(extension).exists():
                 raise ImageError('output_exists','Refusing to overwrite an existing image.')
         temporary=stem.with_suffix('.download')
-        run_js(DOWNLOAD_JS.replace('__KEY__',json.dumps(asset['key'])).replace('__TARGET__',json.dumps(str(temporary))),timeout=55)
+        started=time.perf_counter()
+        with original_receiver(temporary) as endpoint:
+            method=run_js(DOWNLOAD_JS.replace('__KEY__',json.dumps(asset['key'])).replace('__TARGET__',json.dumps(str(temporary))).replace('__TRANSFER__',json.dumps(endpoint)),timeout=55)
+        job.setdefault('timings',{})['download_seconds']=round(job.get('timings',{}).get('download_seconds',0)+time.perf_counter()-started,3)
+        if isinstance(method,dict):job['timings']['download_method']=method.get('method','ui_original')
         extension,meta=image_info(temporary)
+        if isinstance(method,dict) and method.get('method')=='authenticated_original' and (meta['width']<asset.get('width',0) or meta['height']<asset.get('height',0)):
+            raise ImageError('original_resolution_mismatch','Downloaded image is smaller than the observed asset; it is not accepted as an original.')
         target=stem.with_suffix(extension)
         record={'path':str(target.resolve()),**meta,'source_id':source_id,'index':plan['index']}
         plan['verified']=record
@@ -810,8 +919,11 @@ def poll(job_id):
             if time.time()-job.get('wait_started_at',job['created_at'])>900:
                 job['status']='needs_attention'
                 job['error']={'code':'generation_wait_exceeded','message':'Generation has not settled after 15 minutes. Inspect the existing conversation; the prompt has not been resent.'}
+            # ChatGPT briefly renders an action footer before the generated image
+            # mounts. "Worked for ... / Edit" is UI chrome, never a text refusal.
+            reply=re.sub(r'(?im)^\s*(?:Worked for .*|Thought for .*|Edit|Preview|Copy|Share|已思考.*|编辑|预览)\s*$','',result.get('text','')).strip()
             if (not result['stop'] and result['user_count'] and not assets and not pending
-                    and result.get('turn_complete')):
+                    and result.get('turn_complete') and reply):
                 # ChatGPT finished answering and produced no image. Waiting the full
                 # observation budget here taught the caller nothing; its own words are
                 # the useful reply, so hand them over and let the caller adjust.
@@ -838,9 +950,9 @@ def poll(job_id):
         save_job(job)
         # Bound each poll; subsequent polls resume from the per-file checkpoint.
         deadline=time.monotonic()+35
-        for asset in assets:
+        for index,asset in enumerate(assets):
             download_asset(job,asset)
-            if time.monotonic()>deadline:
+            if time.monotonic()>deadline and index<len(assets)-1:
                 return public_job(job)
         downloaded=len(job['files'])
         job['count_match']=downloaded==requested
