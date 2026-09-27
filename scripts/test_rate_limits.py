@@ -45,13 +45,75 @@ class RateLimits(unittest.TestCase):
         result=self.pool.status()['accounts'][0]['last_control']['result']
         self.assertEqual(result['auth_state'],'rate_limited');self.assertGreater(result['retry_at'],time.time())
 
-    def test_only_one_lane_probes_after_wait_and_success_does_not_forge_other_login_state(self):
+    def test_only_real_job_can_prove_recovery_and_other_login_state_is_not_forged(self):
         self.share_login();self.pool.defer_rate_limit('primary')
         with self.pool.connect() as db:db.execute('UPDATE login_cooldowns SET retry_after=0')
         self.assertTrue(self.pool.acquire_rate_probe('primary'));self.assertFalse(self.pool.acquire_rate_probe('secondary'))
         self.pool.control('primary','check');self.worker('primary').tick()
+        self.assertIsNotNone(self.pool.cooldown('primary'))
+        self.submit('real-recovery','primary');worker=self.worker('primary');worker.tick()
+        self.assertIsNotNone(self.pool.cooldown('primary'))
+        worker.tick()
         self.assertIsNone(self.pool.cooldown('primary'));self.assertTrue(self.pool.account('primary')['ready'])
         self.assertFalse(self.pool.account('secondary')['ready'])
+
+    def test_rejected_real_probe_preserves_request_and_increases_backoff(self):
+        job=self.submit('real-429','primary');worker=self.worker('primary');worker.tick()
+        self.pool.defer_rate_limit('primary')
+        with self.pool.connect() as db:db.execute('UPDATE login_cooldowns SET retry_after=0')
+        worker.recoveries=99  # provider backoff is independent of browser-repair attempts
+        with patch.object(self.runtimes['primary'],'poll',side_effect=w.ImageError('rate_limited','real task fixture')),patch.object(self.runtimes['primary'],'status') as status:
+            worker.tick();status.assert_not_called()
+        cooldown=self.pool.cooldown('primary')
+        self.assertEqual(cooldown['strikes'],2);self.assertGreater(cooldown['retry_after']-time.time(),850)
+        self.assertEqual(self.pool.row(job['job_id'])['failures'],0)
+        self.assertEqual(self.runtimes['primary'].starts,1)
+
+    def test_queue_claim_cannot_bypass_the_half_open_lease(self):
+        self.share_login();self.submit('leased-recovery','primary');self.pool.defer_rate_limit('primary')
+        with self.pool.connect() as db:db.execute('UPDATE login_cooldowns SET retry_after=0')
+        self.pool.acquire_rate_probe('secondary')
+        self.assertIsNone(self.pool.claim('primary',rate_probe=True))
+
+    def test_adopting_a_parked_job_waits_for_actual_poll_before_clearing(self):
+        job=self.submit('parked-proof','primary');worker=self.worker('primary');worker.tick();worker.park(self.pool.row(job['job_id']))
+        self.pool.defer_rate_limit('primary')
+        with self.pool.connect() as db:
+            db.execute('UPDATE login_cooldowns SET retry_after=0')
+            db.execute('UPDATE jobs SET retry_after=0')
+        worker.tick();self.assertIsNotNone(self.pool.cooldown('primary'))
+        worker.tick();self.assertIsNone(self.pool.cooldown('primary'))
+        self.assertEqual(self.pool.get(job['job_id'])['status'],'complete')
+
+    def test_unreadable_conversation_does_not_prove_recovery(self):
+        job=self.submit('unreadable-proof','primary');worker=self.worker('primary');worker.tick();self.pool.defer_rate_limit('primary')
+        with self.pool.connect() as db:db.execute('UPDATE login_cooldowns SET retry_after=0')
+        with patch.object(self.runtimes['primary'],'poll',return_value={'status':'generating','operation_stage':'read_conversation','files':[]}):worker.tick()
+        self.assertIsNotNone(self.pool.cooldown('primary'))
+
+    def test_provider_limit_does_not_consume_parked_job_recovery_budget(self):
+        job=self.submit('park-budget','primary');worker=self.worker('primary');worker.tick();worker.park(self.pool.row(job['job_id']))
+        count=self.pool.row(job['job_id'])['park_count'];self.pool.defer_rate_limit('primary')
+        with self.pool.connect() as db:
+            db.execute('UPDATE login_cooldowns SET retry_after=0');db.execute('UPDATE jobs SET retry_after=0')
+        with patch.object(self.runtimes['primary'],'adopt',side_effect=w.ImageError('rate_limited','still cooling')):worker.tick()
+        self.assertEqual(self.pool.row(job['job_id'])['park_count'],count)
+        self.assertEqual(self.pool.cooldown('primary')['strikes'],2)
+
+    def test_live_foreground_job_takes_priority_over_background_recovery(self):
+        self.share_login();self.submit('foreground-probe','secondary');self.pool.claim('secondary')
+        self.pool.heartbeat('primary');self.pool.heartbeat('secondary');self.pool.defer_rate_limit('primary')
+        with self.pool.connect() as db:db.execute('UPDATE login_cooldowns SET retry_after=0')
+        self.assertFalse(self.pool.acquire_rate_probe('primary'))
+        self.assertTrue(self.pool.acquire_rate_probe('secondary'))
+
+    def test_accepted_prompt_keeps_its_probe_exclusive_until_an_original_is_saved(self):
+        self.share_login();self.submit('complete-probe','primary');self.pool.defer_rate_limit('primary')
+        with self.pool.connect() as db:db.execute('UPDATE login_cooldowns SET retry_after=0')
+        worker=self.worker('primary');worker.tick()
+        self.assertIsNotNone(self.pool.cooldown('primary'))
+        self.assertFalse(self.pool.acquire_rate_probe('secondary'))
+        worker.tick();self.assertIsNone(self.pool.cooldown('primary'))
 
     def test_second_rate_limit_after_cooldown_uses_longer_wait(self):
         first=self.pool.defer_rate_limit('primary')

@@ -55,7 +55,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.8'
+VERSION = '0.7.9'
 
 
 @contextlib.contextmanager
@@ -610,13 +610,18 @@ class Pool:
                              (account_id, PARKED, len(ADOPT_BACKOFF), time.time())).fetchone()
         return dict(row) if row else None
 
-    def claim(self, account_id):
+    def claim(self, account_id, *, rate_probe=False):
         with self.transaction() as db:
+            account = db.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
+            if not account:return None
+            cooldown = db.execute('SELECT * FROM login_cooldowns WHERE login_group=?', (login_group(account),)).fetchone()
+            allowed_probe = bool(rate_probe and cooldown and cooldown['retry_after']<=time.time()
+                                 and cooldown['probe_owner']==account_id and cooldown['probe_until']>time.time())
+            if cooldown and not allowed_probe:return None
             active = db.execute("SELECT * FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')", (account_id,)).fetchone()
             if active:
                 return dict(active)
-            account = db.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
-            if not account or not account['enabled'] or not account['ready']:
+            if not account['enabled'] or (not account['ready'] and not allowed_probe):
                 return None
             group = login_group(account)
             # Two follow-ups typing into one conversation would interleave, so a thread

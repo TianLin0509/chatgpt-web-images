@@ -56,6 +56,7 @@ class Worker:
         self.delay = IDLE_TICK
         self.idle_since = time.monotonic()
         self.browser_released = False
+        self.rate_probe = False
 
     def log(self, event, **fields):
         print(json.dumps({'event': event, 'at':time.time(), 'account_id': self.account_id, **fields}), flush=True)
@@ -85,10 +86,16 @@ class Worker:
             return bool(db.execute("SELECT 1 FROM jobs WHERE (account_id=? AND (status IN ('dispatching','running','needs_attention') OR (status='parked' AND park_count<=? AND retry_after<=?))) OR (status='queued' AND preferred IN ('auto',?,?)) LIMIT 1",
                                    (self.account_id,len(ADOPT_BACKOFF),time.time(),self.account_id,group)).fetchone())
 
-    def record_result(self, job_id, result, runtime_id=None):
+    def record_result(self, job_id, result, runtime_id=None, *, confirm_recovery=True):
         previous = self.pool.row(job_id)
         self.pool.save_result(job_id, result, runtime_id)
         phase = result.get('status')
+        if (self.rate_probe and confirm_recovery and not result.get('error') and result.get('files')
+                and phase in {'downloading','complete','partial','count_mismatch'}):
+            # Keep the exclusive probe through generation until a verified original
+            # is saved. A healthy homepage or accepted prompt is insufficient.
+            self.pool.clear_rate_limit(self.account_id)
+            self.pool.account_state(self.account_id, 'authenticated', True)
         if phase in {'preparation_failed', 'failed'}:
             self.pool.account_state(self.account_id, 'browser_unhealthy', False, result.get('error'))
         elif phase in {'complete', 'partial', 'count_mismatch', 'cancelled'}:
@@ -112,11 +119,9 @@ class Worker:
                         raise w.ImageError('account_busy', 'An existing job owns this account; login identity cannot be switched.')
             fn = {'open': self.runtime.open_browser, 'check': self.runtime.status, 'select': self.runtime.select_account}[row['action']]
             cooldown=self.pool.cooldown(self.account_id)
-            if row['action']=='check' and cooldown and (cooldown['retry_after']>time.time() or not self.pool.acquire_rate_probe(self.account_id)):
+            if row['action']=='check' and cooldown:
                 result={'auth_state':'rate_limited','cooldown_cached':True}
             else:
-                if row['action']=='check' and cooldown:
-                    fn=getattr(self.runtime,'probe_rate_limit',fn)
                 result = fn(**args)
             # Browser URLs and title are unnecessary in the shared status surface.
             safe = {k: result[k] for k in ('logged_in','auth_state','visible','remembered','background_rate_limited') if k in result}
@@ -184,15 +189,16 @@ class Worker:
         except Exception as exc:
             error = error_value(exc)
             if error['code']=='rate_limited':self.pool.defer_rate_limit(self.account_id)
-            self.pool.park(job['id'], error)
+            else:self.pool.park(job['id'], error)
             self.log('adopt_failed', job_id=job['id'], error_code=error['code'])
             return True
-        self.record_result(job['id'], result)
+        self.record_result(job['id'], result, confirm_recovery=False)
         self.log('job_adopted', job_id=job['id'])
         return True
 
     def tick(self):
         self.delay = IDLE_TICK
+        self.rate_probe = False
         if self.control_turn and self.controls():
             self.control_turn = False
             return
@@ -201,13 +207,14 @@ class Worker:
         cooldown=self.pool.cooldown(self.account_id)
         if cooldown:
             self.delay=5
-            if cooldown['retry_after']<=time.time() and self.has_waiting_work() and self.recheck_due(account) and self.pool.acquire_rate_probe(self.account_id):
-                self.recoveries+=1
-                self.pool.control(self.account_id,'check')
-                self.last_check=time.monotonic()
-            return
+            if (not account['enabled'] or cooldown['retry_after']>time.time()
+                    or not self.has_waiting_work() or not self.pool.acquire_rate_probe(self.account_id)):
+                return
+            # Half-open: one lane continues one real job. Other lanes stay quiet
+            # until that job is readable/accepted or the provider rejects it again.
+            self.rate_probe = True
         # Disabled accounts are touched only when the user asks to open/check them.
-        if not account['ready'] and self.has_waiting_work() and self.recheck_due(account):
+        if not self.rate_probe and not account['ready'] and self.has_waiting_work() and self.recheck_due(account):
             self.recoveries += 1
             self.log('account_recovery', state=account['state'], attempt=self.recoveries)
             self.pool.control(self.account_id, 'check')
@@ -217,7 +224,7 @@ class Worker:
             self.recoveries = 0
         with self.pool.connect() as db:
             active = db.execute("SELECT id FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')", (self.account_id,)).fetchone()
-        if not active and account['ready'] and account['enabled']:
+        if not active and (account['ready'] or self.rate_probe) and account['enabled']:
             # Legacy jobs keep their browser ownership. Observe them, never cancel or adopt implicitly.
             legacy = self.runtime.active_job()
             if legacy:
@@ -226,7 +233,7 @@ class Worker:
                 return
             if self.adopt_parked():
                 return
-        job = self.pool.claim(self.account_id)
+        job = self.pool.claim(self.account_id, rate_probe=True) if self.rate_probe else self.pool.claim(self.account_id)
         if not job:
             self.release_idle_browser()
             return
@@ -281,7 +288,7 @@ class Worker:
         except Exception as exc:
             error = error_value(exc)
             if error['code']=='rate_limited':error=self.pool.defer_rate_limit(self.account_id)
-            self.pool.failure(job['id'], error)
+            else:self.pool.failure(job['id'], error)
             print(json.dumps({'event': 'job_error', 'job_id': job['id'], 'account_id': self.account_id,
                               'error_code': error['code']}), flush=True)
             if error['code'] in {'login_required','browser_challenge','account_selection_required','credential_required'}:

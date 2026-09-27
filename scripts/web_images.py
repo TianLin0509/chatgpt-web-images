@@ -21,7 +21,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.8'
+VERSION = '0.7.9'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -257,7 +257,7 @@ def set_visible(visible):
     return bool(user32.IsWindowVisible(found[0])) == visible
 
 
-def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True, force_refresh=False):
+def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True, force_refresh=False, new_conversation=False):
     try:
         state = run_js(STATUS_JS)
     except ImageError as exc:
@@ -298,6 +298,13 @@ def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True, 
                 state['window_hidden'] = set_visible(False)
             except Exception:
                 state['window_hidden'] = False
+    # A new task owns a fresh composer. A throttled/read-failed old conversation
+    # in this released lane is not the page whose usability it needs to prove.
+    # Human authentication gates retain priority; no prompt is sent here.
+    if (new_conversation and re.fullmatch(CONVERSATION_URL, state.get('url',''))
+            and not any(state.get(k) for k in ('challenge','credential_required','account_chooser'))):
+        cli(['goto', 'https://chatgpt.com/'])
+        state = run_js(SETTLE_JS)
     # An interrupted cold open can leave the owned tab at about:blank. It will
     # never become a ChatGPT page by waiting or refreshing; finish navigation in
     # that same tab. Existing conversations and unrelated pages stay untouched.
@@ -535,7 +542,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
         if active:
             raise ImageError('job_active', f"Job {active['job_id']} is active; poll it before starting another.")
         bootstrap_started=time.perf_counter()
-        browser=ensure_browser()
+        browser=ensure_browser(new_conversation=not bool(conversation_url))
         bootstrap_seconds=time.perf_counter()-bootstrap_started
         out.mkdir(parents=True, exist_ok=True)
         job_id = time.strftime('%Y%m%d') + '-' + uuid.uuid4().hex[:12]

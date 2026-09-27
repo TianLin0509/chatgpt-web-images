@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.9
+
+- After provider cooling, allow one lane to continue a real task under a durable exclusive lease, prioritizing live foreground jobs over parked retries. Keep the probe exclusive until a verified original is saved. A healthy homepage or accepted prompt no longer clears a blocked conversation. Rejected task probes retain 5/15/30-minute escalation instead of repeatedly resetting to five minutes.
+- Keep request identity, job failure count and parked recovery budget unchanged for HTTP 429. Explicit account checks report the shared wait without generating another provider request, including after its nominal deadline.
+- A new task verifies its own fresh composer, not a failed conversation left in the released lane. Authentication challenges retain priority and no prompt is resent by this preparation step.
+
 ## 0.7.8
 
 - Load pending generated gallery assets eagerly in hidden/offscreen Chrome. This avoids waiting forever for lazy thumbnails while retaining hidden windows and checking exact prompt identity before downloading. User uploads and earlier turns are excluded; no window focus changes or prompt resubmission.

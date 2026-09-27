@@ -26,4 +26,16 @@ class BlankOwnedPage(unittest.TestCase):
             self.assertTrue(w.ensure_browser()['logged_in'])
         cli.assert_not_called()
 
+    def test_new_task_checks_its_fresh_composer_instead_of_a_failed_old_thread(self):
+        old={'url':'https://chatgpt.com/c/fixture-old','logged_in':False,'auth_state':'rate_limited','rate_limited':True}
+        with patch.object(w,'run_js',side_effect=[old,dict(SIGNED)]),patch.object(w,'cli') as cli:
+            result=w.ensure_browser(new_conversation=True)
+        self.assertTrue(result['logged_in']);cli.assert_called_once_with(['goto','https://chatgpt.com/'])
+
+    def test_new_task_does_not_navigate_away_from_a_human_authentication_gate(self):
+        old={'url':'https://chatgpt.com/c/fixture-old','logged_in':False,'auth_state':'browser_challenge','challenge':True}
+        with patch.object(w,'run_js',return_value=old),patch.object(w,'cli') as cli:
+            with self.assertRaises(w.ImageError) as error:w.ensure_browser(new_conversation=True)
+        self.assertEqual(error.exception.code,'browser_challenge');cli.assert_not_called()
+
 if __name__=='__main__':unittest.main()

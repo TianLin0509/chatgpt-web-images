@@ -40,6 +40,11 @@ def acquire_probe(pool,account_id):
         if not row:return True
         if row['retry_after']>now:return False
         if row['probe_until']>now and row['probe_owner']!=account_id:return False
+        if row['probe_until']<=now:
+            # Resume foreground work before another lane's background parked-job
+            # retry. A stalled/dead worker cannot reserve this priority forever.
+            foreground=db.execute("SELECT j.account_id FROM jobs j JOIN accounts a ON a.id=j.account_id WHERE COALESCE(NULLIF(a.login_group,''),a.id)=? AND a.enabled=1 AND a.heartbeat>? AND j.status IN ('running','dispatching') ORDER BY CASE j.status WHEN 'running' THEN 0 ELSE 1 END,j.created,j.id LIMIT 1",(group,now-20)).fetchone()
+            if foreground and foreground['account_id']!=account_id:return False
         db.execute('UPDATE login_cooldowns SET probe_owner=?,probe_until=? WHERE login_group=?',(account_id,now+180,group))
         return True
 
