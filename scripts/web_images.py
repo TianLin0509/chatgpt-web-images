@@ -298,6 +298,12 @@ def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True, 
                 state['window_hidden'] = set_visible(False)
             except Exception:
                 state['window_hidden'] = False
+    # An interrupted cold open can leave the owned tab at about:blank. It will
+    # never become a ChatGPT page by waiting or refreshing; finish navigation in
+    # that same tab. Existing conversations and unrelated pages stay untouched.
+    if state.get('url') == 'about:blank':
+        cli(['goto', 'https://chatgpt.com/'])
+        state = run_js(SETTLE_JS)
     if not any(state.get(key) for key in ('logged_in','account_chooser','challenge','credential_required','rate_limited')):
         state = run_js(SETTLE_JS)
     if state.get('auth_state')=='page_not_ready' or (force_refresh and state.get('logged_in') and not state.get('rate_limited')):

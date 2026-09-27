@@ -3,6 +3,7 @@
 ## 0.7.8
 
 - Load pending generated gallery assets eagerly in hidden/offscreen Chrome. This avoids waiting forever for lazy thumbnails while retaining hidden windows and checking exact prompt identity before downloading. User uploads and earlier turns are excluded; no window focus changes or prompt resubmission.
+- Finish an interrupted cold navigation when the already-owned tab is still `about:blank`, instead of waiting forever or creating another tab. Normal conversations and human authentication gates keep their existing behavior.
 
 ## 0.7.7
 
