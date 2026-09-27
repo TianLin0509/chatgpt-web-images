@@ -1,6 +1,6 @@
-# ChatGPT Web Images 0.7.9
+# ChatGPT Web Images 0.7.10
 
-Version 0.7.9 uses one real task as the exclusive recovery probe after cooling. A healthy homepage does not prove that conversation reads recovered. Rejected probes preserve escalating backoff, durable request identity and parked retry budget; a new task verifies its own composer rather than a failed old thread.
+Version 0.7.10 uses one real task as the exclusive recovery probe after cooling. A healthy homepage does not prove that conversation reads recovered. Rejected probes preserve escalating backoff, durable request identity and parked retry budget; a new task verifies its own composer rather than a failed old thread.
 
 Version 0.7.8 loads pending generated gallery assets in hidden/offscreen Chrome without changing window focus. Only the current turn's generated assets are touched; earlier turns and user uploads are excluded.
 

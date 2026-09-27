@@ -21,7 +21,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.9'
+VERSION = '0.7.10'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -577,10 +577,10 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
             before = before if type(before) is int else 0
             job['operation_stage'] = 'fill_prompt'
             save_job(job)
-            run_js(FILL_PROMPT_JS.replace('__PROMPT__',json.dumps(prompt)))
+            run_js(interactive(FILL_PROMPT_JS.replace('__PROMPT__',json.dumps(prompt))))
             job['operation_stage'] = 'select_image_tool'
             save_job(job)
-            run_js(r'''async page => {
+            run_js(interactive(r'''async page => {
               await page.getByTestId('composer-plus-btn').press('Enter',{timeout:10000});
               // The sidebar can contain a chat also titled 'Create image'.
               // Only the open composer action group/menu is a valid tool entry.
@@ -590,7 +590,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
               catch(e) { throw new Error('IMAGE_TOOL_UNAVAILABLE: '+e.name); }
               await page.locator('#prompt-textarea [data-inline-selection-pill][data-system-hint-type="picture_v2"]').waitFor({state:'attached',timeout:10000});
               return true;
-            }''')
+            }'''))
             if refs:
                 job['operation_stage'] = 'upload_references'
                 save_job(job)
@@ -602,7 +602,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
             job['status']='submitting'
             job['operation_stage']='submit_prompt'
             save_job(job)
-            result=run_js(r'''async page => {
+            result=run_js(interactive(r'''async page => {
               const composer=page.locator('#prompt-textarea');
               // Filling here would erase ChatGPT's inline image-tool selection.
               if(!await composer.locator('[data-inline-selection-pill][data-system-hint-type="picture_v2"]').count())
@@ -614,7 +614,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
                                          __BEFORE__, {timeout:20000});
               await page.waitForURL(/^https:\/\/chatgpt\.com\/c\/[a-zA-Z0-9-]+$/, {timeout:20000});
               return {url:page.url()};
-            }'''.replace('__BEFORE__', str(int(before))))
+            }'''.replace('__BEFORE__', str(int(before)))))
             job['status']='generating'
             job['operation_stage']='observe_images'
             job['conversation_url']=result['url']
@@ -638,6 +638,7 @@ FILL_PROMPT_JS = r'''async page => {
 }'''
 
 from chatgpt_dom import DOM_IMAGES_JS, POLL_JS, MODERN_DOWNLOAD_JS
+from chatgpt_interaction import interactive
 
 
 DOWNLOAD_JS = (r'''async page => {

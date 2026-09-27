@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.10
+
+- Temporarily emulate focus only in the owned page during prompt input, image-tool selection and submission. Background polls stay passive; hidden composer menus work without waking other tabs.
+- Restore focus emulation and detach the scoped CDP session on success and error.
+
+
 ## 0.7.9
 
 - After provider cooling, allow one lane to continue a real task under a durable exclusive lease, prioritizing live foreground jobs over parked retries. Keep the probe exclusive until a verified original is saved. A healthy homepage or accepted prompt no longer clears a blocked conversation. Rejected task probes retain 5/15/30-minute escalation instead of repeatedly resetting to five minutes.
