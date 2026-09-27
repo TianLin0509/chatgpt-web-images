@@ -111,15 +111,30 @@ class Worker:
                     if db.execute("SELECT 1 FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')", (self.account_id,)).fetchone():
                         raise w.ImageError('account_busy', 'An existing job owns this account; login identity cannot be switched.')
             fn = {'open': self.runtime.open_browser, 'check': self.runtime.status, 'select': self.runtime.select_account}[row['action']]
-            result = fn(**args)
+            cooldown=self.pool.cooldown(self.account_id)
+            if row['action']=='check' and cooldown and (cooldown['retry_after']>time.time() or not self.pool.acquire_rate_probe(self.account_id)):
+                result={'auth_state':'rate_limited','cooldown_cached':True}
+            else:
+                if row['action']=='check' and cooldown:
+                    fn=getattr(self.runtime,'probe_rate_limit',fn)
+                result = fn(**args)
             # Browser URLs and title are unnecessary in the shared status surface.
             safe = {k: result[k] for k in ('logged_in','auth_state','visible','remembered') if k in result}
             safe['ok'] = True
-            self.pool.account_state(self.account_id, result.get('auth_state', 'unknown'), result.get('logged_in', False))
+            if result.get('auth_state')=='rate_limited':
+                error=({'code':'rate_limited','retry_at':cooldown['retry_after']} if result.get('cooldown_cached') else self.pool.defer_rate_limit(self.account_id))
+                safe['retry_at']=error['retry_at']
+            elif result.get('logged_in') and cooldown and (cooldown['retry_after']>time.time() or row['action']!='check'):
+                safe['auth_state']='rate_limited';safe['retry_at']=cooldown['retry_after']
+            else:
+                if result.get('logged_in') and cooldown:self.pool.clear_rate_limit(self.account_id)
+                self.pool.account_state(self.account_id, result.get('auth_state', 'unknown'), result.get('logged_in', False))
             state = 'complete'
         except Exception as exc:
             safe = {'ok': False, 'error': error_value(exc)}
-            if safe['error']['code'] != 'account_busy':
+            if safe['error']['code']=='rate_limited':
+                safe['error']=self.pool.defer_rate_limit(self.account_id)
+            elif safe['error']['code'] != 'account_busy':
                 self.pool.account_state(self.account_id, 'needs_attention', False, safe['error'])
             state = 'failed'
         with self.pool.connect() as db:
@@ -168,6 +183,7 @@ class Worker:
             result = self.runtime.adopt(job['runtime_id'])
         except Exception as exc:
             error = error_value(exc)
+            if error['code']=='rate_limited':self.pool.defer_rate_limit(self.account_id)
             self.pool.park(job['id'], error)
             self.log('adopt_failed', job_id=job['id'], error_code=error['code'])
             return True
@@ -182,6 +198,14 @@ class Worker:
             return
         self.control_turn = True
         account = self.pool.account(self.account_id)
+        cooldown=self.pool.cooldown(self.account_id)
+        if cooldown:
+            self.delay=5
+            if cooldown['retry_after']<=time.time() and self.has_waiting_work() and self.recheck_due(account) and self.pool.acquire_rate_probe(self.account_id):
+                self.recoveries+=1
+                self.pool.control(self.account_id,'check')
+                self.last_check=time.monotonic()
+            return
         # Disabled accounts are touched only when the user asks to open/check them.
         if not account['ready'] and self.has_waiting_work() and self.recheck_due(account):
             self.recoveries += 1
@@ -256,6 +280,7 @@ class Worker:
                     self.delay = WATCH_TICK
         except Exception as exc:
             error = error_value(exc)
+            if error['code']=='rate_limited':error=self.pool.defer_rate_limit(self.account_id)
             self.pool.failure(job['id'], error)
             print(json.dumps({'event': 'job_error', 'job_id': job['id'], 'account_id': self.account_id,
                               'error_code': error['code']}), flush=True)

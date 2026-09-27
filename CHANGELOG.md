@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.6
+
+- Recognize observed ChatGPT HTTP 429 responses without sending an extra probe. Keep rate limits separate from sign-out and page loading.
+- Persist cooldown per login across workers and clients, with 5/15/30-minute backoff and one recovery probe. Concurrent reports coalesce and do not multiply the cooling period.
+- Retain queued, active and parked request identity during cooling; expose retry times and wait actions. Keep explicit browser opening available and stop batch summaries from calling parked work deliverable.
+
 ## 0.7.5
 
 - Distinguish an authenticated page shell that has not loaded its composer from an explicit sign-in page. Report `page_not_ready` instead of falsely declaring the account logged out.

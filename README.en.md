@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.5
+# ChatGPT Web Images 0.7.6
+
+Version 0.7.6 observes existing HTTP 429 resource timing metadata and shares durable 5/15/30-minute cooling across all lanes of a login. Only one lane probes after a cooldown. Task identity is retained and progress reports the retry time; parked batches never imply that missing images were delivered.
 
 Version 0.7.5 distinguishes a loading shell from an explicit sign-in screen and permits one same-page refresh during a task or explicit account check, without resending the prompt.
 

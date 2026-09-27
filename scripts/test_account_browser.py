@@ -79,6 +79,12 @@ class AccountBrowser(unittest.TestCase):
         self.assertEqual(self.state()['auth_state'],'page_not_ready')
         self.assertFalse(self.state()['logged_in'])
 
+    def test_real_http_429_is_observed_without_an_extra_probe_request(self):
+        self.page.route('**/backend-api/conversations',lambda r:r.fulfill(status=429,body='too many requests'))
+        self.page.evaluate("async()=>await(await fetch('/backend-api/conversations')).text()")
+        self.assertTrue(self.state()['rate_limited'])
+        self.assertEqual(self.state()['auth_state'],'rate_limited')
+
     def test_modern_profile_and_composer_are_authenticated_without_hub_adapter(self):
         self.page.set_content('<button aria-label="Open profile menu">Profile</button><div contenteditable="true" data-composer-markdown></div>')
         self.assertEqual(self.state()['auth_state'],'authenticated')

@@ -21,7 +21,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.5'
+VERSION = '0.7.6'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -257,7 +257,7 @@ def set_visible(visible):
     return bool(user32.IsWindowVisible(found[0])) == visible
 
 
-def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True):
+def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True, force_refresh=False):
     try:
         state = run_js(STATUS_JS)
     except ImageError as exc:
@@ -298,13 +298,13 @@ def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True):
                 state['window_hidden'] = set_visible(False)
             except Exception:
                 state['window_hidden'] = False
-    if not any(state.get(key) for key in ('logged_in','account_chooser','challenge','credential_required')):
+    if not any(state.get(key) for key in ('logged_in','account_chooser','challenge','credential_required','rate_limited')):
         state = run_js(SETTLE_JS)
-    if state.get('auth_state')=='page_not_ready':
+    if state.get('auth_state')=='page_not_ready' or (force_refresh and state.get('logged_in') and not state.get('rate_limited')):
         from chatgpt_account import RECOVER_LOADING_JS
         state = run_js(RECOVER_LOADING_JS)
     authorized = SETTINGS.get('account_name', '') if account_name is None else account_name
-    if state.get('account_chooser') and authorized and not state.get('challenge'):
+    if state.get('account_chooser') and authorized and not state.get('challenge') and not state.get('rate_limited'):
         state = run_js(selection_code(authorized))
         if state.get('error_code') and require_login:
             code = state['error_code']
@@ -312,6 +312,8 @@ def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True):
     state.update(browser_session=SESSION, provider='chatgpt-web', image_model_verified=False)
     if not require_login:
         return state
+    if state.get('rate_limited'):
+        raise ImageError('rate_limited','ChatGPT returned HTTP 429. Wait for the shared account cooldown; keep the same job and request identity.')
     if state.get('challenge'):
         raise ImageError('browser_challenge', 'Complete the verification in the dedicated browser using open.')
     if state.get('account_chooser') or state.get('credential_required'):
@@ -967,14 +969,18 @@ def compact_result(result,detail=False):
     return slim
 
 
-def status():
+def status(*, force_refresh=False):
     with locked():
-        result=ensure_browser(require_login=False)
+        result=ensure_browser(require_login=False,force_refresh=force_refresh)
         if result.get('logged_in'):
             cli(['state-save',str(DATA/'auth-state.json')])
         result['active_job']=active_job()
         result['window_hidden']=set_visible(False) if result.get('logged_in') else False
         return result
+
+
+def probe_rate_limit():
+    return status(force_refresh=True)
 
 
 def open_browser():
