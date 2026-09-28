@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.13
+
+- Add a long-lived tab daemon per Hub identity (`tab_daemon.cjs`) and a drop-in lane entry (`tab_client.cjs`). Every lane still owns its own tab, so an identity keeps generating in parallel like a person with several ChatGPT tabs; only the browser connection is shared. The per-step transport attached Playwright to the whole Hub Chrome for every queue poll (measured 9-19 s per attach), which caused step timeouts and browser-wide refetch bursts that ended in HTTP 429. Steps now take about 0.2 s after one attach.
+- `use_tab_daemon.py --pool <pool>` switches Hub-bound lanes to the daemon and records the previous entry; `--revert` restores it. If the daemon is unreachable a step falls back to the Hub's own transport.
+
 ## 0.7.12
 
 - Launch lane browsers with Chrome's background-safe switches (no timer throttling, no occluded-window backgrounding, no renderer backgrounding, Windows occlusion tracking off), so an off-screen lane runs at foreground speed instead of relying on per-step focus emulation.
