@@ -33,6 +33,7 @@ SCRIPT = textwrap.dedent('''
   const sleep = file('sleep.js', 'async page => { await new Promise(r => setTimeout(r, 400)); return Date.now(); }');
   const hang = file('hang.js', 'async page => new Promise(() => {})');
   const quick = file('quick.js', 'async page => page.lane');
+  const boom = file('boom.js', 'async page => { throw new Error("boom"); }');
   (async () => {
     const out = {};
     let t = Date.now();
@@ -46,6 +47,12 @@ SCRIPT = textwrap.dedent('''
     try { await d.handle({ lane: 'c', argv: ['run-code', '--filename', hang], timeoutMs: 300 }); out.hang = 'returned'; }
     catch (e) { out.hang = String(e.message).slice(0, 40); }
     out.after_hang = await d.handle({ lane: 'c', argv: ['run-code', '--filename', quick], timeoutMs: 1000 });
+    // A failing step must reach its caller without terminating the process (unobserved
+    // rejections are fatal in Node); the lane keeps working afterwards.
+    try { await d.handle({ lane: 'e', argv: ['run-code', '--filename', boom], timeoutMs: 1000 }); out.boom = 'returned'; }
+    catch (e) { out.boom = e.message; }
+    await new Promise(r => setTimeout(r, 50));
+    out.after_boom = await d.handle({ lane: 'e', argv: ['run-code', '--filename', quick], timeoutMs: 1000 });
     out.delegated = await d.handle({ lane: 'a', argv: ['open', 'about:blank'], timeoutMs: 1000 });
     try { await d.handle({ lane: 'Bad Lane', argv: [], timeoutMs: 1000 }); } catch (e) { out.invalid = e.message; }
     console.log(JSON.stringify(out));
@@ -79,6 +86,8 @@ class TabDaemonTest(unittest.TestCase):
         self.assertGreaterEqual(out['same_lane_ms'], 780, 'steps of one lane must run one at a time')
         self.assertIn('Timeout', out['hang'])
         self.assertEqual(out['after_hang'], 'c', 'a stuck step must not block the next step of its lane')
+        self.assertEqual(out['boom'], 'boom')
+        self.assertEqual(out['after_boom'], 'e', 'a failed step must not terminate the daemon')
         self.assertEqual(out['delegated'], {'delegated': 'open'})
         self.assertEqual(out['invalid'], 'Invalid request')
 

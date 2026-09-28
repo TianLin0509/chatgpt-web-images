@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.15
+
+- Tab daemon survives failed steps. A failed step left an unobserved rejected promise on the lane chain, which terminates Node, so the first closed tab or page error took the shared connection down and every lane fell back to per-step attaches.
+
 ## 0.7.14
 
 - An idle lane moves its own tab to about:blank once per idle period. A finished conversation left open kept polling ChatGPT; when those reads returned HTTP 429, every status check renewed the whole login's cooldown, so one idle tab stalled all lanes for hours (observed 2026-09-27: 429s only in the idle tab, none in the busy one).

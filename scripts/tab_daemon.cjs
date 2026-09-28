@@ -127,7 +127,10 @@ class TabDaemon {
   enqueue(lane, work) {
     const prev = this.chains.get(lane) || Promise.resolve();
     const next = prev.catch(() => {}).then(work);
-    this.chains.set(lane, next.finally(() => { if (this.chains.get(lane) === next) this.chains.delete(lane); }));
+    // The stored tail must never reject: an unobserved rejection terminates Node, and a
+    // failed step (for example a closed tab) used to take the whole daemon down with it.
+    const tail = next.catch(() => {}).finally(() => { if (this.chains.get(lane) === tail) this.chains.delete(lane); });
+    this.chains.set(lane, tail);
     return next;
   }
 
@@ -157,6 +160,9 @@ function category(message) {
 
 async function serve(options) {
   const daemon = new TabDaemon(options);
+  // One lane's failure must never stop the connection every other lane depends on.
+  process.on('unhandledRejection', e => daemon.log('unhandled_rejection', { error: category(String(e && e.message || e)) }));
+  process.on('uncaughtException', e => daemon.log('uncaught_exception', { error: category(String(e && e.message || e)) }));
   const token = crypto.randomBytes(24).toString('hex');
   const server = http.createServer((req, res) => {
     if (req.method !== 'POST' || req.url !== '/call' || req.headers['x-token'] !== token) { res.writeHead(403); res.end(); return; }
