@@ -21,7 +21,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.15'
+VERSION = '0.7.16'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -313,6 +313,15 @@ def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True, 
     # Human authentication gates retain priority; no prompt is sent here.
     if (new_conversation and re.fullmatch(CONVERSATION_URL, state.get('url',''))
             and not any(state.get(k) for k in ('challenge','credential_required','account_chooser'))):
+        cli(['goto', 'https://chatgpt.com/'])
+        state = run_js(SETTLE_JS)
+    # Composer, tool and download steps match English control names. A tab that was
+    # loaded while the account rendered another language keeps it until reloaded, and a
+    # fresh load follows the account's current language. Reload such a page once when
+    # no job owns it; nothing is submitted. A job's own conversation is never reloaded.
+    lang = state.get('ui_lang') or ''
+    if (lang and not lang.lower().startswith('en') and state.get('url','').startswith('https://chatgpt.com')
+            and not re.fullmatch(CONVERSATION_URL, state.get('url','')) and (new_conversation or not active_job())):
         cli(['goto', 'https://chatgpt.com/'])
         state = run_js(SETTLE_JS)
     # An interrupted cold open can leave the owned tab at about:blank. It will

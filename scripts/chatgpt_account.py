@@ -19,7 +19,9 @@ STATE_FUNCTION = r'''() => {
  const challenge = /Just a moment|checking your browser/i.test(document.title) ||
    nodes('iframe[src*="challenges.cloudflare.com"]').length > 0;
  const credential = nodes('input[type="password"],input[autocomplete="one-time-code"],input[name="code"]').length > 0;
- const profile = nodes('[data-testid="accounts-profile-button"],button[aria-label="Open profile menu"]').length > 0;
+ // Tabs of one account can render in different UI languages (a zh-CN tab loaded earlier
+ // next to a fresh en-US one, observed 2026-09-27); the login check must not depend on it.
+ const profile = nodes('[data-testid="accounts-profile-button"],button[aria-label="Open profile menu"],button[aria-label="打开个人资料菜单"]').length > 0;
  const composer = nodes('#prompt-textarea,[contenteditable="true"][data-composer-markdown]').length > 0;
  const trusted = location.origin === 'https://chatgpt.com';
  const logged_in = trusted && profile && composer && !login && !chooser && !challenge && !credential;
@@ -41,7 +43,7 @@ STATE_FUNCTION = r'''() => {
      else rate_limited=true;
    } catch { /* Non-URL performance entries do not describe provider responses. */ }
  }
- return {url:location.href,title:document.title,logged_in,composer,account_chooser:chooser,
+ return {url:location.href,title:document.title,ui_lang:document.documentElement.lang||'',logged_in,composer,account_chooser:chooser,
    login_in_progress:chooser && /Logging in|Signing in|正在登录|登录中/i.test(document.body.innerText),
    challenge,cloudflare:challenge,credential_required:credential,rate_limited,background_rate_limited,
    auth_state:challenge?'browser_challenge':credential?'credential_required':chooser?'account_selection_required':

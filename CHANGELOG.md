@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.16
+
+- Login detection accepts the Chinese profile-menu label. One account's tabs can render in different UI languages (a zh-CN tab loaded earlier beside a fresh en-US tab, observed 2026-09-27); the zh-CN tab was reported page_not_ready indefinitely.
+- An idle or new-task ChatGPT page that renders a non-English UI is reloaded once, so English control names used by the composer, tool and download steps match. A job's own conversation is never reloaded and nothing is submitted.
+
 ## 0.7.15
 
 - Tab daemon survives failed steps. A failed step left an unobserved rejected promise on the lane chain, which terminates Node, so the first closed tab or page error took the shared connection down and every lane fell back to per-step attaches.
