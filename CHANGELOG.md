@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.18
+
+- The server, not only the page, decides whether an image turn has finished. After 90 s without rendered images a job asks the recorded conversation once (then every 60 s, backing off to 120/300 s on HTTP 429) and reloads the conversation, at most three times, only when the server reports a finished turn with image assets. Observed 2026-09-27: the page stayed on "Thinking" after its own reads were rate-limited while the server already held the finished 1672x941 image.
+
 ## 0.7.17
 
 - A lane reuses its recorded tab whenever that tab still exists, instead of opening another one when the Hub's short health check misses it. Twenty-three ownerless ChatGPT tabs had accumulated in the Hub browser (12 stuck on a Cloudflare check), all polling the same login into HTTP 429.

@@ -21,7 +21,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.17'
+VERSION = '0.7.18'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -867,6 +867,64 @@ def download_asset(job, asset):
     save_job(job)  # checkpoint every image, not just the final image
 
 
+# The ChatGPT page can finish an image on the server and still show "Thinking" forever:
+# right after submission it polls the new conversation, and when those reads are answered
+# with HTTP 429 it stops polling (observed 2026-09-27; the server held a finished
+# 1672x941 image while the page never rendered it). The page is therefore not the only
+# source of truth. After a grace period ask the server once, at a gentle cadence, and
+# reload the recorded conversation only when the server reports a finished image turn.
+SERVER_TRUTH_AFTER = 90
+SERVER_TRUTH_EVERY = (60, 120, 300)
+SERVER_TRUTH_RELOADS = 3
+SERVER_TRUTH_JS = r"""async page => page.evaluate(async id => {
+  const s = await (await fetch('/api/auth/session', {credentials: 'include'})).json();
+  const r = await fetch('/backend-api/conversation/' + id, {headers: {authorization: 'Bearer ' + s.accessToken}, credentials: 'include'});
+  if (!r.ok) return {http: r.status};
+  const c = await r.json();
+  const msgs = Object.values(c.mapping || {}).map(n => n.message).filter(Boolean)
+    .sort((a, b) => (a.create_time || 0) - (b.create_time || 0));
+  let lastUser = -1;
+  msgs.forEach((m, i) => { if (m.author?.role === 'user') lastUser = i; });
+  const turn = msgs.slice(lastUser + 1);
+  const images = turn.filter(m => m.author?.role === 'tool')
+    .flatMap(m => (m.content?.parts || []).filter(p => p && typeof p === 'object' && p.asset_pointer)).length;
+  const answer = turn.filter(m => m.author?.role === 'assistant').pop();
+  return {http: 200, images, finished: !!answer && answer.status === 'finished_successfully'};
+}, __ID__)"""
+WAIT_USER_MESSAGE_JS = r"""async page => {
+  await page.locator(':is([data-message-author-role="user"],[data-user-message-bubble])').last().waitFor({timeout:20000});
+  return true;
+}"""
+
+
+def server_truth_reload(job):
+    """Return a fresh POLL_JS result after reloading a stalled conversation, else None."""
+    now = time.time()
+    if now - job.get('wait_started_at', job['created_at']) < SERVER_TRUTH_AFTER or now < job.get('server_truth_next', 0):
+        return None
+    match = re.fullmatch(r'https://chatgpt\.com/c/([a-zA-Z0-9-]+)', job.get('conversation_url', ''))
+    if not match or job.get('server_truth_reloads', 0) >= SERVER_TRUTH_RELOADS:
+        return None
+    truth = run_js(SERVER_TRUTH_JS.replace('__ID__', json.dumps(match.group(1))))
+    truth = truth if isinstance(truth, dict) else {}
+    misses = job.get('server_truth_misses', 0)
+    if truth.get('http') != 200:
+        # A 429 here is the same pressure that stalled the page; back off, never hammer.
+        job['server_truth_misses'] = misses + 1
+        job['server_truth_next'] = now + SERVER_TRUTH_EVERY[min(misses + 1, len(SERVER_TRUTH_EVERY) - 1)]
+        job['server_truth'] = {'http': truth.get('http')}
+        return None
+    job['server_truth_misses'] = 0
+    job['server_truth_next'] = now + SERVER_TRUTH_EVERY[0]
+    job['server_truth'] = {'http': 200, 'finished': bool(truth.get('finished')), 'images': int(truth.get('images') or 0)}
+    if not (truth.get('finished') and truth.get('images')):
+        return None
+    job['server_truth_reloads'] = job.get('server_truth_reloads', 0) + 1
+    cli(['goto', job['conversation_url']])
+    run_js(WAIT_USER_MESSAGE_JS)
+    return run_js(POLL_JS)
+
+
 def poll(job_id):
     with locked():
         path=job_path(job_id)
@@ -930,6 +988,13 @@ def poll(job_id):
         if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',result['url']):
             job['conversation_url']=result['url']
         job['operation_stage']='observe_images'
+        if not assets or result['stop'] or pending:
+            fresh = server_truth_reload(job)
+            if fresh is not None:
+                result = fresh
+                assets = list({a['key']:a for a in result['images']}.values())
+                job['observed_count'] = len(assets)
+                pending = result.get('pending_images',0)
         if not assets or result['stop'] or pending:
             if time.time()-job.get('wait_started_at',job['created_at'])>900:
                 job['status']='needs_attention'
