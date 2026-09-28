@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.19
+
+- Cancelling a parked job finishes immediately. A parked job owns no browser page, so no worker ever claimed it to honour a cancel request; cancelled jobs on disabled lanes stayed parked forever and callers such as the weekly-report connectors kept polling them.
+
 ## 0.7.18
 
 - The server, not only the page, decides whether an image turn has finished. After 90 s without rendered images a job asks the recorded conversation once (then every 60 s, backing off to 120/300 s on HTTP 429) and reloads the conversation, at most three times, only when the server reports a finished turn with image assets. Observed 2026-09-27: the page stayed on "Thinking" after its own reads were rate-limited while the server already held the finished 1672x941 image.

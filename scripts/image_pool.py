@@ -55,7 +55,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.18'
+VERSION = '0.7.19'
 
 
 @contextlib.contextmanager
@@ -556,6 +556,12 @@ class Pool:
                 raise w.ImageError('job_not_found', 'Unknown job_id.')
             if row['status'] == 'queued':
                 db.execute("UPDATE jobs SET status='cancelled',updated=? WHERE id=?", (time.time(), job_id))
+            elif row['status'] == PARKED:
+                # A parked job already handed its lane back and owns no browser page, so no
+                # worker will ever claim it to process a cancel request. Waiting for one left
+                # cancelled jobs (and the website connectors polling them) pending forever.
+                # Its conversation stays in the account; nothing is resent or deleted.
+                db.execute("UPDATE jobs SET status='cancelled',cancel_requested=1,updated=? WHERE id=?", (time.time(), job_id))
             elif row['status'] not in TERMINAL:
                 db.execute('UPDATE jobs SET cancel_requested=1,updated=? WHERE id=?', (time.time(), job_id))
         return self.get(job_id)

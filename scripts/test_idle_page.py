@@ -66,3 +66,28 @@ class IdlePageContracts(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ParkedCancellation(unittest.TestCase):
+    """A parked job owns no browser page; cancelling it must finish at once, even when its
+    lane is disabled, so callers (for example the weekly-report connectors) stop waiting."""
+
+    def test_cancel_parked_job_on_disabled_lane_is_final(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        pool = Pool(root / 'pool')
+        data, config = root / 'lane' / 'browser', root / 'lane' / 'config'
+        w.write_json(config / 'settings.json', {'data_dir': str(data)})
+        pool.add_account('primary', str(data), str(config), enabled=True)
+        pool.account_state('primary', 'authenticated', True)
+        job = pool.submit(prompt='Draw a simple square.', output_dir=str(root / 'out'), request_id='r-park', account_id='auto')
+        runtime = LeavingRuntime(data)
+        worker = Worker(pool, 'primary', runtime)
+        worker.control_turn = False
+        worker.tick()                      # claimed and started
+        pool.park(job['job_id'])
+        pool.enable('primary', False)      # its lane is taken out of service
+        result = pool.cancel(job['job_id'])
+        self.assertEqual(result['status'], 'cancelled')
+        self.assertEqual(runtime.starts, 1, 'cancelling never resubmits')
