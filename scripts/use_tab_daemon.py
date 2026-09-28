@@ -4,8 +4,8 @@ Each lane keeps its own tab and identity; only the transport changes. The Hub en
 and the Hub code are never modified. A lane's previous cli_entry is kept in
 settings.json under "hub_cli_entry" so --revert restores it exactly.
 
-    python use_tab_daemon.py --pool C:\\VibeData\\ChatGPTWebImagesPool          # switch
-    python use_tab_daemon.py --pool C:\\VibeData\\ChatGPTWebImagesPool --revert # undo
+    python use_tab_daemon.py --pool <queue directory>            # switch
+    python use_tab_daemon.py --pool <queue directory> --revert   # undo
 """
 import argparse
 import json
