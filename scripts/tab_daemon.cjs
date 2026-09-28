@@ -14,6 +14,7 @@ const crypto = require('crypto');
 
 const PROTOCOL = 1;
 const IDLE_EXIT_MS = 6 * 3600 * 1000;
+const REAP_EVERY_MS = 10 * 60 * 1000;
 
 function statePath(poolRoot, identity) { return path.join(poolRoot, `tab-daemon-${identity}.json`); }
 function logPath(poolRoot, identity) { return path.join(poolRoot, `tab-daemon-${identity}.log`); }
@@ -119,9 +120,73 @@ class TabDaemon {
       const fn = new Function('return (' + source + '\n)')();
       return fn(await this.page(lane));
     }
+    if (command === 'open') return this.open(lane, tool, argv);
     if (command === 'close') this.pages.delete(lane);
-    // open / close / state-load / state-save keep the Hub's exact semantics.
+    // close / state-load / state-save keep the Hub's exact semantics.
     return tool.execute(argv);
+  }
+
+  endpoint() { return this.tool('images-reaper').hub.endpoint(); }
+  registryPath() { return path.join(this.poolRoot, `tab-registry-${this.identity}.json`); }
+  liveTargets() {
+    const dir = path.join(this.root, 'tool-pages');
+    const live = new Set();
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch {}
+    for (const name of names) { const rec = readJson(path.join(dir, name)); if (rec?.targetId) live.add(rec.targetId); }
+    return live;
+  }
+  register(lane, targetId) {
+    if (!targetId) return;
+    const reg = readJson(this.registryPath()) || { tabs: [] };
+    if (!reg.tabs.some(t => t.targetId === targetId)) reg.tabs.push({ targetId, lane, at: Date.now() / 1000 });
+    writeJson(this.registryPath(), reg);
+  }
+
+  async open(lane, tool, argv) {
+    // Reuse the recorded tab whenever it still exists. The Hub's own check can miss it under
+    // load (a short CDP health deadline) and then opens another tab, leaving the first one
+    // polling ChatGPT with no owner; 23 such orphans pushed the login into HTTP 429.
+    const record = readJson(path.join(this.root, 'tool-pages', lane + '.json'));
+    if (record?.targetId && record.identity === this.identity) {
+      const ep = await this.endpoint();
+      if (ep && record.browserWs === ep.ws) {
+        const page = await this.findPage(await this.connection(ep), record.targetId);
+        if (page) {
+          this.pages.set(lane, { targetId: record.targetId, page });
+          this.register(lane, record.targetId);
+          return { targetId: record.targetId, reused: true };
+        }
+      }
+    }
+    const result = await tool.execute(argv);
+    this.register(lane, result?.targetId);
+    return result;
+  }
+
+  async reap() {
+    // Close only tabs this daemon opened or reused for a lane and that no lane owns now.
+    const reg = readJson(this.registryPath());
+    if (!reg?.tabs?.length) return 0;
+    const ep = await this.endpoint();
+    if (!ep) return 0;
+    const browser = await this.connection(ep);
+    const session = await browser.newBrowserCDPSession();
+    let closed = 0;
+    try {
+      const { targetInfos } = await session.send('Target.getTargets');
+      const exists = new Set(targetInfos.map(t => t.targetId));
+      const live = this.liveTargets();
+      const keep = [];
+      for (const tab of reg.tabs) {
+        if (live.has(tab.targetId)) { keep.push(tab); continue; }
+        if (exists.has(tab.targetId)) {
+          try { await session.send('Target.closeTarget', { targetId: tab.targetId }); closed++; this.log('reaped', { lane: tab.lane }); } catch {}
+        }
+      }
+      writeJson(this.registryPath(), { tabs: keep });
+    } finally { await session.detach().catch(() => {}); }
+    return closed;
   }
 
   enqueue(lane, work) {
@@ -148,6 +213,13 @@ class TabDaemon {
       throw e;
     } finally { clearTimeout(timer); }
   }
+}
+
+function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
+function writeJson(file, value) {
+  const tmp = file + '.' + process.pid + '.' + crypto.randomBytes(4).toString('hex') + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(value), 'utf8');
+  fs.renameSync(tmp, file);
 }
 
 function category(message) {
@@ -188,6 +260,9 @@ async function serve(options) {
   setInterval(() => {
     if (Date.now() - daemon.lastCall > IDLE_EXIT_MS) { daemon.log('idle_exit'); process.exit(0); }
   }, 60000).unref();
+  const reap = () => daemon.reap().catch(e => daemon.log('reap_failed', { error: category(String(e && e.message || e)) }));
+  setTimeout(reap, 30000).unref();
+  setInterval(reap, REAP_EVERY_MS).unref();
 }
 
 if (require.main === module) {

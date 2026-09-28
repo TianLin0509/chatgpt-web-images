@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.17
+
+- A lane reuses its recorded tab whenever that tab still exists, instead of opening another one when the Hub's short health check misses it. Twenty-three ownerless ChatGPT tabs had accumulated in the Hub browser (12 stuck on a Cloudflare check), all polling the same login into HTTP 429.
+- The tab daemon records every tab it opens or reuses for a lane and every 10 minutes closes only those that no lane owns any more. Tabs it never registered (the user's, the Hub's, other tools') are never touched.
+
 ## 0.7.16
 
 - Login detection accepts the Chinese profile-menu label. One account's tabs can render in different UI languages (a zh-CN tab loaded earlier beside a fresh en-US tab, observed 2026-09-27); the zh-CN tab was reported page_not_ready indefinitely.

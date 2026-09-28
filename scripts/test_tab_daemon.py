@@ -98,5 +98,69 @@ class TabDaemonTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
+REAP_SCRIPT = textwrap.dedent("""
+  const { TabDaemon } = require(process.argv[2]);
+  const root = process.argv[3];
+  const fs = require('fs'), path = require('path');
+  const d = new TabDaemon({ identity: 'main', poolRoot: root, hubCore: root, root, playwright: 'unused' });
+  fs.mkdirSync(path.join(root, 'tool-pages'), { recursive: true });
+  const rec = (lane, targetId) => fs.writeFileSync(path.join(root, 'tool-pages', lane + '.json'), JSON.stringify({ targetId, browserWs: 'ws://fake', identity: 'main' }));
+  const closed = [];
+  const alive = new Set(['T-live', 'T-orphan', 'T-user', 'T-reused']);
+  d.endpoint = async () => ({ port: 1, ws: 'ws://fake' });
+  d.connection = async () => ({ newBrowserCDPSession: async () => ({
+    send: async (m, a) => { if (m === 'Target.getTargets') return { targetInfos: [...alive].map(targetId => ({ targetId })) };
+                            if (m === 'Target.closeTarget') { closed.push(a.targetId); alive.delete(a.targetId); return {}; } },
+    detach: async () => {} }) });
+  d.findPage = async (browser, id) => alive.has(id) ? { isClosed: () => false, once() {} } : null;
+  (async () => {
+    const out = {};
+    rec('images-a', 'T-reused');
+    let delegated = 0;
+    const tool = { execute: async () => { delegated++; return { targetId: 'T-new', reused: false }; } };
+    out.reuse = await d.open('images-a', tool, ['open', 'about:blank']);
+    out.delegated_after_reuse = delegated;
+    rec('images-b', 'T-gone');
+    out.fresh = await d.open('images-b', tool, ['open', 'about:blank']);
+    out.delegated_after_fresh = delegated;
+    // T-orphan was opened for a lane earlier; its lane record now points elsewhere.
+    d.register('images-c', 'T-orphan');
+    rec('images-c', 'T-live'); d.register('images-c', 'T-live');
+    out.reaped = await d.reap();
+    out.closed = closed;
+    out.registry = JSON.parse(fs.readFileSync(d.registryPath(), 'utf8')).tabs.map(t => t.targetId).sort();
+    console.log(JSON.stringify(out));
+    process.exit(0);
+  })();
+""")
+
+
+@unittest.skipUnless(NODE, 'node is required for the tab daemon')
+class TabRegistryTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / 'hub-browser-tool.js').write_text(FAKE_TOOL, encoding='utf-8')
+        (self.tmp / 'chatgpt-selector-compat.js').write_text(FAKE_COMPAT, encoding='utf-8')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_reuse_existing_tab_and_reap_only_unowned_registered_tabs(self):
+        script = self.tmp / 'reap.cjs'
+        script.write_text(REAP_SCRIPT, encoding='utf-8')
+        proc = subprocess.run([NODE, str(script), str(HERE / 'tab_daemon.cjs'), str(self.tmp)],
+                              capture_output=True, text=True, encoding='utf-8', timeout=60,
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(out['reuse'], {'targetId': 'T-reused', 'reused': True})
+        self.assertEqual(out['delegated_after_reuse'], 0, 'an existing recorded tab must not cause a second tab')
+        self.assertEqual(out['fresh'], {'targetId': 'T-new', 'reused': False})
+        self.assertEqual(out['delegated_after_fresh'], 1)
+        self.assertEqual(out['closed'], ['T-orphan'], 'only a registered tab that no lane owns is closed')
+        self.assertNotIn('T-user', out['closed'], 'tabs the daemon never registered are never touched')
+        self.assertEqual(out['registry'], ['T-live', 'T-reused'])
+
+
 if __name__ == '__main__':
     unittest.main()
