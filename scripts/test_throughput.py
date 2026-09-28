@@ -134,6 +134,7 @@ class AccountRecovery(fixtures.QueueContracts):
         self.assertFalse(worker.recheck_due(account))
 
     def test_unhealthy_account_queues_its_own_check(self):
+        self.submit('waiting-for-recovery', 'primary')
         worker = self.worker('primary')
         self.pool.account_state('primary', 'browser_unhealthy', False, {'code': 'browser_operation_failed'})
         worker.last_check = time.monotonic() - image_worker.RECHECK_BACKOFF[0] - 1

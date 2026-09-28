@@ -16,6 +16,7 @@ import uuid
 import asyncio
 
 import web_images as w
+import image_limits
 
 TERMINAL = w.TERMINAL | {'cancelled'}
 LIVE = ('dispatching', 'running', 'needs_attention')
@@ -45,13 +46,16 @@ ACTIONABLE = {
     'browser_closed': 'retry', 'busy': 'retry', 'browser_protocol_error': 'retry',
     'job_state_unreadable': 'human',
     'generation_wait_exceeded': 'retry', 'browser_locator_ambiguous': 'retry',
+    'conversation_not_readable': 'retry',
+    'page_not_ready': 'retry',
+    'rate_limited': 'retry',
     'login_required': 'human', 'browser_challenge': 'human', 'account_selection_required': 'human',
     'credential_required': 'human', 'image_tool_unavailable': 'human', 'output_exists': 'human',
     'output_changed': 'human', 'conversation_changed': 'human', 'legacy_job_active': 'human',
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.2'
+VERSION = '0.7.19'
 
 
 @contextlib.contextmanager
@@ -127,6 +131,12 @@ class Pool:
             if 'login_group' not in {row['name'] for row in db.execute('PRAGMA table_info(accounts)')}:
                 db.execute("ALTER TABLE accounts ADD COLUMN login_group TEXT NOT NULL DEFAULT ''")
             db.execute('CREATE INDEX IF NOT EXISTS jobs_parked ON jobs(account_id, status, retry_after)')
+            image_limits.ensure_schema(db)
+
+    def cooldown(self,account_id):return image_limits.get(self,account_id)
+    def defer_rate_limit(self,account_id):return image_limits.defer(self,account_id)
+    def acquire_rate_probe(self,account_id):return image_limits.acquire_probe(self,account_id)
+    def clear_rate_limit(self,account_id):return image_limits.clear(self,account_id)
 
     def connect(self):
         db = sqlite3.connect(self.db, timeout=10, isolation_level=None)
@@ -402,7 +412,8 @@ class Pool:
                 'pending_job_ids': [s['job_id'] for s in waiting], 'needs_attention': attention,
                 'jobs': states,
                 'next_action': 'inspect_blocking_accounts' if attention else
-                               'poll_same_job_ids' if waiting else 'deliver_saved_files'}
+                               'wait_for_account_cooldown' if any(s.get('next_action')=='wait_for_account_cooldown' for s in states) else
+                               'poll_same_job_ids' if waiting or any(s['status']==PARKED for s in states) else 'deliver_saved_files'}
 
     async def poll_many_async(self, job_ids, wait_seconds=0, detail=False, return_when='all'):
         """Wait on a whole batch in one call; polling one job at a time is what serialises callers."""
@@ -488,14 +499,20 @@ class Pool:
             with self.connect() as db:
                 result['queue_position'] = db.execute("SELECT COUNT(*) FROM jobs WHERE status='queued' AND created<=?", (row['created'],)).fetchone()[0]
             lanes = self.status()['accounts']
-            lanes = [a for a in lanes if row['preferred'] in ('auto', a['id'])]
+            lanes = [a for a in lanes if row['preferred'] in ('auto', a['id'],a['login_group'])]
             blocking = [{k: a[k] for k in ('id', 'login_group', 'state', 'worker_alive', 'worker_stalled', 'active_job_id', 'active_job_status')}
                         for a in lanes if not a['enabled'] or not a['ready'] or not a['worker_alive'] or a['worker_stalled'] or a['active_job_id']]
             result['blocking_lane_count'] = len(blocking)
             result['blocking_accounts'] = blocking[:5]
+            for item in result['blocking_accounts']:
+                lane=next(a for a in lanes if a['id']==item['id'])
+                if lane.get('retry_at'):item['retry_at']=lane['retry_at']
             if lanes and all(not a['enabled'] or not a['ready'] or a['worker_stalled'] or
                              a['active_job_status'] == 'needs_attention' for a in lanes):
                 result['next_action'] = 'inspect_blocking_accounts'
+            if lanes and all(a.get('retry_at',0)>time.time() for a in lanes):
+                result['retry_at']=min(a['retry_at'] for a in lanes)
+                result['next_action']='wait_for_account_cooldown'
         if detail:
             result['runtime_job_id'] = row['runtime_id']
         else:
@@ -505,6 +522,9 @@ class Pool:
             if 'files' in result:
                 result['files'] = [{k: v for k, v in f.items() if k in
                     {'path', 'width', 'height', 'bytes', 'sha256'}} for f in result['files']]
+        if row['account_id'] and (cooldown:=self.cooldown(row['account_id'])) and cooldown['retry_after']>time.time() and row['status'] not in TERMINAL:
+            result['retry_at']=cooldown['retry_after'];result['next_action']='wait_for_account_cooldown'
+            result['error']={'code':'rate_limited','message':'ChatGPT HTTP 429: this login is cooling; no prompt will be resent.','actionable_by':'retry'}
         return result
 
     async def poll_async(self, job_id, wait_seconds=0, detail=False):
@@ -536,6 +556,12 @@ class Pool:
                 raise w.ImageError('job_not_found', 'Unknown job_id.')
             if row['status'] == 'queued':
                 db.execute("UPDATE jobs SET status='cancelled',updated=? WHERE id=?", (time.time(), job_id))
+            elif row['status'] == PARKED:
+                # A parked job already handed its lane back and owns no browser page, so no
+                # worker will ever claim it to process a cancel request. Waiting for one left
+                # cancelled jobs (and the website connectors polling them) pending forever.
+                # Its conversation stays in the account; nothing is resent or deleted.
+                db.execute("UPDATE jobs SET status='cancelled',cancel_requested=1,updated=? WHERE id=?", (time.time(), job_id))
             elif row['status'] not in TERMINAL:
                 db.execute('UPDATE jobs SET cancel_requested=1,updated=? WHERE id=?', (time.time(), job_id))
         return self.get(job_id)
@@ -590,13 +616,18 @@ class Pool:
                              (account_id, PARKED, len(ADOPT_BACKOFF), time.time())).fetchone()
         return dict(row) if row else None
 
-    def claim(self, account_id):
+    def claim(self, account_id, *, rate_probe=False):
         with self.transaction() as db:
+            account = db.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
+            if not account:return None
+            cooldown = db.execute('SELECT * FROM login_cooldowns WHERE login_group=?', (login_group(account),)).fetchone()
+            allowed_probe = bool(rate_probe and cooldown and cooldown['retry_after']<=time.time()
+                                 and cooldown['probe_owner']==account_id and cooldown['probe_until']>time.time())
+            if cooldown and not allowed_probe:return None
             active = db.execute("SELECT * FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')", (account_id,)).fetchone()
             if active:
                 return dict(active)
-            account = db.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
-            if not account or not account['enabled'] or not account['ready']:
+            if not account['enabled'] or (not account['ready'] and not allowed_probe):
                 return None
             group = login_group(account)
             # Two follow-ups typing into one conversation would interleave, so a thread
@@ -692,6 +723,8 @@ class Pool:
             for row in db.execute('SELECT * FROM accounts ORDER BY id'):
                 account = {k: row[k] for k in ('id','enabled','ready','state','heartbeat','updated')}
                 account['login_group'] = login_group(row)
+                cooldown=db.execute('SELECT retry_after FROM login_cooldowns WHERE login_group=?',(account['login_group'],)).fetchone()
+                if cooldown:account['retry_at']=cooldown['retry_after']
                 account['worker_alive'] = time.time() - row['heartbeat'] < 20
                 health = self.worker_health(row['id'])
                 account['worker_version'] = health.get('version', 'unknown')

@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import http.server
 import json
 import os
 from pathlib import Path
@@ -13,13 +14,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.2'
+VERSION = '0.7.19'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -61,8 +63,18 @@ WINDOW_LOOKUP_TRIES = 4
 #    this position is never on screen at any sample, while hiding alone left it visible
 #    through the whole cold open. Hiding still runs, to keep it out of the taskbar too.
 OFFSCREEN = (-32000, -32000)
+# An off-screen or hidden window is treated by Chrome as a background page: timers are
+# throttled, lazy images never load and focus-dependent menus stall. These switches keep
+# the lane's renderer running at foreground speed without ever showing the window
+# (chrome-launcher "flags for tools"; CalculateNativeWinOcclusion is the Windows-only
+# occlusion tracker that otherwise marks a covered or off-screen window as hidden).
+BACKGROUND_SAFE_ARGS = ['--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-features=CalculateNativeWinOcclusion']
 BROWSER_ARGS = ['--hide-crash-restore-bubble', '--disable-session-crashed-bubble',
                 '--no-first-run', '--no-default-browser-check',
+                *BACKGROUND_SAFE_ARGS,
                 '--window-position=%d,%d' % OFFSCREEN, '--window-size=1280,900']
 # Where a window goes when the user actually asked to see it.
 ONSCREEN = (80, 60)
@@ -78,7 +90,17 @@ def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix('.tmp-' + uuid.uuid4().hex)
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    os.replace(temp, path)
+    # Windows readers can briefly hold the destination without delete sharing.
+    # Never let a telemetry write kill the worker or lose its active request.
+    for attempt in range(6):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt==5:
+                temp.unlink(missing_ok=True)
+                raise
+            time.sleep(.01*(attempt+1))
 
 
 def prompt_hash(text):
@@ -148,7 +170,7 @@ def cli(args, timeout=55):
         proc = subprocess.run(
             [command, str(CLI_ENTRY), '--session', SESSION, '--json', *args],
             cwd=DATA, capture_output=True, text=True, encoding='utf-8', errors='replace',
-            env={**os.environ, 'NO_COLOR': '1', 'FORCE_COLOR': '0'}, timeout=timeout,
+            env={**os.environ, 'NO_COLOR': '1', 'FORCE_COLOR': '0', 'NO_UPDATE_NOTIFIER':'1'}, timeout=timeout,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except subprocess.TimeoutExpired as exc:
@@ -245,7 +267,7 @@ def set_visible(visible):
     return bool(user32.IsWindowVisible(found[0])) == visible
 
 
-def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True):
+def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True, force_refresh=False, new_conversation=False):
     try:
         state = run_js(STATUS_JS)
     except ImageError as exc:
@@ -286,10 +308,35 @@ def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True):
                 state['window_hidden'] = set_visible(False)
             except Exception:
                 state['window_hidden'] = False
-    if not any(state.get(key) for key in ('logged_in','account_chooser','challenge','credential_required')):
+    # A new task owns a fresh composer. A throttled/read-failed old conversation
+    # in this released lane is not the page whose usability it needs to prove.
+    # Human authentication gates retain priority; no prompt is sent here.
+    if (new_conversation and re.fullmatch(CONVERSATION_URL, state.get('url',''))
+            and not any(state.get(k) for k in ('challenge','credential_required','account_chooser'))):
+        cli(['goto', 'https://chatgpt.com/'])
         state = run_js(SETTLE_JS)
+    # Composer, tool and download steps match English control names. A tab that was
+    # loaded while the account rendered another language keeps it until reloaded, and a
+    # fresh load follows the account's current language. Reload such a page once when
+    # no job owns it; nothing is submitted. A job's own conversation is never reloaded.
+    lang = state.get('ui_lang') or ''
+    if (lang and not lang.lower().startswith('en') and state.get('url','').startswith('https://chatgpt.com')
+            and not re.fullmatch(CONVERSATION_URL, state.get('url','')) and (new_conversation or not active_job())):
+        cli(['goto', 'https://chatgpt.com/'])
+        state = run_js(SETTLE_JS)
+    # An interrupted cold open can leave the owned tab at about:blank. It will
+    # never become a ChatGPT page by waiting or refreshing; finish navigation in
+    # that same tab. Existing conversations and unrelated pages stay untouched.
+    if state.get('url') == 'about:blank':
+        cli(['goto', 'https://chatgpt.com/'])
+        state = run_js(SETTLE_JS)
+    if not any(state.get(key) for key in ('logged_in','account_chooser','challenge','credential_required','rate_limited')):
+        state = run_js(SETTLE_JS)
+    if state.get('auth_state')=='page_not_ready' or (force_refresh and state.get('logged_in') and not state.get('rate_limited')):
+        from chatgpt_account import RECOVER_LOADING_JS
+        state = run_js(RECOVER_LOADING_JS)
     authorized = SETTINGS.get('account_name', '') if account_name is None else account_name
-    if state.get('account_chooser') and authorized and not state.get('challenge'):
+    if state.get('account_chooser') and authorized and not state.get('challenge') and not state.get('rate_limited'):
         state = run_js(selection_code(authorized))
         if state.get('error_code') and require_login:
             code = state['error_code']
@@ -297,12 +344,16 @@ def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True):
     state.update(browser_session=SESSION, provider='chatgpt-web', image_model_verified=False)
     if not require_login:
         return state
+    if state.get('rate_limited'):
+        raise ImageError('rate_limited','ChatGPT returned HTTP 429. Wait for the shared account cooldown; keep the same job and request identity.')
     if state.get('challenge'):
         raise ImageError('browser_challenge', 'Complete the verification in the dedicated browser using open.')
     if state.get('account_chooser') or state.get('credential_required'):
         code = state['auth_state']
         raise ImageError(code, ERROR_MESSAGES[code])
     if not state.get('logged_in'):
+        if state.get('auth_state')=='page_not_ready':
+            raise ImageError('page_not_ready','The account page has not finished loading; this is not proof of a signed-out account. The existing page was refreshed once without resubmitting a prompt.')
         raise ImageError('login_required', 'Sign in in the dedicated browser using open.')
     return state
 
@@ -321,7 +372,7 @@ def job_path(job_id):
 def public_job(job):
     keys = ['job_id', 'status', 'conversation_url', 'output_dir', 'files', 'error',
             'provider', 'image_model_verified', 'prompt_sha256', 'created_at', 'updated_at',
-            'reference_count', 'window_hidden', 'requested_count', 'observed_count', 'count_match', 'submitted_prompt_sha256', 'operation_stage']
+            'reference_count', 'window_hidden', 'requested_count', 'observed_count', 'count_match', 'submitted_prompt_sha256', 'operation_stage', 'timeline', 'timings']
     result={k:job[k] for k in keys if k in job}
     result['requested_count']=job.get('requested_count',1)
     result['downloaded_count']=len(job.get('files',[]))
@@ -332,6 +383,11 @@ def public_job(job):
 
 def save_job(job):
     job['updated_at'] = time.time()
+    timeline=job.setdefault('timeline',[])
+    current={'status':job['status'],'operation':job.get('operation_stage','')}
+    if not timeline or any(timeline[-1].get(k)!=v for k,v in current.items()):
+        timeline.append({'at':job['updated_at'],**current})
+        del timeline[:-40]
     write_json(job_path(job['job_id']), job)
 
 
@@ -357,6 +413,7 @@ def resume_existing(job_id):
             raise ImageError('job_not_active', 'The original job no longer owns this browser.')
         job['wait_started_at'] = time.time()
         job['refresh_requested'] = True
+        job.pop('unreadable_since', None)
         if job['status'] == 'needs_attention':
             job['status'] = 'generating'
         job.pop('error', None)
@@ -399,19 +456,34 @@ def adopt(job_id):
         ensure_browser()
         cli(['goto', url])
         run_js('''async page => {
-          await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+          await page.locator(':is([data-message-author-role="user"],[data-user-message-bubble])').last().waitFor({timeout:20000});
           return true;
         }''')
         write_json(DATA / 'active.json', {'job_id': job_id})
         job['window_hidden'] = set_visible(False)
         job['wait_started_at'] = time.time()
         job.pop('parked_at', None)
+        job.pop('unreadable_since', None)
         job.pop('identity_retry', None)
         job.pop('error', None)
         if job['status'] == 'needs_attention':
             job['status'] = 'generating'
         save_job(job)
         return public_job(job)
+
+
+def leave_conversation():
+    """Move an idle lane's own tab to about:blank so a finished conversation stops polling."""
+    with locked():
+        if active_job():
+            return {'left': False, 'reason': 'job_active'}
+        try:
+            cli(['goto', 'about:blank'])
+        except ImageError as exc:
+            if exc.code in {'browser_not_open', 'browser_closed'}:
+                return {'left': False, 'reason': exc.code}
+            raise
+        return {'left': True}
 
 
 def release_browser():
@@ -502,7 +574,9 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
         active = active_job()
         if active:
             raise ImageError('job_active', f"Job {active['job_id']} is active; poll it before starting another.")
-        ensure_browser()
+        bootstrap_started=time.perf_counter()
+        browser=ensure_browser(new_conversation=not bool(conversation_url))
+        bootstrap_seconds=time.perf_counter()-bootstrap_started
         out.mkdir(parents=True, exist_ok=True)
         job_id = time.strftime('%Y%m%d') + '-' + uuid.uuid4().hex[:12]
         job = dict(job_id=job_id, status='preparing', provider='chatgpt-web', image_model_verified=False,
@@ -510,7 +584,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
                    prompt_sha256=original_hash, requested_count=count, observed_count=0,
                    submitted_prompt_sha256=hashlib.sha256(prompt.encode('utf-8')).hexdigest(),
                    identity_hash=prompt_hash(prompt), identity_loose=loose_hash(prompt),
-                   reference_count=len(refs), files=[])
+                   reference_count=len(refs), files=[],timings={'browser_bootstrap':round(bootstrap_seconds,3)})
         save_job(job)
         write_json(DATA / 'active.json', {'job_id':job_id})
         if request_id:
@@ -519,7 +593,10 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
             job['operation_stage'] = 'continue_conversation' if conversation_url else 'new_conversation'
             job['conversation_url'] = conversation_url or job.get('conversation_url', '')
             save_job(job)
-            cli(['goto', conversation_url or 'https://chatgpt.com/'])
+            # A cold browser already navigated to the empty ChatGPT composer.
+            # Do not reload it a second time, but never reuse a previous thread.
+            if conversation_url or browser.get('url','').rstrip('/')!='https://chatgpt.com':
+                cli(['goto', conversation_url or 'https://chatgpt.com/'])
             job['operation_stage'] = 'wait_composer'
             save_job(job)
             # A follow-up lands after messages that are already in the thread, so waiting
@@ -528,15 +605,15 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
             before = run_js(r'''async page => {
               await page.locator('#prompt-textarea').waitFor({state:'visible',timeout:45000});
               await page.getByTestId('composer-plus-btn').waitFor({state:'visible',timeout:5000});
-              return await page.evaluate(() => document.querySelectorAll('[data-message-author-role="user"]').length);
+              return await page.evaluate(() => document.querySelectorAll(':is([data-message-author-role="user"],[data-user-message-bubble])').length);
             }''')
             before = before if type(before) is int else 0
             job['operation_stage'] = 'fill_prompt'
             save_job(job)
-            run_js(FILL_PROMPT_JS.replace('__PROMPT__',json.dumps(prompt)))
+            run_js(interactive(FILL_PROMPT_JS.replace('__PROMPT__',json.dumps(prompt))))
             job['operation_stage'] = 'select_image_tool'
             save_job(job)
-            run_js(r'''async page => {
+            run_js(interactive(r'''async page => {
               await page.getByTestId('composer-plus-btn').press('Enter',{timeout:10000});
               // The sidebar can contain a chat also titled 'Create image'.
               // Only the open composer action group/menu is a valid tool entry.
@@ -546,7 +623,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
               catch(e) { throw new Error('IMAGE_TOOL_UNAVAILABLE: '+e.name); }
               await page.locator('#prompt-textarea [data-inline-selection-pill][data-system-hint-type="picture_v2"]').waitFor({state:'attached',timeout:10000});
               return true;
-            }''')
+            }'''))
             if refs:
                 job['operation_stage'] = 'upload_references'
                 save_job(job)
@@ -558,7 +635,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
             job['status']='submitting'
             job['operation_stage']='submit_prompt'
             save_job(job)
-            result=run_js(r'''async page => {
+            result=run_js(interactive(r'''async page => {
               const composer=page.locator('#prompt-textarea');
               // Filling here would erase ChatGPT's inline image-tool selection.
               if(!await composer.locator('[data-inline-selection-pill][data-system-hint-type="picture_v2"]').count())
@@ -566,11 +643,11 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
               const button=page.getByTestId('send-button');
               await button.waitFor({state:'visible', timeout:20000});
               await button.click({timeout:20000});
-              await page.waitForFunction(n => document.querySelectorAll('[data-message-author-role="user"]').length > n,
+              await page.waitForFunction(n => document.querySelectorAll(':is([data-message-author-role="user"],[data-user-message-bubble])').length > n,
                                          __BEFORE__, {timeout:20000});
               await page.waitForURL(/^https:\/\/chatgpt\.com\/c\/[a-zA-Z0-9-]+$/, {timeout:20000});
               return {url:page.url()};
-            }'''.replace('__BEFORE__', str(int(before))))
+            }'''.replace('__BEFORE__', str(int(before)))))
             job['status']='generating'
             job['operation_stage']='observe_images'
             job['conversation_url']=result['url']
@@ -593,64 +670,59 @@ FILL_PROMPT_JS = r'''async page => {
  return true;
 }'''
 
-DOM_IMAGES_JS = r"""
-function ownedImages() {
- const users=Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
- const user=users.at(-1);
- if(!user)return [];
- const seen=new Set(), assets=[];
- const selector='[data-testid^="conversation-turn-"] img[alt^="Generated image"], [data-testid^="conversation-turn-"] img[alt^="生成的图片"]';
- for(const node of document.querySelectorAll(selector)) {
-   if(!(user.compareDocumentPosition(node)&Node.DOCUMENT_POSITION_FOLLOWING))continue;
-   const source=node.currentSrc||node.src;
-   if(!source)continue;
-   const url=new URL(source,location.href);
-   const id=url.searchParams.get('id')||url.searchParams.get('file_id');
-   const key=url.origin+url.pathname+(id?'?id='+id:'');
-   if(seen.has(key))continue;
-   seen.add(key);
-   assets.push({node,key,alt:node.alt,width:node.naturalWidth,height:node.naturalHeight,
-     ready:node.complete&&node.naturalWidth>=256&&node.naturalHeight>=256});
- }
- return assets;
-}
-"""
+from chatgpt_dom import DOM_IMAGES_JS, POLL_JS, MODERN_DOWNLOAD_JS
+from chatgpt_interaction import interactive
 
-POLL_JS = r'''async page => {
- // Trigger lazy-loaded generated images without returning image bytes.
- await page.evaluate(()=>{__DOM__ for(const a of ownedImages())if(!a.ready)a.node.scrollIntoView({block:'center'});});
- return await page.evaluate(()=>{
-   __DOM__
-   const users=Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
-   const lastUser=users.at(-1);
-   // Collapsed long messages include a Show more/less button outside the prompt.
-   // Read the full content container, never UI labels. Keep exact identity checks.
-   const userContent=lastUser?.querySelector('[data-testid="collapsible-user-message-content"]')||lastUser;
-   let userText=userContent?.innerText||'';
-   if(userContent?.querySelector('[data-inline-selection-pill][data-id="picture_v2"]')) {
-     // The image tool is rendered inside the user message but is not prompt text.
-     // Remove only its typed DOM marker, never matching words in the user's text.
-     const copy=userContent.cloneNode(true);
-     copy.querySelectorAll('[data-inline-selection-pill][data-id="picture_v2"]').forEach(n=>n.remove());
-     userText=copy.textContent||'';
+
+DOWNLOAD_JS = (r'''async page => {
+__MODERN__
+ // Fetch only the exact authenticated ORIGINAL asset already owned by this turn.
+ // No screenshot, canvas conversion, resize parameter, thumbnail or base64.
+ try {
+   const key=__KEY__;
+   const source=await page.evaluate(key=>{
+     __DOM__
+     const asset=ownedImages().find(a=>a.key===key);
+     if(!asset||!asset.ready)throw Error('original_not_ready');
+     const u=new URL(asset.node.currentSrc||asset.node.src,location.href);
+     if(u.origin!=='https://chatgpt.com'||u.pathname!=='/backend-api/estuary/content'||u.searchParams.get('p')!=='fs'||!/^file[_-]/.test(u.searchParams.get('id')||''))throw Error('unsupported_original_source');
+     const allowed=new Set(['id','ts','p','cid','sig','v']);
+     for(const k of u.searchParams.keys())if(!allowed.has(k))throw Error('unverified_asset_variant');
+     return u.href;
+   },key);
+   // Read the browser's authenticated response unchanged. Forward its binary
+   // body locally through Playwright, avoiding Chrome's unstable save dialog.
+   if(__TRANSFER__) {
+     const waiting=page.waitForResponse(r=>r.url()===source&&r.request().method()==='GET',{timeout:20000});
+     const [response]=await Promise.all([waiting,page.evaluate(url=>fetch(url,{credentials:'same-origin',signal:AbortSignal.timeout(20000)}).then(r=>r.arrayBuffer()).then(()=>true),source)]);
+     const type=response.headers()['content-type']||'';
+     if(!response.ok()||!/^image\/(png|jpeg|webp)(?:;|$)/i.test(type))throw Error('original_response_invalid');
+     const bytes=await response.body();
+     if(!bytes.length||bytes.length>50*1024*1024)throw Error('original_size_invalid');
+     const saved=await page.request.post(__TRANSFER__,{data:bytes,headers:{'Content-Type':'application/octet-stream'},timeout:5000});
+     if(!saved.ok())throw Error('local_original_save_failed');
+     return {saved:true,method:'authenticated_original'};
    }
-   const turns=Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"]'));
-   const assets=ownedImages();
-   // A turn only grows its action footer once it is finished. copy-turn-action-button
-   // is present on both image replies and text replies, so it is the shared signal.
-   // Containment, not order, is what distinguishes 'the user's own turn is last'.
-   const lastTurn=turns.at(-1);
-   const turnComplete=!!lastTurn&&!!lastTurn.querySelector('[data-testid="copy-turn-action-button"]')
-     &&!!lastUser&&!!(lastUser.compareDocumentPosition(lastTurn)&Node.DOCUMENT_POSITION_FOLLOWING);
-   return {url:location.href,stop:!!document.querySelector('[data-testid="stop-button"]'),
-     turn_complete:turnComplete,
-     images:assets.filter(a=>a.ready).map(({node,...a})=>a),
-     pending_images:assets.filter(a=>!a.ready).length,
-     text:(turns.at(-1)?.innerText||'').slice(-1600),user_count:users.length,user_text:userText};
- });
-}'''.replace('__DOM__',DOM_IMAGES_JS)
-
-DOWNLOAD_JS = r'''async page => {
+   const downloadPromise=page.waitForEvent('download',{timeout:25000});
+   const trigger=page.evaluate(async url=>{
+     const response=await fetch(url,{credentials:'same-origin',signal:AbortSignal.timeout(20000)});
+     if(!response.ok||new URL(response.url).origin!=='https://chatgpt.com'||new URL(response.url).pathname!=='/backend-api/estuary/content')throw Error('original_fetch_failed');
+     const blob=await response.blob();
+     if(!/^image\/(png|jpeg|webp)/i.test(blob.type)||!blob.size||blob.size>50*1024*1024)throw Error('original_type_or_size');
+     const href=URL.createObjectURL(blob),a=document.createElement('a');a.href=href;a.download='chatgpt-original';document.body.append(a);a.click();a.remove();
+     setTimeout(()=>URL.revokeObjectURL(href),60000);
+     return blob.size;
+   },source);
+   const [download]=await Promise.all([downloadPromise,trigger]);
+   if(await download.failure())throw Error('original_download_failed');
+   await download.saveAs(__TARGET__);
+   return {saved:true,method:'authenticated_original'};
+ } catch(error) {
+   // Unrecognized source layouts keep the original UI download as a fallback.
+ }
+ // Close a newer full-screen viewer as well as the older image editor.
+ const closeView=page.getByRole('button',{name:/^Close fullscreen view$|^关闭全屏视图$/});
+ if(await closeView.isVisible().catch(()=>false))await closeView.click({timeout:3000});
  const dialog=page.getByRole('dialog').filter({has:page.getByRole('button',{name:/^Save$|^保存$/})});
  if(await dialog.count()) {
    await dialog.getByRole('button',{name:/^Close$|^Close fullscreen view$|^关闭$|^关闭全屏视图$/}).click({timeout:10000});
@@ -696,7 +768,7 @@ DOWNLOAD_JS = r'''async page => {
  if(await download.failure())throw new Error('Image download failed');
  await download.saveAs(__TARGET__);
  return {saved:true};
-}'''.replace('__DOM__',DOM_IMAGES_JS)
+}'''.replace('__DOM__',DOM_IMAGES_JS).replace('__MODERN__',MODERN_DOWNLOAD_JS))
 
 
 def image_info(path):
@@ -718,6 +790,38 @@ def verify_outputs(job):
         target=Path(file['path'])
         if not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest()!=file['sha256']:
             raise ImageError('output_changed','A downloaded output is missing or changed; it will not be overwritten.')
+
+
+@contextlib.contextmanager
+def original_receiver(target):
+    """One bounded binary transfer on loopback; never expose cookies or image JSON."""
+    token=uuid.uuid4().hex+uuid.uuid4().hex
+    received=False
+    class Receiver(http.server.BaseHTTPRequestHandler):
+        def log_message(self,*args):pass
+        def do_POST(self):
+            nonlocal received
+            self.connection.settimeout(5)
+            if self.path!='/'+token or self.headers.get('Origin'):
+                self.send_error(403);return
+            if received:
+                self.send_error(409);return
+            try:size=int(self.headers.get('Content-Length','0'))
+            except ValueError:size=0
+            if not 0<size<=50*1024*1024:
+                self.send_error(413);return
+            raw=self.rfile.read(size)
+            if len(raw)!=size:
+                self.send_error(400);return
+            target.write_bytes(raw)
+            received=True
+            self.send_response(200);self.end_headers();self.wfile.write(b'ok')
+    server=http.server.HTTPServer(('127.0.0.1',0),Receiver)
+    thread=threading.Thread(target=lambda:server.serve_forever(poll_interval=.05),daemon=True)
+    thread.start()
+    try:yield 'http://127.0.0.1:'+str(server.server_port)+'/'+token
+    finally:
+        server.shutdown();server.server_close();thread.join(timeout=6)
 
 
 def download_asset(job, asset):
@@ -742,10 +846,18 @@ def download_asset(job, asset):
             if stem.with_suffix(extension).exists():
                 raise ImageError('output_exists','Refusing to overwrite an existing image.')
         temporary=stem.with_suffix('.download')
-        run_js(DOWNLOAD_JS.replace('__KEY__',json.dumps(asset['key'])).replace('__TARGET__',json.dumps(str(temporary))),timeout=55)
+        started=time.perf_counter()
+        with original_receiver(temporary) as endpoint:
+            method=run_js(DOWNLOAD_JS.replace('__KEY__',json.dumps(asset['key'])).replace('__TARGET__',json.dumps(str(temporary))).replace('__TRANSFER__',json.dumps(endpoint)).replace('__USED_ORIGINALS__',json.dumps([f['original_id'] for f in job['files'] if f.get('original_id')])),timeout=55)
+        job.setdefault('timings',{})['download_seconds']=round(job.get('timings',{}).get('download_seconds',0)+time.perf_counter()-started,3)
+        if isinstance(method,dict):job['timings']['download_method']=method.get('method','ui_original')
         extension,meta=image_info(temporary)
+        if isinstance(method,dict) and method.get('method') in {'authenticated_original','authenticated_gallery_original'} and (meta['width']<asset.get('width',0) or meta['height']<asset.get('height',0)):
+            raise ImageError('original_resolution_mismatch','Downloaded image is smaller than the observed asset; it is not accepted as an original.')
         target=stem.with_suffix(extension)
         record={'path':str(target.resolve()),**meta,'source_id':source_id,'index':plan['index']}
+        if isinstance(method,dict) and re.fullmatch(r'file[_-][A-Za-z0-9_-]+',method.get('original_id','')):
+            record['original_id']=method['original_id']
         plan['verified']=record
         save_job(job)  # recovery can recognize the final file after a crash during rename
         if target.exists():
@@ -753,6 +865,64 @@ def download_asset(job, asset):
         temporary.rename(target)
     job['files'].append(record)
     save_job(job)  # checkpoint every image, not just the final image
+
+
+# The ChatGPT page can finish an image on the server and still show "Thinking" forever:
+# right after submission it polls the new conversation, and when those reads are answered
+# with HTTP 429 it stops polling (observed 2026-09-27; the server held a finished
+# 1672x941 image while the page never rendered it). The page is therefore not the only
+# source of truth. After a grace period ask the server once, at a gentle cadence, and
+# reload the recorded conversation only when the server reports a finished image turn.
+SERVER_TRUTH_AFTER = 90
+SERVER_TRUTH_EVERY = (60, 120, 300)
+SERVER_TRUTH_RELOADS = 3
+SERVER_TRUTH_JS = r"""async page => page.evaluate(async id => {
+  const s = await (await fetch('/api/auth/session', {credentials: 'include'})).json();
+  const r = await fetch('/backend-api/conversation/' + id, {headers: {authorization: 'Bearer ' + s.accessToken}, credentials: 'include'});
+  if (!r.ok) return {http: r.status};
+  const c = await r.json();
+  const msgs = Object.values(c.mapping || {}).map(n => n.message).filter(Boolean)
+    .sort((a, b) => (a.create_time || 0) - (b.create_time || 0));
+  let lastUser = -1;
+  msgs.forEach((m, i) => { if (m.author?.role === 'user') lastUser = i; });
+  const turn = msgs.slice(lastUser + 1);
+  const images = turn.filter(m => m.author?.role === 'tool')
+    .flatMap(m => (m.content?.parts || []).filter(p => p && typeof p === 'object' && p.asset_pointer)).length;
+  const answer = turn.filter(m => m.author?.role === 'assistant').pop();
+  return {http: 200, images, finished: !!answer && answer.status === 'finished_successfully'};
+}, __ID__)"""
+WAIT_USER_MESSAGE_JS = r"""async page => {
+  await page.locator(':is([data-message-author-role="user"],[data-user-message-bubble])').last().waitFor({timeout:20000});
+  return true;
+}"""
+
+
+def server_truth_reload(job):
+    """Return a fresh POLL_JS result after reloading a stalled conversation, else None."""
+    now = time.time()
+    if now - job.get('wait_started_at', job['created_at']) < SERVER_TRUTH_AFTER or now < job.get('server_truth_next', 0):
+        return None
+    match = re.fullmatch(r'https://chatgpt\.com/c/([a-zA-Z0-9-]+)', job.get('conversation_url', ''))
+    if not match or job.get('server_truth_reloads', 0) >= SERVER_TRUTH_RELOADS:
+        return None
+    truth = run_js(SERVER_TRUTH_JS.replace('__ID__', json.dumps(match.group(1))))
+    truth = truth if isinstance(truth, dict) else {}
+    misses = job.get('server_truth_misses', 0)
+    if truth.get('http') != 200:
+        # A 429 here is the same pressure that stalled the page; back off, never hammer.
+        job['server_truth_misses'] = misses + 1
+        job['server_truth_next'] = now + SERVER_TRUTH_EVERY[min(misses + 1, len(SERVER_TRUTH_EVERY) - 1)]
+        job['server_truth'] = {'http': truth.get('http')}
+        return None
+    job['server_truth_misses'] = 0
+    job['server_truth_next'] = now + SERVER_TRUTH_EVERY[0]
+    job['server_truth'] = {'http': 200, 'finished': bool(truth.get('finished')), 'images': int(truth.get('images') or 0)}
+    if not (truth.get('finished') and truth.get('images')):
+        return None
+    job['server_truth_reloads'] = job.get('server_truth_reloads', 0) + 1
+    cli(['goto', job['conversation_url']])
+    run_js(WAIT_USER_MESSAGE_JS)
+    return run_js(POLL_JS)
 
 
 def poll(job_id):
@@ -772,7 +942,7 @@ def poll(job_id):
         if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',url) and browser['url']!=url:
             cli(['goto',url])
             run_js('''async page => {
-              await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+              await page.locator(':is([data-message-author-role="user"],[data-user-message-bubble])').last().waitFor({timeout:20000});
               return true;
             }''')
         result=run_js(POLL_JS)
@@ -785,7 +955,7 @@ def poll(job_id):
             if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',url):
                 cli(['goto',url])
                 run_js('''async page => {
-                  await page.locator('[data-message-author-role="user"]').last().waitFor({timeout:20000});
+                  await page.locator(':is([data-message-author-role="user"],[data-user-message-bubble])').last().waitFor({timeout:20000});
                   return true;
                 }''')
                 result=run_js(POLL_JS)
@@ -800,18 +970,40 @@ def poll(job_id):
                 return public_job(job)
             raise ImageError('conversation_changed','The browser contains a different prompt; do not download or resend. Open the recorded conversation and poll again.')
         job.pop('identity_retry',None)
-        if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',result['url']):
-            job['conversation_url']=result['url']
         # Deduplicate repeated DOM representations of the same generated asset.
         assets=list({a['key']:a for a in result['images']}.values())
         job['observed_count']=len(assets)
         pending=result.get('pending_images',0)
-        if not result['user_count'] or not assets or result['stop'] or pending:
+        if not result['user_count']:
+            # A logged-in shell is not proof that its conversation loaded. Bound
+            # this separately from the image-generation budget; never resend.
+            job.setdefault('unreadable_since',time.time())
+            job['operation_stage']='read_conversation'
+            if time.time()-job['unreadable_since']>=60:
+                job['status']='needs_attention'
+                job['error']={'code':'conversation_not_readable','message':'The recorded conversation has no readable user message after 60 seconds. Inspect page loading or DOM compatibility; the prompt has not been resent.'}
+            save_job(job)
+            return public_job(job)
+        job.pop('unreadable_since',None)
+        if re.fullmatch(r'https://chatgpt.com/c/[a-zA-Z0-9-]+',result['url']):
+            job['conversation_url']=result['url']
+        job['operation_stage']='observe_images'
+        if not assets or result['stop'] or pending:
+            fresh = server_truth_reload(job)
+            if fresh is not None:
+                result = fresh
+                assets = list({a['key']:a for a in result['images']}.values())
+                job['observed_count'] = len(assets)
+                pending = result.get('pending_images',0)
+        if not assets or result['stop'] or pending:
             if time.time()-job.get('wait_started_at',job['created_at'])>900:
                 job['status']='needs_attention'
                 job['error']={'code':'generation_wait_exceeded','message':'Generation has not settled after 15 minutes. Inspect the existing conversation; the prompt has not been resent.'}
+            # ChatGPT briefly renders an action footer before the generated image
+            # mounts. "Worked for ... / Edit" is UI chrome, never a text refusal.
+            reply=re.sub(r'(?im)^\s*(?:Worked for .*|Thought for .*|Edit|Preview|Copy|Share|已思考.*|编辑|预览)\s*$','',result.get('text','')).strip()
             if (not result['stop'] and result['user_count'] and not assets and not pending
-                    and result.get('turn_complete')):
+                    and result.get('turn_complete') and reply):
                 # ChatGPT finished answering and produced no image. Waiting the full
                 # observation budget here taught the caller nothing; its own words are
                 # the useful reply, so hand them over and let the caller adjust.
@@ -835,12 +1027,13 @@ def poll(job_id):
         if time.time()-job.get('stable_since',time.time())<settle_seconds:
             return public_job(job)
         job['status']='downloading'
+        job['operation_stage']='download_originals'
         save_job(job)
         # Bound each poll; subsequent polls resume from the per-file checkpoint.
         deadline=time.monotonic()+35
-        for asset in assets:
+        for index,asset in enumerate(assets):
             download_asset(job,asset)
-            if time.monotonic()>deadline:
+            if time.monotonic()>deadline and index<len(assets)-1:
                 return public_job(job)
         downloaded=len(job['files'])
         job['count_match']=downloaded==requested
@@ -888,14 +1081,18 @@ def compact_result(result,detail=False):
     return slim
 
 
-def status():
+def status(*, force_refresh=False):
     with locked():
-        result=ensure_browser(require_login=False)
+        result=ensure_browser(require_login=False,force_refresh=force_refresh)
         if result.get('logged_in'):
             cli(['state-save',str(DATA/'auth-state.json')])
         result['active_job']=active_job()
         result['window_hidden']=set_visible(False) if result.get('logged_in') else False
         return result
+
+
+def probe_rate_limit():
+    return status(force_refresh=True)
 
 
 def open_browser():
@@ -927,11 +1124,13 @@ def cancel(job_id):
             raise ImageError('job_not_active','This job does not own the browser.')
         ensure_browser()
         result=run_js(POLL_JS)
+        if not result['user_count']:
+            raise ImageError('conversation_not_readable','Cannot confirm the current prompt; refusing to stop an unidentified conversation.')
         if result['user_count'] and not identity_matches(job,result['user_text']):
             raise ImageError('conversation_changed','A different prompt is open; refusing to stop it.')
         if result['stop']:
             run_js('''async page => {
-              const stop=page.getByTestId('stop-button');
+              const stop=page.locator('[data-testid="stop-button"],button[aria-label="Stop generating"],button[aria-label="Stop streaming"],button[aria-label="Stop response"]').filter({visible:true}).first();
               await stop.click({timeout:10000});
               await stop.waitFor({state:'hidden',timeout:15000});
               return {stopped:true};

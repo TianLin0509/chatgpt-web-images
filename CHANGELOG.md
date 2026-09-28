@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.7.19
+
+- Cancelling a parked job finishes immediately. A parked job owns no browser page, so no worker ever claimed it to honour a cancel request; cancelled jobs on disabled lanes stayed parked forever and callers such as the weekly-report connectors kept polling them.
+
+## 0.7.18
+
+- The server, not only the page, decides whether an image turn has finished. After 90 s without rendered images a job asks the recorded conversation once (then every 60 s, backing off to 120/300 s on HTTP 429) and reloads the conversation, at most three times, only when the server reports a finished turn with image assets. Observed 2026-09-27: the page stayed on "Thinking" after its own reads were rate-limited while the server already held the finished 1672x941 image.
+
+## 0.7.17
+
+- A lane reuses its recorded tab whenever that tab still exists, instead of opening another one when the Hub's short health check misses it. Twenty-three ownerless ChatGPT tabs had accumulated in the Hub browser (12 stuck on a Cloudflare check), all polling the same login into HTTP 429.
+- The tab daemon records every tab it opens or reuses for a lane and every 10 minutes closes only those that no lane owns any more. Tabs it never registered (the user's, the Hub's, other tools') are never touched.
+
+## 0.7.16
+
+- Login detection accepts the Chinese profile-menu label. One account's tabs can render in different UI languages (a zh-CN tab loaded earlier beside a fresh en-US tab, observed 2026-09-27); the zh-CN tab was reported page_not_ready indefinitely.
+- An idle or new-task ChatGPT page that renders a non-English UI is reloaded once, so English control names used by the composer, tool and download steps match. A job's own conversation is never reloaded and nothing is submitted.
+
+## 0.7.15
+
+- Tab daemon survives failed steps. A failed step left an unobserved rejected promise on the lane chain, which terminates Node, so the first closed tab or page error took the shared connection down and every lane fell back to per-step attaches.
+
+## 0.7.14
+
+- An idle lane moves its own tab to about:blank once per idle period. A finished conversation left open kept polling ChatGPT; when those reads returned HTTP 429, every status check renewed the whole login's cooldown, so one idle tab stalled all lanes for hours (observed 2026-09-27: 429s only in the idle tab, none in the busy one).
+- HTTP 429 on reading a conversation other than the current one counts as background, not as a blocking rate limit. Submission-path and current-conversation 429s still block.
+
+## 0.7.13
+
+- Add a long-lived tab daemon per Hub identity (`tab_daemon.cjs`) and a drop-in lane entry (`tab_client.cjs`). Every lane still owns its own tab, so an identity keeps generating in parallel like a person with several ChatGPT tabs; only the browser connection is shared. The per-step transport attached Playwright to the whole Hub Chrome for every queue poll (measured 9-19 s per attach), which caused step timeouts and browser-wide refetch bursts that ended in HTTP 429. Steps now take about 0.2 s after one attach.
+- `use_tab_daemon.py --pool <pool>` switches Hub-bound lanes to the daemon and records the previous entry; `--revert` restores it. If the daemon is unreachable a step falls back to the Hub's own transport.
+
+## 0.7.12
+
+- Launch lane browsers with Chrome's background-safe switches (no timer throttling, no occluded-window backgrounding, no renderer backgrounding, Windows occlusion tracking off), so an off-screen lane runs at foreground speed instead of relying on per-step focus emulation.
+- Keep an idle lane's browser warm for 6 hours by default (`CHATGPT_WEB_IMAGES_IDLE_RELEASE_SECONDS`). Releasing after 5 minutes forced a cold Chrome/Cloudflare/ChatGPT start on most jobs, which is where most browser_timeout and browser_not_open failures occurred.
+
+## 0.7.11
+
+- Handle the observed hidden-but-focused Chrome state: temporarily emulate visibility for owned-page input even when document.hasFocus() remains true.
+
+
+## 0.7.10
+
+- Temporarily emulate focus only in the owned page during prompt input, image-tool selection and submission. Background polls stay passive; hidden composer menus work without waking other tabs.
+- Restore focus emulation and detach the scoped CDP session on success and error.
+
+
+## 0.7.9
+
+- After provider cooling, allow one lane to continue a real task under a durable exclusive lease, prioritizing live foreground jobs over parked retries. Keep the probe exclusive until a verified original is saved. A healthy homepage or accepted prompt no longer clears a blocked conversation. Rejected task probes retain 5/15/30-minute escalation instead of repeatedly resetting to five minutes.
+- Keep request identity, job failure count and parked recovery budget unchanged for HTTP 429. Explicit account checks report the shared wait without generating another provider request, including after its nominal deadline.
+- A new task verifies its own fresh composer, not a failed conversation left in the released lane. Authentication challenges retain priority and no prompt is resent by this preparation step.
+
+## 0.7.8
+
+- Load pending generated gallery assets eagerly in hidden/offscreen Chrome. This avoids waiting forever for lazy thumbnails while retaining hidden windows and checking exact prompt identity before downloading. User uploads and earlier turns are excluded; no window focus changes or prompt resubmission.
+- Finish an interrupted cold navigation when the already-owned tab is still `about:blank`, instead of waiting forever or creating another tab. Normal conversations and human authentication gates keep their existing behavior.
+
+## 0.7.7
+
+- Distinguish a throttled sidebar or background conversation refetch from a blocked generation. A rendered authenticated conversation remains observable and downloadable; prompt ownership is still checked before accepting images. Unreadable conversations and generation HTTP 429 retain shared cooldown.
+- Pair with the Hub browser transport fix using Playwright `noDefaults: true`: attaching to one owned tab must not simulate focus across every ChatGPT tab and trigger a refetch storm. No additional dependencies, account changes or prompt resubmission.
+
+## 0.7.6
+
+- Recognize observed ChatGPT HTTP 429 responses without sending an extra probe. Keep rate limits separate from sign-out and page loading.
+- Persist cooldown per login across workers and clients, with 5/15/30-minute backoff and one recovery probe. Concurrent reports coalesce and do not multiply the cooling period.
+- Retain queued, active and parked request identity during cooling; expose retry times and wait actions. Keep explicit browser opening available and stop batch summaries from calling parked work deliverable.
+
+## 0.7.5
+
+- Distinguish an authenticated page shell that has not loaded its composer from an explicit sign-in page. Report `page_not_ready` instead of falsely declaring the account logged out.
+- During a real task or explicit account check, refresh the same owned ChatGPT page once after the loading wait expires. Never resend its prompt; persistent loading remains bounded and retryable.
+- Recognize both current and legacy profile/composer elements directly in the shared account inspector.
+
+## 0.7.4
+
+- Support the current user-turn markup and generated-image galleries alongside legacy message nodes. Scope originals to the verified latest prompt, deduplicate preview/thumbnail copies and keep stable keys across page reloads.
+- Download verified gallery originals from the authenticated page, including fsns assets and cached responses with empty CDP bodies. Compare SHA-256 with the displayed asset, cache candidate hashes and return metadata only over MCP.
+- Bound unreadable-conversation waiting separately from generation; expose observation and download stages and refuse cancellation without prompt identity evidence.
+- Stop automatic idle health navigation and repeated login/challenge checks. Keep explicit account actions and bounded recovery for queued work. Poll idle local queues every three seconds.
+- Preserve generic stdio MCP, account separation, request deduplication, batch generation, references, continuations and checkpoints. Add real headless Chromium fixtures for gallery, download and recovery contracts.
+
+## 0.7.3
+
+- Save verified full-size generated assets from authenticated browser responses; preserve original bytes and retain UI fallback for unrecognized sources.
+- Exclude uploaded references and transient action-footer text from completion checks. Skip redundant cold navigation, observe generation every three seconds and complete immediately after the last saved image.
+- Retry transient Windows state-file sharing violations and keep health telemetry from terminating workers. Record preparation substeps and timing metadata.
+
 ## 0.7.2
 
 - Launch every lane window off screen. Hiding can only happen once a window exists, and reaching that point costs two child processes, so a cold lane used to flash on screen for seconds; with four lanes starting at once that was four windows. Measured with a 0.5s sampler over 150s of cold opens: 0 windows on screen, against 4 before.

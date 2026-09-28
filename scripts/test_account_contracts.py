@@ -13,6 +13,30 @@ SIGNED = dict(logged_in=True,account_chooser=False,challenge=False,auth_state='a
 
 
 class AccountContracts(unittest.TestCase):
+    def test_rate_limited_page_is_not_refreshed_or_called_signed_out(self):
+        state=dict(logged_in=False,auth_state='rate_limited',rate_limited=True)
+        with patch.object(w,'run_js',return_value=state) as js:r=w.safe_call(w.ensure_browser)
+        self.assertEqual(r['error']['code'],'rate_limited');self.assertEqual(js.call_count,1)
+
+    def test_stalled_shell_refreshes_once_without_signing_out_or_resending(self):
+        pending=dict(logged_in=False,auth_state='page_not_ready')
+        from chatgpt_account import RECOVER_LOADING_JS
+        with patch.object(w,'run_js',side_effect=[pending,pending,dict(SIGNED)]) as js:
+            self.assertTrue(w.ensure_browser()['logged_in'])
+        self.assertEqual(js.call_count,3);self.assertEqual(js.call_args.args[0],RECOVER_LOADING_JS)
+
+    def test_persistent_loading_is_retryable_and_refresh_is_bounded(self):
+        pending=dict(logged_in=False,auth_state='page_not_ready')
+        with patch.object(w,'run_js',return_value=pending) as js:
+            r=w.safe_call(w.ensure_browser)
+        self.assertEqual(r['error']['code'],'page_not_ready');self.assertEqual(js.call_count,3)
+
+    def test_explicit_check_can_report_unknown_after_one_loading_recovery(self):
+        pending=dict(logged_in=False,auth_state='page_not_ready')
+        with patch.object(w,'run_js',return_value=pending) as js:
+            r=w.ensure_browser(require_login=False)
+        self.assertEqual(r['auth_state'],'page_not_ready');self.assertEqual(js.call_count,3)
+
     def test_unauthorized_chooser_never_clicked(self):
         with patch.dict(w.SETTINGS,{},clear=True), patch.object(w,'run_js',return_value=dict(CHOOSER)) as js:
             response=w.safe_call(w.ensure_browser)

@@ -1,4 +1,16 @@
-# ChatGPT Web Images 0.7.2
+# ChatGPT Web Images 0.7.11
+
+Version 0.7.11 uses one real task as the exclusive recovery probe after cooling. A healthy homepage does not prove that conversation reads recovered. Rejected probes preserve escalating backoff, durable request identity and parked retry budget; a new task verifies its own composer rather than a failed old thread.
+
+Version 0.7.8 loads pending generated gallery assets in hidden/offscreen Chrome without changing window focus. Only the current turn's generated assets are touched; earlier turns and user uploads are excluded.
+
+Version 0.7.7 separates sidebar/background refetch throttling from blocked generation. Rendered conversations remain observable with exact prompt verification; unreadable pages and generation HTTP 429 still cool down. The companion Hub transport uses `noDefaults: true` so attaching does not simulate focus and refetch every ChatGPT tab.
+
+Version 0.7.6 observes existing HTTP 429 resource timing metadata and shares durable 5/15/30-minute cooling across all lanes of a login. Only one lane probes after a cooldown. Task identity is retained and progress reports the retry time; parked batches never imply that missing images were delivered.
+
+Version 0.7.5 distinguishes a loading shell from an explicit sign-in screen and permits one same-page refresh during a task or explicit account check, without resending the prompt.
+
+Version 0.7.4 supports current ChatGPT turns and multi-image galleries alongside legacy markup. It verifies original bytes before saving, preserves stable checkpoints across reloads, exposes bounded conversation-loading progress, and stops automatic idle login checks. Claude and Codex continue to share the same standard stdio MCP and durable queue. See CHANGELOG.md for details.
 
 Parallelism update: concurrency is the number of browser lanes, not the number of accounts. `account-scale --account-id primary --lanes 4` gives one signed-in login four isolated lanes that run in parallel, and `auto` work is balanced across logins so one account does not absorb a whole burst. An idle lane closes its browser after five minutes and reopens it from its persistent profile, because each open lane costs roughly 0.6 GB. Total lanes are capped at 16: the limit is the machine, not the website.
 
