@@ -34,7 +34,10 @@ STATE_FUNCTION = r'''() => {
      // images are already readable. Poll still verifies the exact prompt before
      // accepting any image. Generation and unreadable-page failures stay blocking.
      const readCurrent=current&&['/backend-api/conversations/','/backend-api/conversation/'].some(p=>u.pathname===p+current);
-     if(logged_in&&(u.pathname==='/backend-api/conversations'||(readCurrent&&rendered)))background_rate_limited=true;
+     // Reading some other conversation (a previous page in this tab) says nothing about
+     // whether this login can submit; counting it renewed the cooldown indefinitely.
+     const readOther=/^\/backend-api\/conversations?\/[^/]+$/.test(u.pathname)&&!readCurrent;
+     if(logged_in&&(u.pathname==='/backend-api/conversations'||readOther||(readCurrent&&rendered)))background_rate_limited=true;
      else rate_limited=true;
    } catch { /* Non-URL performance entries do not describe provider responses. */ }
  }

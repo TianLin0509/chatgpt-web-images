@@ -21,7 +21,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.13'
+VERSION = '0.7.14'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -461,6 +461,20 @@ def adopt(job_id):
             job['status'] = 'generating'
         save_job(job)
         return public_job(job)
+
+
+def leave_conversation():
+    """Move an idle lane's own tab to about:blank so a finished conversation stops polling."""
+    with locked():
+        if active_job():
+            return {'left': False, 'reason': 'job_active'}
+        try:
+            cli(['goto', 'about:blank'])
+        except ImageError as exc:
+            if exc.code in {'browser_not_open', 'browser_closed'}:
+                return {'left': False, 'reason': exc.code}
+            raise
+        return {'left': True}
 
 
 def release_browser():

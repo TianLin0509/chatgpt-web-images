@@ -59,6 +59,7 @@ class Worker:
         self.idle_since = time.monotonic()
         self.browser_released = False
         self.rate_probe = False
+        self.page_left = False
 
     def log(self, event, **fields):
         print(json.dumps({'event': event, 'at':time.time(), 'account_id': self.account_id, **fields}), flush=True)
@@ -149,6 +150,29 @@ class Worker:
         self.last_check = time.monotonic()
         return True
 
+    def leave_idle_conversation(self):
+        """Take an idle lane's tab off its last conversation, once per idle period.
+
+        A finished conversation left open keeps polling ChatGPT in the background. When
+        those reads were answered with HTTP 429 the lane's status check saw the 429 and
+        renewed the whole login's cooldown, so one idle tab could stall every lane for
+        hours (observed 2026-09-27). about:blank sends nothing to ChatGPT; the next job
+        navigates back through ensure_browser.
+        """
+        if self.page_left:
+            return
+        with self.pool.connect() as db:
+            busy = db.execute("SELECT 1 FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')",
+                              (self.account_id,)).fetchone()
+        if busy or not hasattr(self.runtime, 'leave_conversation'):
+            return
+        try:
+            result = self.runtime.leave_conversation()
+            self.log('conversation_left', left=result.get('left'), reason=result.get('reason'))
+        except Exception as exc:
+            self.log('conversation_leave_failed', error_code=error_value(exc)['code'])
+        self.page_left = True
+
     def release_idle_browser(self):
         """Hand an idle lane's memory back; work reopens the browser from the profile."""
         if self.browser_released or time.monotonic() - self.idle_since < IDLE_BROWSER_SECONDS:
@@ -205,6 +229,7 @@ class Worker:
             self.control_turn = False
             return
         self.control_turn = True
+        self.leave_idle_conversation()
         account = self.pool.account(self.account_id)
         cooldown=self.pool.cooldown(self.account_id)
         if cooldown:
@@ -241,6 +266,7 @@ class Worker:
             return
         self.idle_since = time.monotonic()
         self.browser_released = False
+        self.page_left = False
         if job['status'] == 'needs_attention' and not job['cancel_requested']:
             # Waiting for a human while holding the lane stalls every queued job behind
             # it. Park instead: same account, same conversation, no prompt resent.

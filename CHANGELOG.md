@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.14
+
+- An idle lane moves its own tab to about:blank once per idle period. A finished conversation left open kept polling ChatGPT; when those reads returned HTTP 429, every status check renewed the whole login's cooldown, so one idle tab stalled all lanes for hours (observed 2026-09-27: 429s only in the idle tab, none in the busy one).
+- HTTP 429 on reading a conversation other than the current one counts as background, not as a blocking rate limit. Submission-path and current-conversation 429s still block.
+
 ## 0.7.13
 
 - Add a long-lived tab daemon per Hub identity (`tab_daemon.cjs`) and a drop-in lane entry (`tab_client.cjs`). Every lane still owns its own tab, so an identity keeps generating in parallel like a person with several ChatGPT tabs; only the browser connection is shared. The per-step transport attached Playwright to the whole Hub Chrome for every queue poll (measured 9-19 s per attach), which caused step timeouts and browser-wide refetch bursts that ended in HTTP 429. Steps now take about 0.2 s after one attach.
