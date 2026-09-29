@@ -131,6 +131,22 @@ class HumanGateContracts(unittest.TestCase):
         self.assertIsNone(pool.alerts)
         self.assertEqual(pool.status()['human_action'], [])
 
+    def test_idle_lane_leaves_page_alone_while_person_uses_it(self):
+        left = []
+        for account in ('primary', 'secondary'):
+            self.runtimes[account].leave_conversation = lambda account=account: left.append(account) or {'left': True}
+        self.check('secondary')  # human gate pending
+        Worker(self.pool, 'secondary', self.runtimes['secondary']).leave_idle_conversation()
+        self.pool.control('primary', 'open')  # person asked to see this browser
+        with self.pool.connect() as db:
+            db.execute("UPDATE controls SET status='complete' WHERE account_id='primary'")
+        Worker(self.pool, 'primary', self.runtimes['primary']).leave_idle_conversation()
+        self.assertEqual(left, [])
+        with self.pool.connect() as db:
+            db.execute("UPDATE controls SET updated=updated-? WHERE account_id='primary'", (31 * 60,))
+        Worker(self.pool, 'primary', self.runtimes['primary']).leave_idle_conversation()
+        self.assertEqual(left, ['primary'])
+
     def test_toast_script_escapes_markup_and_quotes(self):
         script = human_gate.toast_script("a<b>&'c'", 'x"y')
         self.assertIn('a&lt;b&gt;&amp;', script)

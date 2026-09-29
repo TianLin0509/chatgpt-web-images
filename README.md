@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.21
+# ChatGPT Web Images 0.7.22
+
+0.7.22 空闲车道不再动"有人在用"的页面：账号待人工验证/登录时，或 30 分钟内刚被 `image_open` 打开过，worker 不会把它的标签页切到 `about:blank`。2026-09-29 实测：重启 worker 时把正在做 Cloudflare 验证和登录的副号页面切走了。
 
 0.7.21 修复安装包：wheel 漏打包 `chatgpt_interaction` 模块（自 0.7.10 起），pip 安装后命令一启动就报 `ModuleNotFoundError`。源码目录运行（插件部署方式）不受影响。CI 增加从已安装 wheel 导入的检查。
 

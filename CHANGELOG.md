@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.22
+
+- An idle lane no longer moves its tab to about:blank while a person is using it: while its login has a pending human gate, or for 30 minutes after an explicit `open`. Observed 2026-09-29: a restarted worker navigated the secondary lane away from the page where the user was completing the Cloudflare check and login.
+
 ## 0.7.21
 
 - The wheel ships `chatgpt_interaction`. It was missing from `py-modules` since 0.7.10, so every pip-installed command failed at start with `ModuleNotFoundError`; running from the source tree was unaffected, which is why CI (run from `scripts/`) never saw it. CI now imports every runtime module from the installed wheel outside the source tree.
