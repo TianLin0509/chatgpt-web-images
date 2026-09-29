@@ -23,6 +23,7 @@ jobs:
       - run: python scripts/test_throughput.py
       - run: python scripts/test_recovery_runtime.py
       - run: python scripts/test_poll_pressure.py
+      - run: python scripts/test_human_gate.py
       - run: python scripts/test_image_pool.py
       - run: python scripts/test_pool_protocol.py
       - run: python scripts/test_account_contracts.py

@@ -7,7 +7,7 @@ description: 使用用户自己的 ChatGPT 网页账号生成图片、制作参�
 
 通过已注册的 chatgpt-web-images MCP 调用，Claude、Codex 等客户端使用相同协议。不要另写浏览器脚本或后台轮询脚本。
 
-1. 首次使用调用 `image_status`，读取账号健康、活动任务和最近账号操作结果，不访问网页。未登录时 `image_open(account_id)`；用户登录后 `image_account_check(account_id)`，再查看 status。账号操作返回 queued 只表示已接收。
+1. 首次使用调用 `image_status`，读取账号健康、活动任务和最近账号操作结果，不访问网页。未登录时 `image_open(account_id)`；用户登录后 `image_account_check(account_id)`，再查看 status。账号操作返回 queued 只表示已接收。status 的 `human_action` 列出需要人处理的登录（验证、登录失效等，Windows 通知也已提醒用户），把其中的 next_action 转告用户；`egress_changed=true` 说明出口 IP 变了，一并告诉用户。
 2. 要在之前某张图的基础上修改（改配色、换标题、保持版式微调），传 `continue_from=<该任务的 job_id>`，追问会发进原对话，ChatGPT 仍看得见那些图；不相关的新图不要带 `continue_from`。同一对话同时只允许一个追问在跑，它会自动落到拥有该对话的账号的任意空闲车道。
    长提示词保存为带日期、任务标识的 UTF-8 文件。`image_generate(prompt_file=绝对路径, count=张数, request_id=全局唯一任务标识, output_dir=绝对路径, name=任务名, account_id="auto")`。prompt 与 prompt_file 二选一；reference_images 接受至多五个 PNG/JPEG/WebP 绝对路径，排队期间保持文件不变。
 3. count=1..20 是**一次网页请求**产出的图片数量，不是账号并发数或额度保证。遵从指定张数，多图要求独立附件，不能用拼图或裁切代替，不静默压缩或降低要求。

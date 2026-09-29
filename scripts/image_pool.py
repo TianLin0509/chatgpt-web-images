@@ -17,6 +17,7 @@ import asyncio
 
 import web_images as w
 import image_limits
+import human_gate
 
 TERMINAL = w.TERMINAL | {'cancelled'}
 LIVE = ('dispatching', 'running', 'needs_attention')
@@ -55,7 +56,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.19'
+VERSION = '0.7.20'
 
 
 @contextlib.contextmanager
@@ -93,8 +94,10 @@ def identifier(value):
 
 
 class Pool:
-    def __init__(self, root=None):
+    def __init__(self, root=None, alerts=None):
         self.root = Path(root or pool_root()).resolve()
+        # Only the worker process passes alerts; clients and tests never raise toasts.
+        self.alerts = alerts
         self.root.mkdir(parents=True, exist_ok=True)
         self.db = self.root / 'queue.sqlite3'
         with self.connect() as db:
@@ -673,6 +676,11 @@ class Pool:
         with self.connect() as db:
             db.execute('UPDATE accounts SET state=?,ready=?,error=?,updated=? WHERE id=?',
                        (state, int(ready), json.dumps(error) if error else None, time.time(), account_id))
+        if self.alerts:
+            try:
+                self.alerts.observe(account_id, login_group(self.account(account_id)), state, ready, error)
+            except Exception:
+                pass  # an alert must never cost a lane its state transition
 
     def heartbeat(self, account_id):
         with self.connect() as db:
@@ -753,7 +761,12 @@ class Pool:
             slot['usable_lanes'] += bool(account['enabled'] and account['ready'] and account['worker_alive'] and not account['worker_stalled'])
             slot['busy_lanes'] += bool(account['active_job_id'])
             slot['parked_jobs'] += account['parked_jobs']
+        try:
+            gates, egress_ok = human_gate.GateBook(self.root).summary()
+        except OSError:
+            gates, egress_ok = [], None
         return {'ok': True, 'service': 'local-durable-pool', 'version': VERSION, 'accounts': accounts, 'jobs': counts,
+                'human_action': gates, 'egress_last_ok': egress_ok,
                 'logins': sorted(groups.values(), key=lambda g: g['login_group']),
                 'configured_capacity': sum(bool(a['enabled']) for a in accounts),
                 'parallel_capacity': sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and not a['worker_stalled'] and a['active_job_status'] != 'needs_attention') for a in accounts)}

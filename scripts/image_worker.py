@@ -12,6 +12,7 @@ import sqlite3
 
 import web_images as w
 from image_pool import ADOPT_BACKOFF, PARK_AFTER_SECONDS, PARKED, Pool, TERMINAL, VERSION
+import human_gate
 
 # Waiting for generation is minutes long, so tick fast only when something can change.
 IDLE_TICK, WATCH_TICK = 1, 3
@@ -22,6 +23,10 @@ RECHECK_BACKOFF = (60, 300, 900)
 # failures happened. With one lane per account the memory saved is small, so an idle
 # lane now keeps its warm browser for hours; set the variable to trade memory back.
 IDLE_BROWSER_SECONDS = int(os.environ.get('CHATGPT_WEB_IMAGES_IDLE_RELEASE_SECONDS') or 6 * 3600)
+# A lock held a little longer than busy_timeout says nothing about the account. Observed
+# 2026-09-29: one SQLITE_BUSY tick marked all eight lanes worker_error at the same second,
+# parallel_capacity dropped to 0 and the secondary login's Cloudflare gate was overwritten.
+TRANSIENT_SQLITE = {'SQLITE_BUSY', 'SQLITE_LOCKED', 'SQLITE_BUSY_SNAPSHOT', 'SQLITE_LOCKED_SHAREDCACHE'}
 
 
 @contextlib.contextmanager
@@ -323,9 +328,24 @@ class Worker:
                 self.pool.account_state(self.account_id, error['code'], False, error)
 
 
+def mark_worker_error(pool, account_id, error):
+    """Take a lane offline for a real worker fault, not for a busy database or over a human gate."""
+    if error.get('sqlite_error') in TRANSIENT_SQLITE:
+        return False
+    try:
+        account = pool.account(account_id)
+    except Exception:
+        return False
+    if human_gate.gate_code(account['state'], account.get('error')):
+        return False
+    pool.account_state(account_id, 'worker_error', False, error)
+    return True
+
+
 def main():
     account_id = sys.argv[1]
     pool = Pool()
+    pool.alerts = human_gate.Alerts(pool.root)
     account = pool.account(account_id)
     if Path(account['data_dir']).resolve() != w.DATA.resolve():
         raise RuntimeError('Worker account environment mismatch')
@@ -374,7 +394,7 @@ def main():
                 except Exception as exc:
                     error = error_value(exc)
                     print(json.dumps({'event': 'tick_error', 'error': error}), flush=True)
-                    pool.account_state(account_id, 'worker_error', False, error)
+                    mark_worker_error(pool, account_id, error)
                 finally:
                     health['tick_finished'] = time.time()
                     try:w.write_json(health_path, health)
