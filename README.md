@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.20
+# ChatGPT Web Images 0.7.21
+
+0.7.21 修复安装包：wheel 漏打包 `chatgpt_interaction` 模块（自 0.7.10 起），pip 安装后命令一启动就报 `ModuleNotFoundError`。源码目录运行（插件部署方式）不受影响。CI 增加从已安装 wheel 导入的检查。
 
 0.7.20 需要人处理时主动告诉你。某个登录卡在 Cloudflare 真人验证、登录失效、要输密码或选账号时，按登录身份只弹一条 Windows 通知（不抢焦点；未处理 2 小时后再提醒一次），并记下当时 chatgpt.com 看到的出口 IP。`image_status` 新增 `human_action`（谁要处理、怎么处理、出口 IP 是否比上次正常时变了）和 `egress_last_ok`。出口 IP 走系统代理测量，与 Chrome 同一路径，每小时最多一次，只访问 Cloudflare 的 `/cdn-cgi/trace`，不碰车道页面。设 `CHATGPT_WEB_IMAGES_NOTIFY=0` 可关闭通知。瞬时的数据库忙（`SQLITE_BUSY`）不再把车道标成 `worker_error`，也不再覆盖"待人工验证"状态：2026-09-29 实测一次瞬时忙让 8 条车道同时下线、并行能力归零，副号的验证状态也被抹掉。本工具不绕过验证，验证仍由你在专属浏览器里完成。
 
