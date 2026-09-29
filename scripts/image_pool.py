@@ -56,7 +56,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.20'
+VERSION = '0.7.21'
 
 
 @contextlib.contextmanager

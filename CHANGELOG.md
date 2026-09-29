@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.21
+
+- The wheel ships `chatgpt_interaction`. It was missing from `py-modules` since 0.7.10, so every pip-installed command failed at start with `ModuleNotFoundError`; running from the source tree was unaffected, which is why CI (run from `scripts/`) never saw it. CI now imports every runtime module from the installed wheel outside the source tree.
+
 ## 0.7.20
 
 - A login that needs a person (Cloudflare check, expired login, password prompt, account chooser) is announced once per login with a Windows toast that does not take focus, again after 2 hours if still unhandled, and cleared when the login authenticates. Observed 2026-09-27: the secondary login sat on a Cloudflare check for two days unnoticed.
