@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.20
+
+- A login that needs a person (Cloudflare check, expired login, password prompt, account chooser) is announced once per login with a Windows toast that does not take focus, again after 2 hours if still unhandled, and cleared when the login authenticates. Observed 2026-09-27: the secondary login sat on a Cloudflare check for two days unnoticed.
+- `image_status` adds `human_action` (login, gate, account, next action, egress at the gate, whether it differs from the last working egress) and `egress_last_ok`. Egress comes from Cloudflare's `/cdn-cgi/trace` on chatgpt.com over the Windows system proxy Chrome uses, at most once an hour while healthy; lane pages are never probed. `CHATGPT_WEB_IMAGES_NOTIFY=0` disables toasts.
+- A transient `SQLITE_BUSY`/`SQLITE_LOCKED` tick error no longer marks the lane `worker_error`, and no worker error overwrites a pending human gate. Observed 2026-09-29: one busy tick took all eight lanes offline at the same second (parallel capacity 0) and erased the secondary login's Cloudflare state.
+
 ## 0.7.19
 
 - Cancelling a parked job finishes immediately. A parked job owns no browser page, so no worker ever claimed it to honour a cancel request; cancelled jobs on disabled lanes stayed parked forever and callers such as the weekly-report connectors kept polling them.
