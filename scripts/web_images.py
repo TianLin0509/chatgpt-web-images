@@ -21,7 +21,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.21'
+VERSION = '0.7.22'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 

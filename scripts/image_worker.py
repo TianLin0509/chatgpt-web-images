@@ -26,6 +26,8 @@ IDLE_BROWSER_SECONDS = int(os.environ.get('CHATGPT_WEB_IMAGES_IDLE_RELEASE_SECON
 # A lock held a little longer than busy_timeout says nothing about the account. Observed
 # 2026-09-29: one SQLITE_BUSY tick marked all eight lanes worker_error at the same second,
 # parallel_capacity dropped to 0 and the secondary login's Cloudflare gate was overwritten.
+# After an explicit open the person may still be signing in; leave their page alone.
+PERSON_OPEN_SECONDS = 30 * 60
 TRANSIENT_SQLITE = {'SQLITE_BUSY', 'SQLITE_LOCKED', 'SQLITE_BUSY_SNAPSHOT', 'SQLITE_LOCKED_SHAREDCACHE'}
 
 
@@ -171,12 +173,29 @@ class Worker:
                               (self.account_id,)).fetchone()
         if busy or not hasattr(self.runtime, 'leave_conversation'):
             return
+        if self.person_on_page():
+            return  # re-evaluated next tick; leave once the person is done
+
         try:
             result = self.runtime.leave_conversation()
             self.log('conversation_left', left=result.get('left'), reason=result.get('reason'))
         except Exception as exc:
             self.log('conversation_leave_failed', error_code=error_value(exc)['code'])
         self.page_left = True
+
+    def person_on_page(self):
+        """The lane's page is being used by a person: a pending human gate, or a recent open.
+
+        Observed 2026-09-29: a restarted worker moved the secondary lane's tab to
+        about:blank while the user was completing its Cloudflare check and login.
+        """
+        account = self.pool.account(self.account_id)
+        if human_gate.gate_code(account['state'], account.get('error')):
+            return True
+        with self.pool.connect() as db:
+            last = db.execute('SELECT action,updated FROM controls WHERE account_id=? ORDER BY created DESC LIMIT 1',
+                              (self.account_id,)).fetchone()
+        return bool(last and last['action'] == 'open' and time.time() - last['updated'] < PERSON_OPEN_SECONDS)
 
     def release_idle_browser(self):
         """Hand an idle lane's memory back; work reopens the browser from the profile."""
