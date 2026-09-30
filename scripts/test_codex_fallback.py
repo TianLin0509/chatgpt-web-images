@@ -34,6 +34,8 @@ class CodexFallbackContracts(unittest.TestCase):
         self.runtime = FakeRuntime(data)
         self.out = self.root / 'out'
         self.calls = []
+        import threading
+        self.calls_lock = threading.Lock()
 
     def alive(self):
         w.write_json(self.pool.root / 'codex-lane-health.json', {'beat': time.time(), 'pid': 1})
@@ -49,11 +51,12 @@ class CodexFallbackContracts(unittest.TestCase):
         Path(kw['output_dir']).mkdir(parents=True, exist_ok=True)
         files = []
         for i in range(kw['count']):
-            target = Path(kw['output_dir']) / f"{kw['job_id']}-{kw['name']}-{i + 1:02d}.png"
+            target = Path(kw['output_dir']) / f"{kw['job_id']}-{kw['name']}-{i + kw.get('first_index', 1):02d}.png"
             target.write_bytes(b'png-' + str(i).encode())
             files.append({'path': str(target), 'width': 1536, 'height': 1024, 'bytes': target.stat().st_size,
                           'sha256': hashlib.sha256(target.read_bytes()).hexdigest()})
-        self.calls.append(kw)
+        with self.calls_lock:
+            self.calls.append(kw)
         return {'job_id': kw['job_id'], 'status': 'complete', 'files': files, 'provider': cx.PROVIDER, 'count_match': True}
 
     def run_lane(self, generate=None):
@@ -256,6 +259,117 @@ class CodexFallbackContracts(unittest.TestCase):
     def test_status_reports_the_lane(self):
         status = self.pool.status()['codex_fallback']
         self.assertEqual((status['enabled'], status['alive'], status['parallel']), (True, True, 2))
+
+
+class CodexFanOutContracts(CodexFallbackContracts):
+    """Every image of a job is its own Codex run, in parallel within the lane's slots."""
+
+    def test_a_four_image_job_draws_four_single_images_in_parallel(self):
+        import threading
+        active, peak, gate = [0], [0], threading.Lock()
+        def tracked(**kw):
+            with gate:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.3)
+            try:
+                return self.fake_generate(**kw)
+            finally:
+                with gate:
+                    active[0] -= 1
+        self.enable(parallel=8)
+        job_id = self.pool.submit(prompt='Four mocks.', output_dir=str(self.out), request_id='four', count=4)['job_id']
+        self.pool.fallback(job_id)
+        self.run_lane(tracked)
+        result = self.pool.get(job_id)
+        self.assertEqual((result['status'], len(result['files'])), ('complete', 4))
+        self.assertEqual(sorted(c['count'] for c in self.calls), [1, 1, 1, 1])
+        self.assertEqual(sorted(c['variant'] for c in self.calls), [(1, 4), (2, 4), (3, 4), (4, 4)])
+        self.assertEqual(len({f['path'] for f in result['files']}), 4, 'distinct file names')
+        self.assertEqual(peak[0], 4, 'all four drew at the same time')
+
+    def test_slots_bound_concurrent_runs_across_jobs(self):
+        import threading
+        active, peak, gate = [0], [0], threading.Lock()
+        def tracked(**kw):
+            with gate:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.2)
+            try:
+                return self.fake_generate(**kw)
+            finally:
+                with gate:
+                    active[0] -= 1
+        self.enable(parallel=3)
+        ids = [self.pool.submit(prompt='x', output_dir=str(self.out), request_id='j%d' % i, count=2)['job_id'] for i in range(3)]
+        for job_id in ids:
+            self.pool.fallback(job_id)
+        lane = CodexLane(self.pool, fallback_settings(self.pool.root), generate=tracked)
+        lane.tick()
+        self.assertEqual(len(lane.running), 2, 'a third job waits in the queue while slots are reserved')
+        for _ in range(40):
+            for t in list(lane.running.values()):
+                t.join(5)
+            lane.tick()
+            if all(self.pool.row(j)['status'] == 'complete' for j in ids):
+                break
+        self.assertTrue(all(self.pool.row(j)['status'] == 'complete' for j in ids))
+        self.assertLessEqual(peak[0], 3)
+
+    def test_a_partial_failure_delivers_what_was_drawn(self):
+        def flaky(**kw):
+            if kw['first_index'] == 2:
+                raise cx.CodexImageError('codex_no_image', 'none')
+            return self.fake_generate(**kw)
+        job_id = self.pool.submit(prompt='x', output_dir=str(self.out), request_id='flaky', count=3)['job_id']
+        self.pool.fallback(job_id)
+        self.run_lane(flaky)
+        result = self.pool.get(job_id)
+        self.assertEqual((result['status'], len(result['files'])), ('count_mismatch', 2))
+
+    def test_progress_is_visible_while_other_images_are_still_drawing(self):
+        import threading
+        release = threading.Event()
+        def staged(**kw):
+            if kw['first_index'] == 2:
+                release.wait(5)
+            return self.fake_generate(**kw)
+        job_id = self.pool.submit(prompt='x', output_dir=str(self.out), request_id='stage', count=2)['job_id']
+        self.pool.fallback(job_id)
+        lane = CodexLane(self.pool, fallback_settings(self.pool.root), generate=staged)
+        lane.tick()
+        for _ in range(50):
+            if self.pool.get(job_id)['downloaded_count'] == 1:
+                break
+            time.sleep(0.1)
+        mid = self.pool.get(job_id)
+        self.assertEqual((mid['status'], mid['downloaded_count']), ('running', 1))
+        release.set()
+        for t in list(lane.running.values()):
+            t.join(5)
+        self.assertEqual(self.pool.get(job_id)['downloaded_count'], 2)
+
+    def test_runs_waiting_for_a_slot_do_not_start_after_a_cancel(self):
+        import threading
+        self.enable(parallel=1)
+        started = []
+        job_id = self.pool.submit(prompt='x', output_dir=str(self.out), request_id='cancel-queue', count=3)['job_id']
+        self.pool.fallback(job_id)
+        def first_cancels(**kw):
+            started.append(kw['first_index'])
+            self.pool.cancel(job_id)
+            return self.fake_generate(**kw)
+        self.run_lane(first_cancels)
+        self.assertEqual(len(started), 1, 'queued runs saw the cancel and never started')
+        self.assertEqual(self.pool.row(job_id)['status'], 'cancelled')
+
+    def test_fanout_can_be_switched_off(self):
+        self.enable(fanout=False)
+        job_id = self.pool.submit(prompt='x', output_dir=str(self.out), request_id='one-run', count=3)['job_id']
+        self.pool.fallback(job_id)
+        self.run_lane()
+        self.assertEqual([c['count'] for c in self.calls], [3])
 
 
 class CodexRunnerContracts(unittest.TestCase):
@@ -484,9 +598,10 @@ class CodexFirstContracts(CodexFallbackContracts):
 
 # CodexFirstContracts reuses the fixture only; the web-first contracts above assert the
 # opposite routing on purpose and run in their own class.
-for _name in [n for n in vars(CodexFallbackContracts) if n.startswith('test_')]:
-    if _name not in vars(CodexFirstContracts):
-        setattr(CodexFirstContracts, _name, None)
+for _cls in (CodexFirstContracts, CodexFanOutContracts):
+    for _name in [n for n in vars(CodexFallbackContracts) if n.startswith('test_')]:
+        if _name not in vars(_cls):
+            setattr(_cls, _name, None)
 
 
 if __name__ == '__main__':

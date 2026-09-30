@@ -71,7 +71,7 @@ def command(configured=None):
     return [shim]
 
 
-def prompt_for(prompt, count, has_references):
+def prompt_for(prompt, count, has_references, variant=None):
     lines = [
         f'Use your built-in image_gen tool to create exactly {count} separate image{"s" if count > 1 else ""}.',
         'Use only the built-in image_gen tool. Do not run scripts or commands, do not use any API or CLI image path, '
@@ -79,6 +79,10 @@ def prompt_for(prompt, count, has_references):
     ]
     if count > 1:
         lines.append('Make each image a distinct composition that follows the same request.')
+    if variant:
+        # Parallel runs cannot see each other; name the variant so they do not converge.
+        lines.append(f'This is option {variant[0]} of {variant[1]} made in parallel for the same request; '
+                     'give it its own distinct composition, layout or viewpoint.')
     if has_references:
         lines.append('The attached images are references for this request.')
     lines += ['', 'Request:', prompt.strip(), '', 'When done, reply with one line per generated image file path.']
@@ -165,7 +169,7 @@ def image_size(path):
 
 
 def generate(*, prompt, count, output_dir, name, job_id, codex_home, work_dir, references=(),
-             codex_command=None, timeout=None, cancelled=lambda: False, run=default_runner):
+             codex_command=None, timeout=None, cancelled=lambda: False, run=default_runner, first_index=1, variant=None):
     """Generate `count` images and copy them into output_dir. Returns a job-shaped result."""
     codex_home = Path(codex_home)
     check_home(codex_home)
@@ -180,7 +184,7 @@ def generate(*, prompt, count, output_dir, name, job_id, codex_home, work_dir, r
     argv.append('-')
     started = time.time()
     limit = timeout or min(MAX_SECONDS, BASE_SECONDS + PER_IMAGE_SECONDS * count)
-    returncode, stdout, outcome = run(argv, input=prompt_for(prompt, count, bool(references)), env=environment(codex_home),
+    returncode, stdout, outcome = run(argv, input=prompt_for(prompt, count, bool(references), variant), env=environment(codex_home),
                                       cwd=str(work_dir), timeout=limit, cancelled=cancelled, log_dir=work_dir)
     thread, usage, failure = parse_events(stdout)
     generated = []
@@ -196,7 +200,7 @@ def generate(*, prompt, count, output_dir, name, job_id, codex_home, work_dir, r
         detail = failure if failure else f'exit {returncode}'
         raise CodexImageError('codex_no_image', f'Codex returned no generated image ({str(detail)[:300]}).')
     files = []
-    for index, source in enumerate(generated[:count], 1):
+    for index, source in enumerate(generated[:count], first_index):
         target = output_dir / f'{job_id}-{name}-{index:02d}{source.suffix.lower()}'
         shutil.copy2(source, target)
         data = target.read_bytes()

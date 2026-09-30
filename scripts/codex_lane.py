@@ -82,6 +82,10 @@ class CodexLane:
         self.running = {}
         self.lock = threading.Lock()
         self.failures, self.degraded_until = 0, 0.0
+        # Image runs reserved per job and the slots they draw in (one Codex process each).
+        self.parallel = max(1, int(settings.get('parallel', 3)))
+        self.slots = threading.BoundedSemaphore(self.parallel)
+        self.reservations = {}
 
     def outcome(self, ok):
         with self.lock:
@@ -103,6 +107,22 @@ class CodexLane:
             return last['value']
         return cancelled
 
+    def reserve(self, job_id, runs):
+        with self.lock:
+            self.reservations[job_id] = self.reservations.get(job_id, 0) + runs
+
+    def release(self, job_id, runs=1):
+        with self.lock:
+            left = self.reservations.get(job_id, 0) - runs
+            if left > 0:
+                self.reservations[job_id] = left
+            else:
+                self.reservations.pop(job_id, None)
+
+    def reserved(self):
+        with self.lock:
+            return sum(self.reservations.values())
+
     def run_job(self, job):
         try:
             self._run(job)
@@ -111,6 +131,65 @@ class CodexLane:
         finally:
             with self.lock:
                 self.running.pop(job['id'], None)
+                self.reservations.pop(job['id'], None)
+
+    def produce(self, job_id, payload, references, base):
+        """All images of one job. By default every image is its own Codex run, in parallel
+        within the lane's slots (one run draws its images one after another: 2 images took
+        261 s, while two single-image runs side by side took 112 s and 122 s). Each finished
+        image is saved into the job at once, so a poll shows the count rising."""
+        count, name = payload['count'], payload.get('name') or 'image'
+        common = dict(prompt=payload['prompt'], output_dir=payload['output_dir'], name=name, job_id=job_id,
+                      codex_home=self.settings['codex_home'], references=references,
+                      codex_command=self.settings.get('codex_command'), cancelled=self.cancel_watch(job_id))
+        work = self.pool.root / 'codex-work' / job_id
+        if count == 1 or not self.settings.get('fanout', True):
+            try:
+                with self.slots:
+                    return self.generate(**common, count=count, work_dir=work)
+            finally:
+                self.release(job_id, 1)
+        files, errors, guard, save_lock = [], [], threading.Lock(), threading.Lock()
+        started = time.time()
+        def one(index):
+            try:
+                with self.slots:
+                    # A run that waited for a slot rechecks the cancel flag itself (the shared
+                    # watcher caches it for a few seconds) before starting a Codex process.
+                    if self.pool.row(job_id)['cancel_requested']:
+                        raise cx.CodexImageError('codex_cancelled', 'The job was cancelled before this image started.')
+                    result = self.generate(**common, count=1, work_dir=work / str(index), first_index=index,
+                                           variant=(index, count))
+                with guard:
+                    files.extend(result['files'])
+                # Snapshot and write under one lock so the stored count only ever grows.
+                with save_lock:
+                    with guard:
+                        progress = sorted(files, key=lambda f: f['path'])
+                    with contextlib.suppress(Exception):  # progress is cosmetic; the image is kept
+                        durable(lambda: self.pool.save_result(job_id, {**base, 'status': 'generating', 'files': progress}, 'codex-' + job_id))
+            except cx.CodexImageError as exc:
+                with guard:
+                    errors.append(exc)
+            except Exception as exc:
+                with guard:
+                    errors.append(cx.CodexImageError('codex_error', type(exc).__name__))
+            finally:
+                self.release(job_id, 1)
+        threads = [threading.Thread(target=one, args=(i,), daemon=True) for i in range(1, count + 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if not files:
+            cancelled = [e for e in errors if e.code == 'codex_cancelled']
+            raise (cancelled or errors or [cx.CodexImageError('codex_no_image', 'Codex returned no image.')])[0]
+        files.sort(key=lambda f: f['path'])
+        return {'job_id': job_id, 'status': 'complete' if len(files) == count else 'count_mismatch', 'files': files,
+                'provider': cx.PROVIDER, 'image_model_verified': False, 'requested_count': count,
+                'observed_count': len(files), 'count_match': len(files) == count, 'parallel_runs': count,
+                'seconds': round(time.time() - started, 1),
+                **({'run_errors': sorted({e.code for e in errors})} if errors else {})}
 
     def _run(self, job):
         job_id = job['id']
@@ -126,11 +205,7 @@ class CodexLane:
         durable(lambda: self.pool.save_result(job_id, {**base, 'status': 'generating', 'files': []}, 'codex-' + job_id))
         self.log('codex_started', job_id=job_id, count=payload['count'], fallback_from=origin)
         try:
-            result = self.generate(prompt=payload['prompt'], count=payload['count'], output_dir=payload['output_dir'],
-                                   name=payload.get('name') or 'image', job_id=job_id,
-                                   codex_home=self.settings['codex_home'], work_dir=self.pool.root / 'codex-work' / job_id,
-                                   references=references, codex_command=self.settings.get('codex_command'),
-                                   cancelled=self.cancel_watch(job_id))
+            result = self.produce(job_id, payload, references, base)
         except cx.CodexImageError as exc:
             if exc.code not in ('codex_cancelled', 'reference_changed'):
                 self.outcome(False)
@@ -169,12 +244,15 @@ class CodexLane:
             self.pool.expire_handbacks(3 * float(self.settings.get('queue_wait_seconds', 90)))
         if time.time() < self.degraded_until:
             return  # breaker open: the web serves everything until it closes
-        with self.lock:
-            free = max(0, int(self.settings.get('parallel', 3)) - len(self.running))
-        for _ in range(free):
+        # `parallel` counts Codex processes (images being drawn), shared by all jobs. A job is
+        # taken only while slots are free, so waiting work stays visible in the queue.
+        fanout = self.settings.get('fanout', True)
+        while self.reserved() < self.parallel:
             job = self.pool.claim_codex(float(self.settings.get('queue_wait_seconds', 90)), exclude=set(self.running), first=first)
             if not job:
                 break
+            runs = json.loads(job['payload'])['count'] if fanout else 1
+            self.reserve(job['id'], runs)
             thread = threading.Thread(target=self.run_job, args=(job,), daemon=True)
             with self.lock:
                 self.running[job['id']] = thread

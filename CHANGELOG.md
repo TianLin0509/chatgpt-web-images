@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.26
+
+- Per-image parallelism on the Codex lane: a job of N images becomes N single-image runs in parallel, each prompted as option i of N so the options differ. `parallel` now counts Codex processes shared by all jobs; a job is claimed only while slots are free. Finished images are written into the job one by one; a partial failure delivers what was drawn (`count_mismatch`). Measured 2026-09-30: two 4-image jobs with 8 runs side by side finished 8/8 in about 200 s, no rate limit; one run drawing several images had taken 261-744 s. `"fanout": false` keeps one run per job.
+
 ## 0.7.25
 
 - Codex first: `"prefer": "codex"` in `codex-fallback.json` (the owner's choice 2026-09-30 after the web lanes kept stalling: stable generation over token cost). New work goes to Codex at once; web lanes take only explicit account pins and hand-backs. A Codex failure gets one web attempt (follow-up images passed as references) and never bounces back; a hand-back no web lane takes within three queue waits fails with the Codex reason. Without a running lane the web serves everything as before.
