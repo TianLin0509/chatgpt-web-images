@@ -135,6 +135,25 @@ class CodexFallbackContracts(unittest.TestCase):
         self.assertEqual((row['status'], row['preferred']), ('queued', CODEX_LANE))
         self.assertEqual(self.pool.get(job_id)['fallback_from'], 'browser_challenge')
 
+    def test_parked_jobs_of_a_lane_waiting_for_a_person_go_to_codex(self):
+        job_id = self.submit()
+        self.pool.claim('primary')
+        with self.pool.connect() as db:
+            db.execute("UPDATE jobs SET status='parked',runtime_id='rt',park_count=0,retry_after=0 WHERE id=?", (job_id,))
+        self.assertIsNone(self.pool.claim_codex(90), 'a healthy lane re-opens its own parked job')
+        self.pool.account_state('primary', 'browser_challenge', False)
+        claimed = self.pool.claim_codex(90)
+        self.assertEqual(claimed['id'], job_id)
+        self.assertEqual((claimed['runtime_id'], json.loads(claimed['result'])['fallback_from']), (None, 'web_unavailable'))
+
+    def test_old_or_imaged_parked_jobs_are_left_alone(self):
+        old, imaged = self.submit('old'), self.submit('imaged')
+        self.pool.account_state('primary', 'browser_challenge', False)
+        with self.pool.connect() as db:
+            db.execute("UPDATE jobs SET status='parked',account_id='primary',created=created-90000 WHERE id=?", (old,))
+            db.execute("UPDATE jobs SET status='parked',account_id='primary',result=? WHERE id=?", (json.dumps({'files': [{'path': 'x'}]}), imaged))
+        self.assertIsNone(self.pool.claim_codex(90))
+
     def test_a_job_with_saved_files_is_never_moved(self):
         job_id = self.submit()
         self.pool.claim('primary')

@@ -668,14 +668,36 @@ class Pool:
                              "(preferred=? OR (preferred='auto' AND thread='' AND created<=?) OR created<=?) "
                              "ORDER BY (preferred=?) DESC, created, id LIMIT 1",
                              (CODEX_LANE, now - queue_wait_seconds, now - 3 * queue_wait_seconds, CODEX_LANE)).fetchone()
-            if not row or row['id'] in exclude:
+            note = None
+            if row and row['id'] not in exclude:
+                note = json.loads(row['result'] or '{}')
+                if row['preferred'] != CODEX_LANE:
+                    note = {'status': 'queued', 'files': [], 'fallback_from': 'queue_wait'}
+            else:
+                row = self.stranded_parked(db, now, exclude)
+                if row:
+                    note = {'status': 'queued', 'files': [], 'fallback_from': 'web_unavailable',
+                            'web_account': row['account_id'], 'web_preferred': row['preferred']}
+            if not row:
                 return None
-            note = json.loads(row['result'] or '{}')
-            if row['preferred'] != CODEX_LANE:
-                note = {'status': 'queued', 'files': [], 'fallback_from': 'queue_wait'}
-            db.execute("UPDATE jobs SET status='dispatching',account_id=?,result=?,updated=? WHERE id=?",
+            db.execute("UPDATE jobs SET status='dispatching',account_id=?,runtime_id=NULL,result=?,updated=? WHERE id=?",
                        (CODEX_LANE, json.dumps(note), time.time(), row['id']))
             return dict(db.execute('SELECT * FROM jobs WHERE id=?', (row['id'],)).fetchone())
+
+    def stranded_parked(self, db, now, exclude=()):
+        """A parked job nobody will re-open: its lane waits for a person (human check, sign-in),
+        is disabled, or its automatic retries are used up. Observed 2026-09-30: both main lanes
+        sat in browser_challenge and three parked jobs never moved. Only the last day's work,
+        and only jobs with no saved image, so long-abandoned requests are not regenerated."""
+        rows = db.execute("SELECT j.*, a.enabled AS lane_enabled, a.ready AS lane_ready FROM jobs j "
+                          "LEFT JOIN accounts a ON a.id=j.account_id WHERE j.status=? AND j.cancel_requested=0 "
+                          "AND j.created>=? ORDER BY j.created, j.id", (PARKED, now - 86400)).fetchall()
+        for row in rows:
+            if row['id'] in exclude or json.loads(row['result'] or '{}').get('files'):
+                continue
+            if not row['lane_enabled'] or not row['lane_ready'] or row['park_count'] > len(ADOPT_BACKOFF):
+                return row
+        return None
 
     def codex_ready(self):
         """Hand work over only to a lane that is configured, running and on a subscription login;
