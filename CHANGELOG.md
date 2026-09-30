@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.7.27
+
+- `status` answers "can I submit now?": `can_generate`, `serving` (`codex`, `web` or null), `next_action` (`submit` / `resolve_human_action`), `advice`, and `human_action_blocks_generation`; `logins` lists the Codex lane (`login_group=codex`, lanes = parallel runs) and `parallel_capacity` counts it. Observed 2026-09-30: an agent saw only web lanes in `browser_challenge` with 0 usable, asked the user to pass the check and never submitted, while Codex was idle. The MCP instructions and the skill now say to submit whenever `can_generate` is true.
+- `can_generate` counts only web lanes `claim()` would feed: a login waiting for a person or cooling down, and a lane holding a job that needs attention, do not count although idle lanes of it look ready (independent review).
+- A Codex lane stopped by hand (`stop-codex`) stops being first at once, not only after its running jobs finish and its heartbeat ends; new work goes to the web meanwhile (independent review).
+- A queued job Codex will draw reports `provider=codex-imagegen` instead of the web default.
+- A Codex lane that is not running yet (a restart, the seconds before its first heartbeat) counts as serving: every call starts it. Only a lane stopped by hand (`stop-codex`), an open breaker or a non-subscription home makes Codex unavailable. Found while deploying: the status read during the lane restart sent the caller to the web check.
+- Codex drawing runs start clean: `--ignore-user-config --ignore-rules --ephemeral`. The owner's config.toml brought MCP servers, plugins and skills into every run: measured per image 94k-211k input tokens with it (4 runs) and 36k-85k without (5 runs), same image quality and time; runs no longer appear in the Codex session history. The login still comes from the Codex home.
+
+## 0.7.26
+
+- Per-image parallelism on the Codex lane: a job of N images becomes N single-image runs in parallel, each prompted as option i of N so the options differ. `parallel` now counts Codex processes shared by all jobs; a job is claimed only while slots are free. Finished images are written into the job one by one; a partial failure delivers what was drawn (`count_mismatch`). Measured 2026-09-30: two 4-image jobs with 8 runs side by side finished 8/8 in about 200 s, no rate limit; one run drawing several images had taken 261-744 s. `"fanout": false` keeps one run per job.
+
+## 0.7.25
+
+- Codex first: `"prefer": "codex"` in `codex-fallback.json` (the owner's choice 2026-09-30 after the web lanes kept stalling: stable generation over token cost). New work goes to Codex at once; web lanes take only explicit account pins and hand-backs. A Codex failure gets one web attempt (follow-up images passed as references) and never bounces back; a hand-back no web lane takes within three queue waits fails with the Codex reason. Without a running lane the web serves everything as before.
+- Codex results can be continued (`continue_from`): the follow-up runs on Codex with the thread's latest images as references.
+- Responses stay compact: Codex usage, thread and routing notes are not returned (paths, sizes, bytes and hashes only).
+
+## 0.7.24
+
+- Codex fallback lane (`codex_lane.py`, `codex_imagegen.py`). Web lanes stay first; the lane takes a job queued longer than `queue_wait_seconds` (default 90) with no web lane, a web preparation failure (nothing submitted), or a stuck web job about to be parked with no saved file, and generates it with the Codex CLI built-in `image_gen` tool. Measured 2026-09-30: during an OpenAI incident that kept ChatGPT web pages loading forever, Codex produced images in 132-261 s. Several jobs run in parallel (default 3). Results carry `provider=codex-imagegen` and `fallback_from`.
+- Subscription only: the Codex home must report `auth_mode=chatgpt` (a default Codex home signed in with an API key is refused before anything runs), every API key variable is removed from the environment, and the prompt is instructed to use only the built-in tool. The prompt travels on stdin and the npm shim is unwrapped to `node <entry>`, so no text passes through cmd.exe quoting.
+- Follow-up jobs that fall back pass the last images of their conversation as references.
+- Hardened after an independent review: the lane truly runs `parallel` jobs (the one-active-job index now exempts the Codex lane; old queues migrate in place; measured two jobs finishing in 112 s and 122 s side by side); Codex runs with output in files and the whole process tree is stopped on timeout or cancel; work is handed over only to a running lane on a subscription login, and switching off returns waiting hand-overs to the web; Codex runs read-only with `model_provider="openai"`, refusing a home that configures another provider, and every vendor API key variable is removed; a missing reference image fails with `reference_changed`; jobs pinned to an account or continuing a conversation wait three times longer before the lane takes them; queue writes retry through a busy database and a produced image is never downgraded to a failure.
+- `image_status` reports `codex_fallback` (enabled, alive, active jobs, waiting hand-overs); workers start the lane with the pool; `codex-fallback.json` configures it and its absence keeps it off.
+
 ## 0.7.23
 
 - A lane that meets a human check leaves the page at once. The check page reloads itself about every 85 s and each failure raises Cloudflare's partitioned retry counter; observed 2026-09-29, enough of them made even the person loop on "Verifying". 0.7.22's rule that kept a gated lane's page open is reversed; only a page just shown to a person by `open` stays.

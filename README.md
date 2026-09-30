@@ -1,4 +1,12 @@
-# ChatGPT Web Images 0.7.23
+# ChatGPT Web Images 0.7.27
+
+0.7.27 调用前一眼可判断能否出图：`status` 新增 `can_generate`、`serving`（codex / web）、`next_action` 与 `advice`，`logins` 里列出 Codex 车道；Codex 优先时网页车道卡验证不再被当成阻塞（`human_action_blocks_generation=false`）。起因（2026-09-30）：一个 agent 只看到网页车道全是 `browser_challenge`，就停下来让用户去点验证，没有提交任务，而 Codex 车道当时空闲。Codex 出图改为干净启动（不加载本机 config.toml 里的 MCP、插件与规则，也不写入 Codex 会话历史），实测每张图输入 token 从 9.4 万–21.1 万降到 3.6 万–8.5 万，约减半。排队中由 Codex 接手的任务 `provider` 也显示 `codex-imagegen`。
+
+0.7.26 Codex 按张并行：一个要 N 张图的任务拆成 N 路同时画（每路一个 Codex 进程，只画 1 张，并被告知"这是第 i 个方案，请用不同构图"），`parallel` 改为全局同时运行的 Codex 进程数，所有任务共用；新任务只在有空位时领取。每画完一张就写回任务，轮询能看到张数逐步增加；部分失败时交付已画好的图并标注数量不足。实测（2026-09-30）：2 个任务各 4 张、8 路并行，8/8 成功，约 3.3 分钟全部完成，未触发限流；此前一次画完多张要 4–12 分钟。`"fanout": false` 可恢复一次对话画完全部。修改 `parallel` 后需重启降级车道（队列目录建 `stop-codex`，心跳消失后删除，下一次调用会自动拉起）。
+
+0.7.25 可把 Codex 设为首选（`codex-fallback.json` 里加 `"prefer": "codex"`，本机已开启）：新任务立即交给 Codex 订阅生成（默认最多 4 个并行），网页车道只处理调用方明确指定账号的任务和 Codex 交回的任务。Codex 失败时交给网页重试一次，网页再失败就如实报错，不来回转；交回的任务若没有网页车道接手，按 Codex 的原因报失败，不无限等待。Codex 车道没在运行时网页照常接手全部任务。Codex 生成的图也能 `continue_from` 续改，上一轮的图作为参考图。返回结果只有文字和文件路径（路径、宽高、字节数、校验值），不含图片数据，也不含 Codex 内部记录。
+
+0.7.24 新增 Codex 订阅降级车道：网页车道仍是首选，但网页走不通时自动改由 Codex CLI 内置的 `image_gen` 工具生成，不经过浏览器，所以不受 Cloudflare 验证、页面卡死或 ChatGPT 网页事故影响（2026-09-30 实测：网页正处于官方故障期间，Codex 仍 132 秒出图）。触发条件：任务排队超过 `queue_wait_seconds`（默认 90 秒）还没有网页车道接手；网页在准备阶段失败（尚未提交）；网页任务卡住要被挂起、且还没保存任何图片。多个降级任务并行（默认 3 个）。结果标注 `provider=codex-imagegen` 和 `fallback_from`。**只用订阅**：Codex 目录必须是 ChatGPT 订阅登录（`auth_mode=chatgpt`），否则拒绝运行；调用时环境里所有 API Key 变量都被移除。配置写在队列目录的 `codex-fallback.json`：`{"enabled": true, "codex_home": "<Codex 订阅登录目录>", "parallel": 3, "queue_wait_seconds": 90}`；没有这个文件或 `"enabled": false` 就不启用（这是唯一开关，所有进程读同一个文件）；关闭时已转交、还在排队的任务自动退回网页队列。续图任务降级时，会把该对话最近一次的图片作为参考图交给 Codex。
 
 0.7.23 按业界做法（OpenAI Operator 接管模式、Cloudflare Browser Run 与 Browserless 的 human-in-the-loop）重做人机验证处理，只停、只交给人，不绕过：
 - 车道一遇到验证页立刻离开（切到 about:blank）。验证页每约 85 秒自己重试，每次失败都会累积 Cloudflare 的失败计数（`cf_chl_rc_*`），2026-09-29 实测累积到一定程度后连人手动都会无限循环。

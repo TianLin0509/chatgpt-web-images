@@ -11,7 +11,7 @@ import time
 import sqlite3
 
 import web_images as w
-from image_pool import ADOPT_BACKOFF, PARK_AFTER_SECONDS, PARKED, Pool, TERMINAL, VERSION
+from image_pool import ADOPT_BACKOFF, PARK_AFTER_SECONDS, PARKED, Pool, TERMINAL, VERSION, codex_first
 import human_gate
 
 # Waiting for generation is minutes long, so tick fast only when something can change.
@@ -92,12 +92,21 @@ class Worker:
     def has_waiting_work(self):
         # Idle lanes never navigate browsers just to refresh a health badge.
         group=self.pool.account(self.account_id).get('login_group') or self.account_id
+        # With Codex first, unpinned work is the web's only once Codex handed it back.
+        auto = "(preferred='auto' AND result LIKE '%\"to_web\": true%')" if codex_first(self.pool.root) else "preferred='auto'"
         with self.pool.connect() as db:
-            return bool(db.execute("SELECT 1 FROM jobs WHERE (account_id=? AND (status IN ('dispatching','running','needs_attention') OR (status='parked' AND park_count<=? AND retry_after<=?))) OR (status='queued' AND preferred IN ('auto',?,?)) LIMIT 1",
+            return bool(db.execute("SELECT 1 FROM jobs WHERE (account_id=? AND (status IN ('dispatching','running','needs_attention') OR (status='parked' AND park_count<=? AND retry_after<=?))) OR (status='queued' AND (preferred IN (?,?) OR "+auto+")) LIMIT 1",
                                    (self.account_id,len(ADOPT_BACKOFF),time.time(),self.account_id,group)).fetchone())
 
     def record_result(self, job_id, result, runtime_id=None, *, confirm_recovery=True):
         previous = self.pool.row(job_id)
+        # Nothing reached the website: rather than fail the job, the Codex lane generates it.
+        if (result.get('status') == 'preparation_failed' and not result.get('files')
+                and self.pool.codex_ready() and self.pool.fallback(job_id, result.get('error'))):
+            self.pool.account_state(self.account_id, 'browser_unhealthy', False, result.get('error'))
+            print(json.dumps({'event': 'job_fallback', 'at': time.time(), 'job_id': job_id, 'account_id': self.account_id,
+                              'reason': (result.get('error') or {}).get('code')}), flush=True)
+            return
         self.pool.save_result(job_id, result, runtime_id)
         phase = result.get('status')
         if (self.rate_probe and confirm_recovery and not result.get('error') and result.get('files')
@@ -221,6 +230,11 @@ class Worker:
             except Exception as exc:
                 self.log('park_failed', job_id=job['id'], error_code=error_value(exc)['code'])
                 return False
+        # A stuck web job with no saved image goes to the Codex lane instead of waiting for
+        # re-observation: the image matters more than that web conversation.
+        if self.pool.codex_ready() and self.pool.fallback(job['id'], {'code': 'web_stuck'}):
+            self.log('job_fallback', job_id=job['id'], reason='web_stuck')
+            return True
         parked = self.pool.park(job['id'])
         self.log('job_parked', job_id=job['id'], auto_retry_at=parked.get('auto_retry_at'),
                  attempts_left=parked.get('auto_retry_attempts_left'))
@@ -242,6 +256,11 @@ class Worker:
             result = self.runtime.adopt(job['runtime_id'])
         except Exception as exc:
             error = error_value(exc)
+            # The web cannot even re-open this job (paused site, rate limit, dead page) and it
+            # has no image yet: the Codex lane generates it now instead of after more backoff.
+            if self.pool.codex_ready() and self.pool.fallback(job['id'], error):
+                self.log('job_fallback', job_id=job['id'], reason=error['code'])
+                return True
             if error['code']=='rate_limited':self.pool.defer_rate_limit(self.account_id)
             else:self.pool.park(job['id'], error)
             self.log('adopt_failed', job_id=job['id'], error_code=error['code'])
@@ -331,7 +350,8 @@ class Worker:
                 import hashlib
                 digest = hashlib.sha256((digest + '\n' + job['preferred']).encode()).hexdigest()
                 index = self.runtime.DATA / 'requests' / (payload['request_id'] + '.json')
-                if digest != job['request_hash'] and not index.exists():
+                rewritten = json.loads(job['result'] or '{}').get('to_web')  # the pool changed it on hand-back
+                if digest != job['request_hash'] and not index.exists() and not rewritten:
                     raise w.ImageError('reference_changed', 'Reference content changed while queued; restore it or cancel this job explicitly.')
                 result = self.runtime.start(**payload)
                 self.record_result(job['id'], result, result['job_id'])
