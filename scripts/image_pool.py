@@ -102,6 +102,27 @@ def codex_first(root):
     return True
 
 
+def codex_can_serve(root):
+    """Codex can draw work submitted now: the lane is configured, not stopped by hand, its
+    breaker is closed and the home is a subscription login. A lane that is not running yet
+    counts, because every call starts it (a restart takes a few seconds)."""
+    settings = fallback_settings(root)
+    if not settings or (Path(root) / 'stop-codex').exists():
+        return False
+    try:
+        health = json.loads((Path(root) / 'codex-lane-health.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        health = {}
+    if health.get('degraded_until', 0) > time.time():
+        return False
+    import codex_imagegen
+    try:
+        codex_imagegen.check_home(settings['codex_home'])
+    except codex_imagegen.CodexImageError:
+        return False
+    return True
+
+
 @contextlib.contextmanager
 def launch_lock(path):
     """Cross-process gate for launch reservations; never waits on another caller."""
@@ -999,8 +1020,8 @@ class Pool:
         except OSError:
             gates, egress_ok = [], None
         codex = self.codex_status()
-        first = codex_first(self.root)
-        codex_usable = bool(codex['enabled'] and codex['alive'] and codex['degraded_until'] <= time.time())
+        codex_usable = codex_can_serve(self.root)
+        first = codex_usable and codex['prefer'] == 'codex'
         web_usable = sum(g['usable_lanes'] for g in groups.values())
         logins = sorted(groups.values(), key=lambda g: g['login_group'])
         if codex['enabled']:

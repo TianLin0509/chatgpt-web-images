@@ -3,6 +3,7 @@
 ## 0.7.27
 
 - `status` answers "can I submit now?": `can_generate`, `serving` (`codex`, `web` or null), `next_action` (`submit` / `resolve_human_action`), `advice`, and `human_action_blocks_generation`; `logins` lists the Codex lane (`login_group=codex`, lanes = parallel runs) and `parallel_capacity` counts it. Observed 2026-09-30: an agent saw only web lanes in `browser_challenge` with 0 usable, asked the user to pass the check and never submitted, while Codex was idle. The MCP instructions and the skill now say to submit whenever `can_generate` is true.
+- A Codex lane that is not running yet (a restart, the seconds before its first heartbeat) counts as serving: every call starts it. Only a lane stopped by hand (`stop-codex`), an open breaker or a non-subscription home makes Codex unavailable. Found while deploying: the status read during the lane restart sent the caller to the web check.
 - Codex drawing runs start clean: `--ignore-user-config --ignore-rules --ephemeral`. The owner's config.toml brought MCP servers, plugins and skills into every run: measured one image at 117k input tokens with it, 42k without, same image quality and time; runs no longer appear in the Codex session history. The login still comes from the Codex home.
 
 ## 0.7.26

@@ -265,6 +265,8 @@ class CodexFallbackContracts(unittest.TestCase):
         status = self.pool.status()
         self.assertEqual((status['can_generate'], status['serving']), (True, 'codex'), 'Codex still takes auto work after the wait')
         (self.pool.root / 'codex-lane-health.json').unlink()
+        self.assertEqual(self.pool.status()['serving'], 'codex', 'a lane that is not running yet is started by the call')
+        (self.pool.root / 'stop-codex').touch()
         status = self.pool.status()
         self.assertEqual((status['can_generate'], status['serving'], status['next_action']), (False, None, 'resolve_human_action'))
         self.assertTrue(status['human_action_blocks_generation'])
@@ -614,6 +616,14 @@ class CodexFirstContracts(CodexFallbackContracts):
         codex = {g['login_group']: g for g in status['logins']}['codex']
         self.assertEqual((codex['lanes'], codex['usable_lanes'], codex['provider']), (2, 2, 'codex-imagegen'))
         self.assertEqual(status['parallel_capacity'], 2)
+
+    def test_status_does_not_send_the_user_to_the_web_while_the_lane_restarts(self):
+        (self.pool.root / 'codex-lane-health.json').unlink()  # between stop and the next heartbeat
+        self.pool.account_state('primary', 'browser_challenge', False)
+        status = self.pool.status()
+        self.assertEqual((status['can_generate'], status['serving']), (True, 'codex'))
+        w.write_json(self.pool.root / 'codex-lane-health.json', {'beat': time.time(), 'degraded_until': time.time() + 60})
+        self.assertEqual(self.pool.status()['serving'], None, 'breaker open and no web lane: nothing can draw')
 
     def test_without_a_running_lane_the_web_takes_everything(self):
         (self.pool.root / 'codex-lane-health.json').unlink()
