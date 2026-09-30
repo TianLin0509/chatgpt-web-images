@@ -1,4 +1,11 @@
-# ChatGPT Web Images 0.7.22
+# ChatGPT Web Images 0.7.23
+
+0.7.23 按业界做法（OpenAI Operator 接管模式、Cloudflare Browser Run 与 Browserless 的 human-in-the-loop）重做人机验证处理，只停、只交给人，不绕过：
+- 车道一遇到验证页立刻离开（切到 about:blank）。验证页每约 85 秒自己重试，每次失败都会累积 Cloudflare 的失败计数（`cf_chl_rc_*`），2026-09-29 实测累积到一定程度后连人手动都会无限循环。
+- 同一登录的其他车道不再领取任务，不去撞同一个验证。
+- 跑在 AI Hub 共享浏览器里的车道，`image_open` 改为「人工接管」：Hub 暂停并断开所有网页自动化（生图、中转站、网页圆桌），清掉该站点的验证状态 cookie（不碰登录 cookie），在屏幕上开一个没有调试连接的正常窗口；人关掉窗口或调用 `image_account_check` 即恢复，最长 15 分钟自动结束。需要 AI Hub 带 `core/web-risk-guard.js` 的版本；旧版 Hub 下保持原行为。
+- 接管期间 worker 不派发、不轮询，也不把等待算作失败。
+- 识别中文的 Cloudflare 标题（「请稍候」）。
 
 0.7.22 空闲车道不再动"有人在用"的页面：账号待人工验证/登录时，或 30 分钟内刚被 `image_open` 打开过，worker 不会把它的标签页切到 `about:blank`。2026-09-29 实测：重启 worker 时把正在做 Cloudflare 验证和登录的副号页面切走了。
 

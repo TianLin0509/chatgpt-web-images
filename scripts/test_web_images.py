@@ -228,6 +228,21 @@ class Contracts(unittest.TestCase):
         self.assertEqual(second['job_id'],first['job_id'])
         self.assertTrue(second['reused_request'])
 
+    def test_person_handoff_during_start_leaves_no_trace_and_is_not_a_failure(self):
+        # The Hub refuses before any page action; nothing reached ChatGPT, so the attempt is undone
+        # and the same request can run once the person is done (0.7.23 review finding).
+        handoff=w.ImageError('human_handoff','A person has the browser')
+        with patch.object(w,'ensure_browser'),patch.object(w,'cli'),patch.object(w,'set_visible',return_value=True),patch.object(w,'run_js',side_effect=handoff):
+            with self.assertRaises(w.ImageError) as caught:
+                w.start(prompt='hello',request_id='handoff-1',output_dir=str(self.data))
+        self.assertEqual(caught.exception.code,'human_handoff')
+        self.assertFalse((self.data/'active.json').exists())
+        self.assertFalse((self.data/'requests'/'handoff-1.json').exists())
+        self.assertEqual(list((self.data/'jobs').glob('*.json')) if (self.data/'jobs').exists() else [],[])
+        with patch.object(w,'ensure_browser'),patch.object(w,'cli'),patch.object(w,'set_visible',return_value=True),patch.object(w,'run_js',side_effect=[True,True,True,{'url':'https://chatgpt.com/c/abc-def'}]):
+            again=w.start(prompt='hello',request_id='handoff-1',output_dir=str(self.data))
+        self.assertEqual(again['status'],'generating')
+
     def test_request_id_conflict_never_resubmits(self):
         w.write_json(self.data/'requests'/'retry-1.json',{'request_hash':'different','job_id':'20260907-abcdef012345'})
         with patch.object(w,'ensure_browser') as browser:

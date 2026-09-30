@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import hashlib
 import http.server
 import json
@@ -21,7 +22,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.22'
+VERSION = '0.7.23'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -161,6 +162,51 @@ def locked():
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def hub_root():
+    """The Hub Chrome root when this lane runs in the Hub's shared browser, else None."""
+    return _hub_root_of(CLI_ENTRY)
+
+
+@functools.lru_cache(maxsize=8)
+def _hub_root_of(entry):
+    # Read once per entry: workers ask every tick whether a person holds the browser.
+    if entry.suffix != '.cjs':
+        return None
+    try:
+        match = re.search(r'"root"\s*:\s*"((?:[^"\\]|\\.)+)"', entry.read_text(encoding='utf-8'))
+    except OSError:
+        return None
+    return Path(json.loads('"' + match.group(1) + '"')) if match else None
+
+
+def hub_has_guard():
+    """True when the lane's Hub ships the shared web-risk guard (person handoff)."""
+    return _hub_guard_of(CLI_ENTRY)
+
+
+@functools.lru_cache(maxsize=8)
+def _hub_guard_of(entry):
+    if entry.suffix != '.cjs':
+        return False
+    try:
+        match = re.search(r'"hubCore"\s*:\s*"((?:[^"\\]|\\.)+)"', entry.read_text(encoding='utf-8'))
+    except OSError:
+        return False
+    return bool(match) and (Path(json.loads('"' + match.group(1) + '"')) / 'web-risk-guard.js').is_file()
+
+
+def human_handoff():
+    """The Hub's handoff lease while a person verifies or signs in; every lane waits it out."""
+    root = hub_root()
+    if not root:
+        return None
+    try:
+        lease = json.loads((root / 'web-risk.json').read_text(encoding='utf-8')).get('handoff')
+    except (OSError, ValueError):
+        return None
+    return lease if lease and lease.get('until', 0) > time.time() * 1000 else None
+
+
 def cli(args, timeout=55):
     command = shutil.which('node.exe')
     if not command or not CLI_ENTRY.is_file():
@@ -186,6 +232,10 @@ def cli(args, timeout=55):
         # The CLI may put the error in text content rather than `error`.
         # Classify it locally; never expose traces, signed URLs or response bodies.
         message = json.dumps(envelope, ensure_ascii=False)
+        if 'Human handoff' in message:
+            raise ImageError('human_handoff', 'A person is verifying or signing in in the Hub browser; automation waits until they finish.')
+        if 'Site challenged' in message:
+            raise ImageError('browser_challenge', 'This login met a human check and is paused; use open to let a person complete it.')
         if 'not open' in message or 'No browser' in message:
             code = 'browser_not_open'
         elif 'strict mode violation' in message:
@@ -267,7 +317,14 @@ def set_visible(visible):
     return bool(user32.IsWindowVisible(found[0])) == visible
 
 
-def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True, force_refresh=False, new_conversation=False):
+def leave_challenge():
+    """A challenge page reloads itself and every failed attempt counts against the login
+    (observed 2026-09-29: the retry counter made even the person loop). Leave it at once."""
+    with contextlib.suppress(ImageError):
+        cli(['goto', 'about:blank'])
+
+
+def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True, force_refresh=False, new_conversation=False, for_person=False):
     try:
         state = run_js(STATUS_JS)
     except ImageError as exc:
@@ -342,6 +399,8 @@ def ensure_browser(*, require_login=True, account_name=None, hide_on_open=True, 
             code = state['error_code']
             raise ImageError(code, ERROR_MESSAGES[code])
     state.update(browser_session=SESSION, provider='chatgpt-web', image_model_verified=False)
+    if state.get('challenge') and not for_person:
+        leave_challenge()
     if not require_login:
         return state
     if state.get('rate_limited'):
@@ -653,6 +712,20 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
             job['conversation_url']=result['url']
             job['window_hidden']=set_visible(False)
             save_job(job)
+        except ImageError as exc:
+            if exc.code == 'human_handoff':
+                # The Hub refuses before any page action, so nothing of this step reached ChatGPT.
+                # Undo this attempt's records; the worker waits the person out and dispatches again.
+                job_path(job_id).unlink(missing_ok=True)
+                (DATA/'active.json').unlink(missing_ok=True)
+                if request_id:
+                    previous_path.unlink(missing_ok=True)
+                raise
+            job['status']='submission_uncertain' if job['status'] in {'submitting','generating'} else 'preparation_failed'
+            job['error']={'code':exc.code,'message':str(exc)}
+            save_job(job)
+            if job['status']=='preparation_failed':
+                (DATA/'active.json').unlink(missing_ok=True)
         except Exception as exc:
             # Never auto-resend after a timeout: the server may already be generating.
             job['status']='submission_uncertain' if job['status'] in {'submitting','generating'} else 'preparation_failed'
@@ -1081,8 +1154,12 @@ def compact_result(result,detail=False):
     return slim
 
 
-def status(*, force_refresh=False):
+def status(*, force_refresh=False, person=False):
     with locked():
+        if person and hub_root():
+            # The person says they are done: end their handoff and let automation try once.
+            with contextlib.suppress(ImageError):
+                cli(['human-done', 'https://chatgpt.com/'])
         result=ensure_browser(require_login=False,force_refresh=force_refresh)
         if result.get('logged_in'):
             cli(['state-save',str(DATA/'auth-state.json')])
@@ -1097,7 +1174,13 @@ def probe_rate_limit():
 
 def open_browser():
     with locked():
-        result=ensure_browser(require_login=False, hide_on_open=False)
+        if hub_has_guard():
+            # Shared Hub browser: hand it to the person. Every automated connection detaches,
+            # challenge counters are reset and a clean window opens on screen. A failure here is
+            # reported as is; showing the automated lane tab instead is what the handoff avoids.
+            handed = cli(['human-open', 'https://chatgpt.com/'])
+            return {'visible': True, 'handoff': True, 'until': (handed or {}).get('until')}
+        result=ensure_browser(require_login=False, hide_on_open=False, for_person=True)
         result['visible']=set_visible(True)
         return result
 

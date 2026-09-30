@@ -16,7 +16,8 @@ STATE_FUNCTION = r'''() => {
    /Choose an account|选择.*[账帐]号|选择.*[账帐]户/i.test(text(n))) ||
    (buttons.some(n => /Log in to another account|登录其他[账帐]号|使用其他[账帐]户/i.test(text(n))) &&
     /Welcome back|欢迎回来|Choose an account/i.test(document.body.innerText));
- const challenge = /Just a moment|checking your browser/i.test(document.title) ||
+ // Cloudflare localises its interstitial title (the main profile prefers zh-CN).
+ const challenge = /Just a moment|checking your browser|请稍候|請稍候|Attention Required/i.test(document.title) ||
    nodes('iframe[src*="challenges.cloudflare.com"]').length > 0;
  const credential = nodes('input[type="password"],input[autocomplete="one-time-code"],input[name="code"]').length > 0;
  // Tabs of one account can render in different UI languages (a zh-CN tab loaded earlier
