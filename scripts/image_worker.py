@@ -98,6 +98,13 @@ class Worker:
 
     def record_result(self, job_id, result, runtime_id=None, *, confirm_recovery=True):
         previous = self.pool.row(job_id)
+        # Nothing reached the website: rather than fail the job, the Codex lane generates it.
+        if (result.get('status') == 'preparation_failed' and not result.get('files')
+                and self.pool.codex_ready() and self.pool.fallback(job_id, result.get('error'))):
+            self.pool.account_state(self.account_id, 'browser_unhealthy', False, result.get('error'))
+            print(json.dumps({'event': 'job_fallback', 'at': time.time(), 'job_id': job_id, 'account_id': self.account_id,
+                              'reason': (result.get('error') or {}).get('code')}), flush=True)
+            return
         self.pool.save_result(job_id, result, runtime_id)
         phase = result.get('status')
         if (self.rate_probe and confirm_recovery and not result.get('error') and result.get('files')
@@ -221,6 +228,11 @@ class Worker:
             except Exception as exc:
                 self.log('park_failed', job_id=job['id'], error_code=error_value(exc)['code'])
                 return False
+        # A stuck web job with no saved image goes to the Codex lane instead of waiting for
+        # re-observation: the image matters more than that web conversation.
+        if self.pool.codex_ready() and self.pool.fallback(job['id'], {'code': 'web_stuck'}):
+            self.log('job_fallback', job_id=job['id'], reason='web_stuck')
+            return True
         parked = self.pool.park(job['id'])
         self.log('job_parked', job_id=job['id'], auto_retry_at=parked.get('auto_retry_at'),
                  attempts_left=parked.get('auto_retry_attempts_left'))

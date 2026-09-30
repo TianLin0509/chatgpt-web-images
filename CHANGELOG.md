@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.24
+
+- Codex fallback lane (`codex_lane.py`, `codex_imagegen.py`). Web lanes stay first; the lane takes a job queued longer than `queue_wait_seconds` (default 90) with no web lane, a web preparation failure (nothing submitted), or a stuck web job about to be parked with no saved file, and generates it with the Codex CLI built-in `image_gen` tool. Measured 2026-09-30: during an OpenAI incident that kept ChatGPT web pages loading forever, Codex produced images in 132-261 s. Several jobs run in parallel (default 3). Results carry `provider=codex-imagegen` and `fallback_from`.
+- Subscription only: the Codex home must report `auth_mode=chatgpt` (a default Codex home signed in with an API key is refused before anything runs), every API key variable is removed from the environment, and the prompt is instructed to use only the built-in tool. The prompt travels on stdin and the npm shim is unwrapped to `node <entry>`, so no text passes through cmd.exe quoting.
+- Follow-up jobs that fall back pass the last images of their conversation as references.
+- Hardened after an independent review: the lane truly runs `parallel` jobs (the one-active-job index now exempts the Codex lane; old queues migrate in place; measured two jobs finishing in 112 s and 122 s side by side); Codex runs with output in files and the whole process tree is stopped on timeout or cancel; work is handed over only to a running lane on a subscription login, and switching off returns waiting hand-overs to the web; Codex runs read-only with `model_provider="openai"`, refusing a home that configures another provider, and every vendor API key variable is removed; a missing reference image fails with `reference_changed`; jobs pinned to an account or continuing a conversation wait three times longer before the lane takes them; queue writes retry through a busy database and a produced image is never downgraded to a failure.
+- `image_status` reports `codex_fallback` (enabled, alive, active jobs, waiting hand-overs); workers start the lane with the pool; `codex-fallback.json` configures it and its absence keeps it off.
+
 ## 0.7.23
 
 - A lane that meets a human check leaves the page at once. The check page reloads itself about every 85 s and each failure raises Cloudflare's partitioned retry counter; observed 2026-09-29, enough of them made even the person loop on "Verifying". 0.7.22's rule that kept a gated lane's page open is reversed; only a page just shown to a person by `open` stays.

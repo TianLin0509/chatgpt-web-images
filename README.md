@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.23
+# ChatGPT Web Images 0.7.24
+
+0.7.24 新增 Codex 订阅降级车道：网页车道仍是首选，但网页走不通时自动改由 Codex CLI 内置的 `image_gen` 工具生成，不经过浏览器，所以不受 Cloudflare 验证、页面卡死或 ChatGPT 网页事故影响（2026-09-30 实测：网页正处于官方故障期间，Codex 仍 132 秒出图）。触发条件：任务排队超过 `queue_wait_seconds`（默认 90 秒）还没有网页车道接手；网页在准备阶段失败（尚未提交）；网页任务卡住要被挂起、且还没保存任何图片。多个降级任务并行（默认 3 个）。结果标注 `provider=codex-imagegen` 和 `fallback_from`。**只用订阅**：Codex 目录必须是 ChatGPT 订阅登录（`auth_mode=chatgpt`），否则拒绝运行；调用时环境里所有 API Key 变量都被移除。配置写在队列目录的 `codex-fallback.json`：`{"enabled": true, "codex_home": "<Codex 订阅登录目录>", "parallel": 3, "queue_wait_seconds": 90}`；没有这个文件或 `"enabled": false` 就不启用（这是唯一开关，所有进程读同一个文件）；关闭时已转交、还在排队的任务自动退回网页队列。续图任务降级时，会把该对话最近一次的图片作为参考图交给 Codex。
 
 0.7.23 按业界做法（OpenAI Operator 接管模式、Cloudflare Browser Run 与 Browserless 的 human-in-the-loop）重做人机验证处理，只停、只交给人，不绕过：
 - 车道一遇到验证页立刻离开（切到 about:blank）。验证页每约 85 秒自己重试，每次失败都会累积 Cloudflare 的失败计数（`cf_chl_rc_*`），2026-09-29 实测累积到一定程度后连人手动都会无限循环。

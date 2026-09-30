@@ -51,13 +51,32 @@ ACTIONABLE = {
     'page_not_ready': 'retry',
     'rate_limited': 'retry',
     'human_handoff': 'retry',
+    'codex_timeout': 'retry', 'codex_no_image': 'agent', 'codex_error': 'retry',
+    'codex_not_subscription': 'human', 'codex_missing': 'human',
     'login_required': 'human', 'browser_challenge': 'human', 'account_selection_required': 'human',
     'credential_required': 'human', 'image_tool_unavailable': 'human', 'output_exists': 'human',
     'output_changed': 'human', 'conversation_changed': 'human', 'legacy_job_active': 'human',
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.23'
+VERSION = '0.7.24'
+# The Codex fallback lane (codex_lane.py): not a browser account, so it has no row in accounts.
+CODEX_LANE = 'codex'
+# The lane process writes a heartbeat every tick; older than this means it is not running.
+CODEX_HEALTH_SECONDS = 30
+
+
+def fallback_settings(root):
+    """codex-fallback.json in the pool root: {"enabled": true, "codex_home": "...", "parallel": 3,
+    "queue_wait_seconds": 90}. Off when the file is absent, "enabled" is false or the Codex home
+    is missing. The file is the only switch: every process of the pool reads the same one."""
+    try:
+        settings = json.loads((Path(root) / 'codex-fallback.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if not settings.get('enabled') or not settings.get('codex_home') or not Path(settings['codex_home']).is_dir():
+        return None
+    return settings
 
 
 @contextlib.contextmanager
@@ -117,7 +136,7 @@ class Pool:
                     created REAL NOT NULL, updated REAL NOT NULL);
                 CREATE INDEX IF NOT EXISTS jobs_schedule ON jobs(status, created);
                 CREATE UNIQUE INDEX IF NOT EXISTS account_active ON jobs(account_id)
-                    WHERE status IN ('dispatching','running','needs_attention');
+                    WHERE status IN ('dispatching','running','needs_attention') AND account_id<>'codex';
                 CREATE TABLE IF NOT EXISTS controls (
                     id TEXT PRIMARY KEY, account_id TEXT NOT NULL, action TEXT NOT NULL,
                     args TEXT NOT NULL, status TEXT NOT NULL, result TEXT, created REAL NOT NULL,
@@ -135,6 +154,13 @@ class Pool:
             if 'login_group' not in {row['name'] for row in db.execute('PRAGMA table_info(accounts)')}:
                 db.execute("ALTER TABLE accounts ADD COLUMN login_group TEXT NOT NULL DEFAULT ''")
             db.execute('CREATE INDEX IF NOT EXISTS jobs_parked ON jobs(account_id, status, retry_after)')
+            # One active job per browser lane; the Codex lane runs several (0.7.24). Older
+            # queues carry the index without the exception and are migrated in place.
+            index = db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='account_active'").fetchone()
+            if index and 'codex' not in (index['sql'] or ''):
+                db.execute('DROP INDEX account_active')
+                db.execute("CREATE UNIQUE INDEX account_active ON jobs(account_id) "
+                           "WHERE status IN ('dispatching','running','needs_attention') AND account_id<>'codex'")
             image_limits.ensure_schema(db)
 
     def cooldown(self,account_id):return image_limits.get(self,account_id)
@@ -478,7 +504,8 @@ class Pool:
             w.verify_outputs(result)
         result.update(job_id=row['id'], request_id=row['request_id'], account_id=row['account_id'],
                       status=row['status'], created_at=row['created'], updated_at=row['updated'],
-                      requested_count=payload['count'], provider='chatgpt-web', image_model_verified=False)
+                      requested_count=payload['count'], image_model_verified=False,
+                      provider=result.get('provider') or ('codex-imagegen' if row['account_id'] == CODEX_LANE else 'chatgpt-web'))
         result['phase'] = json.loads(row['result'] or '{}').get('status', row['status'])
         result['downloaded_count'] = len(result.get('files', []))
         result['missing_count'] = max(0, payload['count'] - result['downloaded_count'])
@@ -526,7 +553,7 @@ class Pool:
             if 'files' in result:
                 result['files'] = [{k: v for k, v in f.items() if k in
                     {'path', 'width', 'height', 'bytes', 'sha256'}} for f in result['files']]
-        if row['account_id'] and (cooldown:=self.cooldown(row['account_id'])) and cooldown['retry_after']>time.time() and row['status'] not in TERMINAL:
+        if row['account_id'] and row['account_id'] != CODEX_LANE and (cooldown:=self.cooldown(row['account_id'])) and cooldown['retry_after']>time.time() and row['status'] not in TERMINAL:
             result['retry_at']=cooldown['retry_after'];result['next_action']='wait_for_account_cooldown'
             result['error']={'code':'rate_limited','message':'ChatGPT HTTP 429: this login is cooling; no prompt will be resent.','actionable_by':'retry'}
         return result
@@ -612,6 +639,82 @@ class Pool:
             db.execute("UPDATE jobs SET status='dispatching',failures=0,error=NULL,updated=? WHERE id=?",
                        (time.time(), job_id))
         return self.get(job_id)
+
+    def fallback(self, job_id, error=None):
+        """Hand a job the web could not deliver to the Codex lane. Only jobs without a saved
+        file move; a web conversation that was already submitted is left as it is."""
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None or row['status'] in TERMINAL or row['cancel_requested']:
+                return False
+            if json.loads(row['result'] or '{}').get('files'):
+                return False
+            note = {'status': 'queued', 'files': [], 'fallback_from': (error or {}).get('code') or row['status'],
+                    'web_account': row['account_id'], 'web_preferred': row['preferred']}
+            db.execute("UPDATE jobs SET status='queued',preferred=?,account_id=NULL,runtime_id=NULL,result=?,error=NULL,"
+                       "failures=0,park_count=0,retry_after=0,updated=? WHERE id=?",
+                       (CODEX_LANE, json.dumps(note), time.time(), job_id))
+        return True
+
+    def claim_codex(self, queue_wait_seconds, exclude=()):
+        """The next job for the Codex lane: one handed over by a web lane, or one no web lane
+        has taken within queue_wait_seconds."""
+        with self.transaction() as db:
+            now = time.time()
+            # Unpinned new work waits queue_wait_seconds for a web lane; work pinned to an account
+            # or continuing a conversation waits three times as long, since only the web keeps it
+            # in that conversation (the Codex fallback passes its last images as references).
+            row = db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 AND "
+                             "(preferred=? OR (preferred='auto' AND thread='' AND created<=?) OR created<=?) "
+                             "ORDER BY (preferred=?) DESC, created, id LIMIT 1",
+                             (CODEX_LANE, now - queue_wait_seconds, now - 3 * queue_wait_seconds, CODEX_LANE)).fetchone()
+            if not row or row['id'] in exclude:
+                return None
+            note = json.loads(row['result'] or '{}')
+            if row['preferred'] != CODEX_LANE:
+                note = {'status': 'queued', 'files': [], 'fallback_from': 'queue_wait'}
+            db.execute("UPDATE jobs SET status='dispatching',account_id=?,result=?,updated=? WHERE id=?",
+                       (CODEX_LANE, json.dumps(note), time.time(), row['id']))
+            return dict(db.execute('SELECT * FROM jobs WHERE id=?', (row['id'],)).fetchone())
+
+    def codex_ready(self):
+        """Hand work over only to a lane that is configured, running and on a subscription login;
+        otherwise the job keeps its web failure instead of waiting for nobody."""
+        settings = fallback_settings(self.root)
+        if not settings or not self.codex_status()['alive']:
+            return False
+        import codex_imagegen
+        try:
+            codex_imagegen.check_home(settings['codex_home'])
+        except codex_imagegen.CodexImageError:
+            return False
+        return True
+
+    def release_codex_handovers(self):
+        """The lane stopped or was switched off: waiting hand-overs return to their web queue."""
+        with self.transaction() as db:
+            for row in db.execute("SELECT id,result FROM jobs WHERE status='queued' AND preferred=?", (CODEX_LANE,)).fetchall():
+                back = json.loads(row['result'] or '{}').get('web_preferred') or 'auto'
+                db.execute('UPDATE jobs SET preferred=?,updated=? WHERE id=?', (back if back != CODEX_LANE else 'auto', time.time(), row['id']))
+
+    def requeue_codex_orphans(self):
+        """Jobs the Codex lane owned when its process stopped go back to its queue."""
+        with self.connect() as db:
+            db.execute("UPDATE jobs SET status='queued',preferred=?,account_id=NULL,runtime_id=NULL,updated=? "
+                       "WHERE account_id=? AND status IN ('dispatching','running')", (CODEX_LANE, time.time(), CODEX_LANE))
+
+    def codex_status(self):
+        settings = fallback_settings(self.root)
+        try:
+            health = json.loads((self.root / 'codex-lane-health.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            health = {}
+        with self.connect() as db:
+            active = db.execute("SELECT COUNT(*) FROM jobs WHERE account_id=? AND status IN ('dispatching','running')", (CODEX_LANE,)).fetchone()[0]
+            waiting = db.execute("SELECT COUNT(*) FROM jobs WHERE preferred=? AND status='queued'", (CODEX_LANE,)).fetchone()[0]
+        return {'enabled': bool(settings), 'alive': time.time() - health.get('beat', 0) < CODEX_HEALTH_SECONDS,
+                'version': health.get('version'), 'active_jobs': active, 'handed_over_waiting': waiting,
+                'parallel': (settings or {}).get('parallel', 3), 'queue_wait_seconds': (settings or {}).get('queue_wait_seconds', 90)}
 
     def due_parked(self, account_id):
         """The parked job this account should re-observe now, if any."""
@@ -771,6 +874,7 @@ class Pool:
         except OSError:
             gates, egress_ok = [], None
         return {'ok': True, 'service': 'local-durable-pool', 'version': VERSION, 'accounts': accounts, 'jobs': counts,
+                'codex_fallback': self.codex_status(),
                 'human_action': gates, 'egress_last_ok': egress_ok,
                 'logins': sorted(groups.values(), key=lambda g: g['login_group']),
                 'configured_capacity': sum(bool(a['enabled']) for a in accounts),
@@ -810,6 +914,21 @@ class Pool:
                     w.write_json(reservation, {'pid': child.pid, 'started': time.time(), 'version': VERSION})
             except OSError as exc:
                 failures.append({'account_id': account['id'], 'code': 'worker_start_failed', 'type': type(exc).__name__})
+        if not fallback_settings(self.root):
+            self.release_codex_handovers()
+        elif not (self.root / 'stop-codex').exists() and not self.codex_status()['alive']:
+            try:
+                with launch_lock(self.root / 'launch-codex.lock') as acquired:
+                    reservation = self.root / 'launch-codex.json'
+                    if acquired and not (reservation.exists() and time.time() - reservation.stat().st_mtime < 20):
+                        with (self.root / 'codex-lane.log').open('ab') as log:
+                            child = subprocess.Popen([sys.executable, str(Path(__file__).with_name('codex_lane.py'))],
+                                         cwd=self.root, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                         creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS) if os.name == 'nt' else 0,
+                                         close_fds=True)
+                        w.write_json(reservation, {'pid': child.pid, 'started': time.time(), 'version': VERSION})
+            except OSError as exc:
+                failures.append({'account_id': CODEX_LANE, 'code': 'worker_start_failed', 'type': type(exc).__name__})
         return failures
 
 
