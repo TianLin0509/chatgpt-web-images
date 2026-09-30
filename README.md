@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.27
+# ChatGPT Web Images 0.7.28
+
+0.7.28 Codex 账号跟随 AI Hub：`codex-fallback.json` 加 `"follow_hub": true` 后，生图使用 AI Hub 当前默认的 Codex 订阅账号（Hub 配置 `providers.codex.subscription_profile`），每 2 秒重读一次，在 Hub 里切换账号后下一轮即生效。Hub 改用 API Key、配置读不到或账号不存在时，Codex 车道停用，交给网页，不会猜测账号；非订阅登录照旧拒绝。`image_status.codex_fallback.account` 显示当前用的是哪个账号。`codex_home` 仍保留一个真实目录，供仍在运行的旧版本进程读取。
 
 0.7.27 调用前一眼可判断能否出图：`status` 新增 `can_generate`、`serving`（codex / web）、`next_action` 与 `advice`，`logins` 里列出 Codex 车道；Codex 优先时网页车道卡验证不再被当成阻塞（`human_action_blocks_generation=false`）。起因（2026-09-30）：一个 agent 只看到网页车道全是 `browser_challenge`，就停下来让用户去点验证，没有提交任务，而 Codex 车道当时空闲。Codex 出图改为干净启动（不加载本机 config.toml 里的 MCP、插件与规则，也不写入 Codex 会话历史），实测每张图输入 token 从 9.4 万–21.1 万降到 3.6 万–8.5 万，约减半。排队中由 Codex 接手的任务 `provider` 也显示 `codex-imagegen`。
 

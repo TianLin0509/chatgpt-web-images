@@ -59,21 +59,56 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.27'
+VERSION = '0.7.28'
 # The Codex fallback lane (codex_lane.py): not a browser account, so it has no row in accounts.
 CODEX_LANE = 'codex'
 # The lane process writes a heartbeat every tick; older than this means it is not running.
 CODEX_HEALTH_SECONDS = 30
 
 
+HUB_ACCOUNT = 'hub'
+
+
+def hub_codex_account(hub_config=None):
+    """The Codex account AI Hub uses by default: providers.codex.subscription_profile of the
+    Hub config, resolved like the Hub does (a profile without a home is ~/.codex). None when
+    the Hub runs Codex on an API key or its config cannot be read; the lane then stays off
+    rather than guess an account."""
+    path = Path(hub_config) if hub_config else Path.home() / '.claude-session-hub' / 'config.json'
+    try:
+        codex = (json.loads(path.read_text(encoding='utf-8')).get('providers') or {}).get('codex') or {}
+    except (OSError, ValueError):
+        return None
+    if codex.get('backend', 'subscription') != 'subscription':
+        return None
+    profiles = {'default': {'label': 'default', 'home': ''},
+                'second': {'label': 'second', 'home': str(Path.home() / '.codex-profiles' / 'second')}}
+    for item in codex.get('subscription_profiles') or []:
+        if isinstance(item, dict) and str(item.get('id') or '').strip():
+            profiles[str(item['id']).strip()] = {'label': str(item.get('label') or item['id']), 'home': str(item.get('home') or '').strip()}
+    wanted = str(codex.get('subscription_profile') or 'default').strip()
+    if wanted not in profiles:
+        return None
+    home = os.path.expanduser(profiles[wanted]['home']) if profiles[wanted]['home'] else str(Path.home() / '.codex')
+    return {'profile': wanted, 'label': profiles[wanted]['label'], 'home': home}
+
+
 def fallback_settings(root):
-    """codex-fallback.json in the pool root: {"enabled": true, "codex_home": "...", "parallel": 3,
-    "queue_wait_seconds": 90}. Off when the file is absent, "enabled" is false or the Codex home
-    is missing. The file is the only switch: every process of the pool reads the same one."""
+    """codex-fallback.json in the pool root: {"enabled": true, "codex_home": "...", "follow_hub": true,
+    "parallel": 8, "queue_wait_seconds": 90}. "follow_hub" draws on the account AI Hub uses by
+    default (read on every lane tick, so switching it in the Hub switches the lane); codex_home
+    stays a real path so processes of older versions still running keep a valid setting.
+    Off when the file is absent, "enabled" is false or the Codex home is missing. The file is
+    the only switch: every process of the pool reads the same one."""
     try:
         settings = json.loads((Path(root) / 'codex-fallback.json').read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return None
+    if settings.get('follow_hub'):
+        account = hub_codex_account(settings.get('hub_config'))
+        if not account:
+            return None
+        settings = {**settings, 'codex_home': account['home'], 'account': {'from': HUB_ACCOUNT, **account}}
     if not settings.get('enabled') or not settings.get('codex_home') or not Path(settings['codex_home']).is_dir():
         return None
     return settings
@@ -857,7 +892,9 @@ class Pool:
         with self.connect() as db:
             active = db.execute("SELECT COUNT(*) FROM jobs WHERE account_id=? AND status IN ('dispatching','running')", (CODEX_LANE,)).fetchone()[0]
             waiting = db.execute("SELECT COUNT(*) FROM jobs WHERE preferred=? AND status='queued'", (CODEX_LANE,)).fetchone()[0]
-        return {'enabled': bool(settings), 'prefer': (settings or {}).get('prefer', 'web'), 'alive': time.time() - health.get('beat', 0) < CODEX_HEALTH_SECONDS,
+        account = (settings or {}).get('account') or {'from': 'pinned'}
+        return {'enabled': bool(settings), 'prefer': (settings or {}).get('prefer', 'web'),
+                'account': {k: account[k] for k in ('from', 'profile', 'label') if k in account}, 'alive': time.time() - health.get('beat', 0) < CODEX_HEALTH_SECONDS,
                 'version': health.get('version'), 'degraded_until': health.get('degraded_until', 0), 'active_jobs': active, 'handed_over_waiting': waiting,
                 'parallel': (settings or {}).get('parallel', 3), 'queue_wait_seconds': (settings or {}).get('queue_wait_seconds', 90)}
 

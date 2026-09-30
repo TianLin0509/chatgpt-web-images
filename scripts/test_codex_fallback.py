@@ -649,6 +649,51 @@ class CodexFirstContracts(CodexFallbackContracts):
         job_id = self.submit()
         self.assertEqual(self.pool.claim('primary')['id'], job_id)
 
+class HubAccountContracts(unittest.TestCase):
+    """"follow_hub" draws on the Codex account AI Hub uses by default (owner, 2026-09-30)."""
+
+    def setUp(self):
+        from image_pool import fallback_settings
+        self.fallback_settings = fallback_settings
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.homes = {}
+        for name in ('main', 'other'):
+            home = self.root / name
+            home.mkdir()
+            (home / 'auth.json').write_text(json.dumps({'auth_mode': 'chatgpt'}), encoding='utf-8')
+            self.homes[name] = home
+        self.hub = self.root / 'hub-config.json'
+        self.pool = Pool(self.root / 'pool')
+        w.write_json(self.pool.root / 'codex-fallback.json', {'enabled': True, 'codex_home': str(self.homes['other']), 'follow_hub': True, 'hub_config': str(self.hub),
+                                                             'prefer': 'codex', 'parallel': 2})
+
+    def hub_uses(self, profile, backend='subscription'):
+        w.write_json(self.hub, {'providers': {'codex': {'backend': backend, 'subscription_profile': profile, 'subscription_profiles': [
+            {'id': 'second', 'label': 'Main', 'home': str(self.homes['main'])},
+            {'id': 'third', 'label': 'Other', 'home': str(self.homes['other'])}]}}})
+
+    def test_the_lane_follows_the_hub_default_account(self):
+        self.hub_uses('second')
+        self.assertEqual(Path(self.fallback_settings(self.pool.root)['codex_home']), self.homes['main'])
+        self.assertEqual(self.pool.codex_status()['account'], {'from': 'hub', 'profile': 'second', 'label': 'Main'})
+        self.hub_uses('third')  # switched in the Hub: the next tick draws on that account
+        self.assertEqual(Path(self.fallback_settings(self.pool.root)['codex_home']), self.homes['other'])
+
+    def test_no_account_is_guessed(self):
+        self.assertIsNone(self.fallback_settings(self.pool.root), 'Hub config unreadable')
+        self.hub_uses('second', backend='api')
+        self.assertIsNone(self.fallback_settings(self.pool.root), 'the Hub runs Codex on an API key')
+        self.hub_uses('missing')
+        self.assertIsNone(self.fallback_settings(self.pool.root))
+
+    def test_a_hub_account_without_a_home_is_the_default_codex_home(self):
+        from image_pool import hub_codex_account
+        w.write_json(self.hub, {'providers': {'codex': {'subscription_profile': 'default'}}})
+        self.assertEqual(Path(hub_codex_account(self.hub)['home']), Path.home() / '.codex')
+
+
 # CodexFirstContracts reuses the fixture only; the web-first contracts above assert the
 # opposite routing on purpose and run in their own class.
 for _cls in (CodexFirstContracts, CodexFanOutContracts):

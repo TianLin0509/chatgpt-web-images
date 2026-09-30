@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.28
+
+- `"follow_hub": true` in `codex-fallback.json` draws on the Codex account AI Hub uses by default (`providers.codex.subscription_profile` of the Hub config, resolved like the Hub: a profile without a home is `~/.codex`). Read on every lane tick, so switching the account in the Hub switches the lane. When the Hub runs Codex on an API key, its config cannot be read or the profile is unknown, the lane stays off rather than guess; the subscription-only check still applies. `codex_fallback.account` in `image_status` names the account (profile and label, never paths or tokens). `codex_home` stays a real path so processes of older versions still running keep a valid setting.
+
 ## 0.7.27
 
 - `status` answers "can I submit now?": `can_generate`, `serving` (`codex`, `web` or null), `next_action` (`submit` / `resolve_human_action`), `advice`, and `human_action_blocks_generation`; `logins` lists the Codex lane (`login_group=codex`, lanes = parallel runs) and `parallel_capacity` counts it. Observed 2026-09-30: an agent saw only web lanes in `browser_challenge` with 0 usable, asked the user to pass the check and never submitted, while Codex was idle. The MCP instructions and the skill now say to submit whenever `can_generate` is true.
