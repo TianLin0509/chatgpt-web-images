@@ -603,6 +603,7 @@ class CodexFirstContracts(CodexFallbackContracts):
         self.assertFalse(Worker(self.pool, 'primary', self.runtime).has_waiting_work())
         result = self.pool.get(job_id)
         self.assertEqual((result['served_by'], result['next_action']), ('codex', 'poll_same_job'))
+        self.assertEqual(result['provider'], 'codex-imagegen', 'a queued Codex job does not claim the web')
         self.assertNotIn('blocking_accounts', result)
 
     def test_status_says_submit_although_every_web_lane_waits_for_a_person(self):

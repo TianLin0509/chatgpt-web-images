@@ -595,6 +595,7 @@ class Pool:
             with self.connect() as db:
                 result['queue_position'] = db.execute("SELECT COUNT(*) FROM jobs WHERE status='queued' AND created<=?", (row['created'],)).fetchone()[0]
             result['served_by'] = 'codex'
+            result['provider'] = 'codex-imagegen'  # the web default would say the web draws it
         elif row['status'] == 'queued':
             with self.connect() as db:
                 result['queue_position'] = db.execute("SELECT COUNT(*) FROM jobs WHERE status='queued' AND created<=?", (row['created'],)).fetchone()[0]
