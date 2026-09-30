@@ -84,8 +84,8 @@ def codex_first(root):
     explicit account pins and what Codex handed back. Chosen by the owner 2026-09-30 after the
     web lanes kept stalling: stable generation over token cost."""
     settings = fallback_settings(root)
-    if not settings or settings.get('prefer') != 'codex':
-        return False
+    if not settings or settings.get('prefer') != 'codex' or (Path(root) / 'stop-codex').exists():
+        return False  # a lane stopped by hand still finishes its runs but takes no new work
     try:
         health = json.loads((Path(root) / 'codex-lane-health.json').read_text(encoding='utf-8'))
     except (OSError, ValueError):
@@ -1021,9 +1021,15 @@ class Pool:
         except OSError:
             gates, egress_ok = [], None
         codex = self.codex_status()
+        web_capacity = sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and not a['worker_stalled'] and a['active_job_status'] != 'needs_attention') for a in accounts)
+        # Lanes claim() would actually hand work to: a login waiting for a person or cooling
+        # down takes nothing, although its idle lanes still look ready.
+        gated = {g.get('login_group') for g in gates}
+        web_usable = sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and not a['worker_stalled']
+                              and a['active_job_status'] != 'needs_attention' and a['login_group'] not in gated
+                              and a.get('retry_at', 0) <= time.time()) for a in accounts)
         codex_usable = codex_can_serve(self.root)
         first = codex_usable and codex['prefer'] == 'codex'
-        web_usable = sum(g['usable_lanes'] for g in groups.values())
         logins = sorted(groups.values(), key=lambda g: g['login_group'])
         if codex['enabled']:
             # Listed with the web logins so a caller reading `logins` sees that Codex can draw.
@@ -1040,7 +1046,6 @@ class Pool:
             advice = 'Submit now.'
         else:
             advice = 'No lane can draw right now; relay human_action to the user.'
-        web_capacity = sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and not a['worker_stalled'] and a['active_job_status'] != 'needs_attention') for a in accounts)
         return {'ok': True, 'service': 'local-durable-pool', 'version': VERSION,
                 'can_generate': bool(serving), 'serving': serving, 'next_action': 'submit' if serving else 'resolve_human_action',
                 'advice': advice, 'accounts': accounts, 'jobs': counts,

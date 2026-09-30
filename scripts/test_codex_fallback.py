@@ -618,6 +618,24 @@ class CodexFirstContracts(CodexFallbackContracts):
         self.assertEqual((codex['lanes'], codex['usable_lanes'], codex['provider']), (2, 2, 'codex-imagegen'))
         self.assertEqual(status['parallel_capacity'], 2)
 
+    def test_a_lane_stopped_by_hand_leaves_new_work_to_the_web_at_once(self):
+        from image_pool import codex_first
+        (self.pool.root / 'stop-codex').touch()  # its heartbeat goes on while running jobs finish
+        self.assertFalse(codex_first(self.pool.root))
+        job_id = self.submit()
+        self.assertEqual(self.pool.claim('primary')['id'], job_id)
+
+    def test_web_lanes_of_a_login_waiting_for_a_person_do_not_count_as_serving(self):
+        import human_gate
+        (self.pool.root / 'stop-codex').touch()
+        w.write_json(self.pool.root / 'worker-primary-health.json', {'version': 'x'})
+        with self.pool.connect() as db:
+            db.execute('UPDATE accounts SET heartbeat=? WHERE id=?', (time.time(), 'primary'))
+        self.assertEqual(self.pool.status()['serving'], 'web')
+        human_gate.GateBook(self.pool.root).enter('primary', 'primary', 'browser_challenge')
+        status = self.pool.status()
+        self.assertEqual((status['can_generate'], status['serving']), (False, None), 'claim() gives this login nothing')
+
     def test_status_does_not_send_the_user_to_the_web_while_the_lane_restarts(self):
         (self.pool.root / 'codex-lane-health.json').unlink()  # between stop and the next heartbeat
         self.pool.account_state('primary', 'browser_challenge', False)
