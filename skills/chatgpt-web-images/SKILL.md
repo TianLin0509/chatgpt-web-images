@@ -22,7 +22,7 @@ description: 使用用户自己的 ChatGPT 网页账号生成图片、制作参�
    queued 时先看 blocking_accounts；账号故障后后台会自行重检有限次，仍是 browser_unhealthy 才需排查后 account_check，不通过反复提交试错。worker_stalled 表示进程仍有心跳但操作停滞，不等于可用。已有活动任务不可切换账号。resume 只恢复观察，不重发；同一超时反复出现时交代阻塞原因，不无限 resume。
 11. 只有请求、观察与下载数量相符才是 complete。partial / count_mismatch / failed 必须如实交代，交付已保存文件。确认本地文件存在并用本地看图工具检查，不把图片 base64 放进工具文字。
 
-内部图片模型未核实，称为“ChatGPT 网页生成”。网页走不通时队列会自动改由 Codex 订阅的内置生图工具生成（结果 `provider=codex-imagegen`，带 `fallback_from`），交付时如实说明哪些图来自 Codex；这条降级只用订阅，任何情况下都不走付费 API，也不要另外手动改用其他生图工具。尺寸以原图为准。不绕过登录、校验、额度；密码和验证码只由用户在专属浏览器输入。
+内部图片模型未核实，称为“ChatGPT 网页生成”。本机已设为 Codex 优先：新任务由 Codex 订阅的内置生图工具生成（结果 `provider=codex-imagegen`），网页作为兜底；交付时如实说明图片来源。结果只含文件路径等文字，不要自己直接调用 Codex 生图工具（那会把图片数据带进上下文），统一走本 MCP。任何情况下都不走付费 API。Codex 生成的图同样可以用 `continue_from` 续改。尺寸以原图为准。不绕过登录、校验、额度；密码和验证码只由用户在专属浏览器输入。
 
 ## MCP 尚未加载
 

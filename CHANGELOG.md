@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.25
+
+- Codex first: `"prefer": "codex"` in `codex-fallback.json` (the owner's choice 2026-09-30 after the web lanes kept stalling: stable generation over token cost). New work goes to Codex at once; web lanes take only explicit account pins and hand-backs. A Codex failure gets one web attempt (follow-up images passed as references) and never bounces back; a hand-back no web lane takes within three queue waits fails with the Codex reason. Without a running lane the web serves everything as before.
+- Codex results can be continued (`continue_from`): the follow-up runs on Codex with the thread's latest images as references.
+- Responses stay compact: Codex usage, thread and routing notes are not returned (paths, sizes, bytes and hashes only).
+
 ## 0.7.24
 
 - Codex fallback lane (`codex_lane.py`, `codex_imagegen.py`). Web lanes stay first; the lane takes a job queued longer than `queue_wait_seconds` (default 90) with no web lane, a web preparation failure (nothing submitted), or a stuck web job about to be parked with no saved file, and generates it with the Codex CLI built-in `image_gen` tool. Measured 2026-09-30: during an OpenAI incident that kept ChatGPT web pages loading forever, Codex produced images in 132-261 s. Several jobs run in parallel (default 3). Results carry `provider=codex-imagegen` and `fallback_from`.

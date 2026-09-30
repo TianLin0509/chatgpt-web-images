@@ -16,9 +16,11 @@ import threading
 import time
 
 import codex_imagegen as cx
-from image_pool import Pool, fallback_settings, VERSION
+from image_pool import Pool, codex_first, fallback_settings, VERSION
 
 TICK_SECONDS = 2
+# Consecutive Codex failures that open the breaker, and how long it stays open.
+BREAKER_FAILURES, BREAKER_SECONDS = 3, 600
 HEALTH_FILE = 'codex-lane-health.json'
 CANCEL_CHECK_SECONDS = 5
 
@@ -51,10 +53,11 @@ def references_for(pool, job, payload):
         return declared[:5]
     if not job.get('thread'):
         return []
+    root = job['thread'][len('codex:'):] if job['thread'].startswith('codex:') else ''
     with pool.connect() as db:
-        rows = db.execute("SELECT result FROM jobs WHERE status IN ('complete','partial','count_mismatch') AND "
-                          "(thread=? OR result LIKE ?) ORDER BY updated DESC LIMIT 5",
-                          (job['thread'], '%' + job['thread'] + '%')).fetchall()
+        rows = db.execute("SELECT result FROM jobs WHERE status IN ('complete','partial','count_mismatch','cancelled') AND id<>? AND "
+                          "(thread=? OR id=? OR result LIKE ?) ORDER BY updated DESC LIMIT 5",
+                          (job.get('id', ''), job['thread'], root, '%' + job['thread'] + '%')).fetchall()
     for row in rows:
         files = [f['path'] for f in json.loads(row['result'] or '{}').get('files', []) if Path(f.get('path', '')).is_file()]
         if files:
@@ -78,6 +81,14 @@ class CodexLane:
         self.pool, self.settings, self.generate = pool, settings, generate
         self.running = {}
         self.lock = threading.Lock()
+        self.failures, self.degraded_until = 0, 0.0
+
+    def outcome(self, ok):
+        with self.lock:
+            self.failures = 0 if ok else self.failures + 1
+            if self.failures >= BREAKER_FAILURES:
+                self.degraded_until, self.failures = time.time() + BREAKER_SECONDS, 0
+                self.log('breaker_open', until=self.degraded_until)
 
     def log(self, event, **fields):
         print(json.dumps({'event': event, 'at': time.time(), **fields}, ensure_ascii=False), flush=True)
@@ -121,6 +132,13 @@ class CodexLane:
                                    references=references, codex_command=self.settings.get('codex_command'),
                                    cancelled=self.cancel_watch(job_id))
         except cx.CodexImageError as exc:
+            if exc.code not in ('codex_cancelled', 'reference_changed'):
+                self.outcome(False)
+            # Codex preferred: a Codex failure gets one web attempt instead of failing the job.
+            if (exc.code not in ('codex_cancelled', 'reference_changed') and codex_first(self.pool.root)
+                    and durable(lambda: self.pool.release_to_web(job_id, {'code': exc.code}, references))):
+                self.log('codex_to_web', job_id=job_id, error_code=exc.code)
+                return
             status = 'cancelled' if exc.code == 'codex_cancelled' else 'failed'
             outcome = {**base, 'status': status, 'files': []}
             if status == 'failed':
@@ -129,11 +147,16 @@ class CodexLane:
             self.log('codex_' + status, job_id=job_id, error_code=exc.code)
             return
         except Exception as exc:
+            self.outcome(False)
+            if codex_first(self.pool.root) and durable(lambda: self.pool.release_to_web(job_id, {'code': 'codex_error'}, references)):
+                self.log('codex_to_web', job_id=job_id, error_code='codex_error')
+                return
             durable(lambda: self.pool.save_result(job_id, {**base, 'status': 'failed', 'files': [],
                                                            'error': {'code': 'codex_error', 'message': type(exc).__name__}}, 'codex-' + job_id))
             self.log('codex_failed', job_id=job_id, error_code='codex_error')
             return
         result.update(base)
+        self.outcome(True)
         if self.pool.row(job_id)['cancel_requested']:
             result['status'] = 'cancelled'  # finished anyway; the saved files stay listed
         # Images exist now: never downgrade this to a failure because a write was busy.
@@ -141,10 +164,15 @@ class CodexLane:
         self.log('codex_finished', job_id=job_id, status=result['status'], files=len(result['files']), seconds=result.get('seconds'))
 
     def tick(self):
+        first = self.settings.get('prefer') == 'codex'
+        if first:
+            self.pool.expire_handbacks(3 * float(self.settings.get('queue_wait_seconds', 90)))
+        if time.time() < self.degraded_until:
+            return  # breaker open: the web serves everything until it closes
         with self.lock:
             free = max(0, int(self.settings.get('parallel', 3)) - len(self.running))
         for _ in range(free):
-            job = self.pool.claim_codex(float(self.settings.get('queue_wait_seconds', 90)), exclude=set(self.running))
+            job = self.pool.claim_codex(float(self.settings.get('queue_wait_seconds', 90)), exclude=set(self.running), first=first)
             if not job:
                 break
             thread = threading.Thread(target=self.run_job, args=(job,), daemon=True)
@@ -158,7 +186,8 @@ def write_health(pool, lane):
     with contextlib.suppress(OSError):
         tmp = health.with_suffix('.tmp')
         tmp.write_text(json.dumps({'version': VERSION, 'pid': os.getpid(), 'beat': time.time(),
-                                   'running': sorted(lane.running) if lane else []}), encoding='utf-8')
+                                   'running': sorted(lane.running) if lane else [],
+                                   'degraded_until': lane.degraded_until if lane else 0}), encoding='utf-8')
         os.replace(tmp, health)
 
 

@@ -346,5 +346,148 @@ class CodexRunnerContracts(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 30)
 
 
+
+class CodexFirstContracts(CodexFallbackContracts):
+    """prefer=codex: Codex is the primary lane, the web the fallback (owner's choice 2026-09-30)."""
+
+    def enable(self, **extra):
+        super().enable(prefer='codex', **extra)
+
+    def test_new_work_goes_to_codex_at_once_and_web_lanes_leave_it(self):
+        job_id = self.submit()
+        self.assertIsNone(self.pool.claim('primary'), 'the web does not take unpinned work')
+        self.run_lane()
+        result = self.pool.get(job_id)
+        self.assertEqual((result['status'], result['provider'], result['fallback_from']), ('complete', 'codex-imagegen', 'codex_first'))
+
+    def test_an_explicit_web_pin_is_respected(self):
+        job_id = self.submit(account_id='primary')
+        self.run_lane()
+        self.assertEqual(self.pool.row(job_id)['status'], 'queued')
+        self.assertEqual(self.pool.claim('primary')['id'], job_id)
+
+    def test_a_codex_failure_gets_one_web_attempt_and_never_bounces_back(self):
+        job_id = self.submit()
+        def broken(**kw):
+            raise cx.CodexImageError('codex_no_image', 'none')
+        self.run_lane(broken)
+        row = self.pool.row(job_id)
+        self.assertEqual((row['status'], row['preferred']), ('queued', 'auto'))
+        self.assertIsNone(self.pool.claim_codex(90, first=True), 'Codex does not take it back')
+        self.assertEqual(self.pool.claim('primary')['id'], job_id, 'the web takes the hand-back')
+        Worker(self.pool, 'primary', self.runtime).record_result(job_id, {'status': 'preparation_failed', 'files': [],
+                                                                          'error': {'code': 'browser_timeout'}}, 'rt')
+        self.assertEqual(self.pool.row(job_id)['status'], 'preparation_failed', 'no ping-pong')
+
+    def test_a_hand_back_no_web_lane_takes_fails_with_the_codex_reason(self):
+        job_id = self.submit()
+        self.pool.claim_codex(90, first=True)
+        self.pool.release_to_web(job_id, {'code': 'codex_timeout'})
+        self.pool.expire_handbacks(270)
+        self.assertEqual(self.pool.row(job_id)['status'], 'queued', 'a fresh hand-back waits for the web')
+        with self.pool.connect() as db:
+            note = json.loads(db.execute('SELECT result FROM jobs WHERE id=?', (job_id,)).fetchone()['result'])
+            note['to_web_at'] -= 1000
+            db.execute('UPDATE jobs SET result=? WHERE id=?', (json.dumps(note), job_id))
+        self.pool.expire_handbacks(270)
+        result = self.pool.get(job_id)
+        self.assertEqual((result['status'], result['error']['code']), ('failed', 'codex_timeout'))
+
+    def test_a_codex_result_can_be_continued_with_its_images(self):
+        parent = self.submit('parent')
+        self.run_lane()
+        self.assertEqual(self.pool.get(parent)['status'], 'complete')
+        child = self.pool.submit(prompt='Make it blue.', output_dir=str(self.out), request_id='child', continue_from=parent)['job_id']
+        row = self.pool.row(child)
+        self.assertEqual((row['preferred'], row['thread']), (CODEX_LANE, 'codex:' + parent))
+        self.run_lane()
+        self.assertEqual(self.pool.get(child)['status'], 'complete')
+        refs = self.calls[-1]['references']
+        self.assertEqual([Path(r).name for r in refs], [Path(f['path']).name for f in self.pool.get(parent)['files']])
+
+    def test_results_carry_paths_not_codex_internals(self):
+        job_id = self.submit()
+        self.calls = []
+        def with_internals(**kw):
+            result = self.fake_generate(**kw)
+            result.update(codex_usage={'input_tokens': 120000}, codex_thread='t-1')
+            return result
+        self.run_lane(with_internals)
+        result = self.pool.get(job_id)
+        self.assertNotIn('codex_usage', result)
+        self.assertNotIn('codex_thread', result)
+        self.assertEqual(set(result['files'][0]), {'path', 'width', 'height', 'bytes', 'sha256'})
+        self.assertLess(len(json.dumps(result)), 2000, 'compact text, no image data')
+
+    def test_an_old_hand_back_is_never_pulled_back_by_codex(self):
+        job_id = self.submit()
+        self.pool.claim_codex(90, first=True)
+        self.pool.release_to_web(job_id, {'code': 'codex_timeout'})
+        self.age(job_id, 10000)
+        self.assertIsNone(self.pool.claim_codex(90, first=True))
+        self.assertIsNone(self.pool.claim_codex(90, first=False))
+
+    def test_a_codex_follow_up_handed_to_the_web_starts_there_with_its_images(self):
+        parent = self.submit('parent')
+        self.run_lane()
+        child = self.pool.submit(prompt='Make it blue.', output_dir=str(self.out), request_id='child', continue_from=parent)['job_id']
+        def broken(**kw):
+            raise cx.CodexImageError('codex_no_image', 'none')
+        self.run_lane(broken)
+        payload = json.loads(self.pool.row(child)['payload'])
+        self.assertEqual(len(payload['reference_images']), 1)
+        self.assertEqual(payload['conversation_url'], '')
+        worker = Worker(self.pool, 'primary', self.runtime)
+        worker.tick(); worker.tick()
+        self.assertEqual(self.runtime.starts, 1, 'the pool-rewritten payload is not a changed reference')
+
+    def test_a_parked_job_codex_already_tried_is_not_pulled_back(self):
+        job_id = self.submit()
+        self.pool.claim_codex(90, first=True)
+        self.pool.release_to_web(job_id, {'code': 'codex_timeout'})
+        self.pool.account_state('primary', 'browser_challenge', False)
+        with self.pool.connect() as db:
+            db.execute("UPDATE jobs SET status='parked',account_id='primary',park_count=4 WHERE id=?", (job_id,))
+        self.assertIsNone(self.pool.claim_codex(90, first=True))
+
+    def test_repeated_codex_failures_open_the_breaker_and_the_web_takes_over(self):
+        def broken(**kw):
+            raise cx.CodexImageError('codex_missing', 'gone')
+        lane = CodexLane(self.pool, fallback_settings(self.pool.root), generate=broken)
+        for key in ('b1', 'b2', 'b3'):
+            self.submit(key)
+            lane.tick()
+            for t in list(lane.running.values()):
+                t.join(5)
+        self.assertGreater(lane.degraded_until, time.time())
+        import codex_lane
+        codex_lane.write_health(self.pool, lane)
+        from image_pool import codex_first
+        self.assertFalse(codex_first(self.pool.root))
+        job_id = self.submit('after')
+        with self.pool.connect() as db:  # only the new, never-handed-back job is left for the web
+            db.execute("UPDATE jobs SET status='cancelled' WHERE id<>?", (job_id,))
+        self.assertEqual(self.pool.claim('primary')['id'], job_id, 'breaker open: unpinned work goes to the web again')
+
+    def test_unpinned_work_does_not_wake_web_lanes_and_is_reported_as_codex_served(self):
+        job_id = self.submit()
+        self.pool.account_state('primary', 'browser_unhealthy', False)
+        self.assertFalse(Worker(self.pool, 'primary', self.runtime).has_waiting_work())
+        result = self.pool.get(job_id)
+        self.assertEqual((result['served_by'], result['next_action']), ('codex', 'poll_same_job'))
+        self.assertNotIn('blocking_accounts', result)
+
+    def test_without_a_running_lane_the_web_takes_everything(self):
+        (self.pool.root / 'codex-lane-health.json').unlink()
+        job_id = self.submit()
+        self.assertEqual(self.pool.claim('primary')['id'], job_id)
+
+# CodexFirstContracts reuses the fixture only; the web-first contracts above assert the
+# opposite routing on purpose and run in their own class.
+for _name in [n for n in vars(CodexFallbackContracts) if n.startswith('test_')]:
+    if _name not in vars(CodexFirstContracts):
+        setattr(CodexFirstContracts, _name, None)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

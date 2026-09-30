@@ -59,7 +59,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.24'
+VERSION = '0.7.25'
 # The Codex fallback lane (codex_lane.py): not a browser account, so it has no row in accounts.
 CODEX_LANE = 'codex'
 # The lane process writes a heartbeat every tick; older than this means it is not running.
@@ -77,6 +77,29 @@ def fallback_settings(root):
     if not settings.get('enabled') or not settings.get('codex_home') or not Path(settings['codex_home']).is_dir():
         return None
     return settings
+
+
+def codex_first(root):
+    """"prefer": "codex" and the lane is running: new work goes to Codex; the web takes only
+    explicit account pins and what Codex handed back. Chosen by the owner 2026-09-30 after the
+    web lanes kept stalling: stable generation over token cost."""
+    settings = fallback_settings(root)
+    if not settings or settings.get('prefer') != 'codex':
+        return False
+    try:
+        health = json.loads((Path(root) / 'codex-lane-health.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return False
+    # A lane that keeps failing (CLI gone, login changed) opens its breaker: the web serves
+    # everything until it closes, instead of every job paying a Codex failure first.
+    if time.time() - health.get('beat', 0) >= CODEX_HEALTH_SECONDS or health.get('degraded_until', 0) > time.time():
+        return False
+    import codex_imagegen
+    try:
+        codex_imagegen.check_home(settings['codex_home'])
+    except codex_imagegen.CodexImageError:
+        return False
+    return True
 
 
 @contextlib.contextmanager
@@ -306,6 +329,18 @@ class Pool:
         group = login_group(self.account(row['account_id'])) if row['account_id'] else 'auto'
         return conversation, group
 
+    def codex_parent(self, job_id):
+        """The Codex thread a follow-up of this job continues, or None for a web result."""
+        row = self.row(job_id)
+        result = json.loads(row['result'] or '{}')
+        if row['account_id'] != CODEX_LANE and result.get('provider') != 'codex-imagegen':
+            return None
+        if row['status'] not in TERMINAL:
+            raise w.ImageError('continue_while_active', 'Finish or cancel that job before asking a follow-up about it.')
+        if not result.get('files'):
+            raise w.ImageError('continue_without_images', 'That job saved no image, so there is nothing to continue from.')
+        return row['thread'] if row['thread'].startswith('codex:') else 'codex:' + row['id']
+
     def prepare(self, account_id='auto', **kwargs):
         """Resolve one request into everything the queue needs, touching nothing yet."""
         with self.connect() as db:
@@ -313,17 +348,25 @@ class Pool:
                 raise w.ImageError('no_accounts', 'Register and log in to at least one isolated account before submitting.')
         parent = kwargs.pop('continue_from', '')
         thread = ''
-        if parent:
+        codex_thread = self.codex_parent(parent) if parent else None
+        if codex_thread:
+            # A Codex result has no web conversation: the follow-up goes to Codex, which
+            # receives the images of that thread as references.
+            thread = codex_thread
+            if account_id == 'auto':
+                account_id = CODEX_LANE
+        elif parent:
             thread, group = self.continuation(parent)
             kwargs['conversation_url'] = thread
             # The follow-up must reach the login that owns the conversation; any of its
             # lanes will do, so this pins the login rather than one browser profile.
-            if account_id == 'auto':
+            # With Codex first it stays unpinned: Codex takes it with that conversation's images.
+            if account_id == 'auto' and not codex_first(self.root):
                 account_id = group
             elif login_group(self.account(account_id)) != group:
                 raise w.ImageError('continue_wrong_account',
                                    'That conversation belongs to a different ChatGPT login.')
-        if account_id != 'auto':
+        if account_id not in ('auto', CODEX_LANE):
             self.account(account_id)
         payload, digest = w.validate_request(**kwargs)
         digest = hashlib.sha256((digest + '\n' + account_id).encode()).hexdigest()
@@ -526,7 +569,12 @@ class Pool:
             result['parked_reason'] = 'lane_released_for_queue'
             result['auto_retry_attempts_left'] = max(0, len(ADOPT_BACKOFF) - row['park_count'] + 1)
             result['auto_retry_at'] = row['retry_after'] if not attended else None
-        if row['status'] == 'queued':
+        if row['status'] == 'queued' and row['preferred'] in ('auto', CODEX_LANE) and codex_first(self.root) \
+                and not json.loads(row['result'] or '{}').get('to_web'):
+            with self.connect() as db:
+                result['queue_position'] = db.execute("SELECT COUNT(*) FROM jobs WHERE status='queued' AND created<=?", (row['created'],)).fetchone()[0]
+            result['served_by'] = 'codex'
+        elif row['status'] == 'queued':
             with self.connect() as db:
                 result['queue_position'] = db.execute("SELECT COUNT(*) FROM jobs WHERE status='queued' AND created<=?", (row['created'],)).fetchone()[0]
             lanes = self.status()['accounts']
@@ -549,7 +597,8 @@ class Pool:
         else:
             result = {k: v for k, v in result.items() if k not in {
                 'conversation_url', 'output_dir', 'prompt_sha256', 'submitted_prompt_sha256',
-                'reference_count', 'window_hidden', '_resume_requested'}}
+                'reference_count', 'window_hidden', '_resume_requested', 'codex_usage', 'codex_thread',
+                'to_web', 'codex_tried', 'web_account', 'web_preferred'}}
             if 'files' in result:
                 result['files'] = [{k: v for k, v in f.items() if k in
                     {'path', 'width', 'height', 'bytes', 'sha256'}} for f in result['files']]
@@ -647,8 +696,9 @@ class Pool:
             row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
             if row is None or row['status'] in TERMINAL or row['cancel_requested']:
                 return False
-            if json.loads(row['result'] or '{}').get('files'):
-                return False
+            previous = json.loads(row['result'] or '{}')
+            if previous.get('files') or previous.get('codex_tried'):
+                return False  # Codex already failed this job: no ping-pong, the web failure stands
             note = {'status': 'queued', 'files': [], 'fallback_from': (error or {}).get('code') or row['status'],
                     'web_account': row['account_id'], 'web_preferred': row['preferred']}
             db.execute("UPDATE jobs SET status='queued',preferred=?,account_id=NULL,runtime_id=NULL,result=?,error=NULL,"
@@ -656,18 +706,32 @@ class Pool:
                        (CODEX_LANE, json.dumps(note), time.time(), job_id))
         return True
 
-    def claim_codex(self, queue_wait_seconds, exclude=()):
+    def claim_codex(self, queue_wait_seconds, exclude=(), first=False):
         """The next job for the Codex lane: one handed over by a web lane, or one no web lane
         has taken within queue_wait_seconds."""
         with self.transaction() as db:
             now = time.time()
+            if first:
+                # Codex preferred: every unpinned job at once; explicit web pins only after the
+                # long wait; jobs Codex already handed back to the web stay there.
+                row = db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 AND ("
+                                 "(preferred IN (?, 'auto') AND COALESCE(result, '') NOT LIKE ?) OR "
+                                 "(created<=? AND COALESCE(result, '') NOT LIKE ?)) ORDER BY created, id LIMIT 1",
+                                 (CODEX_LANE, '%"to_web": true%', now - 3 * queue_wait_seconds, '%"codex_tried": true%')).fetchone()
+                if row and row['id'] not in exclude:
+                    note = (json.loads(row['result'] or '{}') if row['preferred'] == CODEX_LANE
+                            else {'status': 'queued', 'files': [], 'fallback_from': 'codex_first'})
+                    db.execute("UPDATE jobs SET status='dispatching',account_id=?,runtime_id=NULL,result=?,updated=? WHERE id=?",
+                               (CODEX_LANE, json.dumps(note), time.time(), row['id']))
+                    return dict(db.execute('SELECT * FROM jobs WHERE id=?', (row['id'],)).fetchone())
+                return None
             # Unpinned new work waits queue_wait_seconds for a web lane; work pinned to an account
             # or continuing a conversation waits three times as long, since only the web keeps it
             # in that conversation (the Codex fallback passes its last images as references).
-            row = db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 AND "
+            row = db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 AND COALESCE(result, '') NOT LIKE ? AND "
                              "(preferred=? OR (preferred='auto' AND thread='' AND created<=?) OR created<=?) "
                              "ORDER BY (preferred=?) DESC, created, id LIMIT 1",
-                             (CODEX_LANE, now - queue_wait_seconds, now - 3 * queue_wait_seconds, CODEX_LANE)).fetchone()
+                             ('%"codex_tried": true%', CODEX_LANE, now - queue_wait_seconds, now - 3 * queue_wait_seconds, CODEX_LANE)).fetchone()
             note = None
             if row and row['id'] not in exclude:
                 note = json.loads(row['result'] or '{}')
@@ -693,7 +757,8 @@ class Pool:
                           "LEFT JOIN accounts a ON a.id=j.account_id WHERE j.status=? AND j.cancel_requested=0 "
                           "AND j.created>=? ORDER BY j.created, j.id", (PARKED, now - 86400)).fetchall()
         for row in rows:
-            if row['id'] in exclude or json.loads(row['result'] or '{}').get('files'):
+            note = json.loads(row['result'] or '{}')
+            if row['id'] in exclude or note.get('files') or note.get('codex_tried'):
                 continue
             if not row['lane_enabled'] or not row['lane_ready'] or row['park_count'] > len(ADOPT_BACKOFF):
                 return row
@@ -703,7 +768,8 @@ class Pool:
         """Hand work over only to a lane that is configured, running and on a subscription login;
         otherwise the job keeps its web failure instead of waiting for nobody."""
         settings = fallback_settings(self.root)
-        if not settings or not self.codex_status()['alive']:
+        status = self.codex_status()
+        if not settings or not status['alive'] or status.get('degraded_until', 0) > time.time():
             return False
         import codex_imagegen
         try:
@@ -711,6 +777,41 @@ class Pool:
         except codex_imagegen.CodexImageError:
             return False
         return True
+
+    def release_to_web(self, job_id, error, references=()):
+        """Codex could not make it: the web tries once (Codex never takes it back). A follow-up
+        gives the web the images it refers to as ordinary reference images."""
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None or row['cancel_requested']:
+                return False
+            payload = json.loads(row['payload'])
+            if references and not payload.get('reference_images') and row['thread'].startswith('codex:'):
+                payload['reference_images'] = [str(r) for r in references][:5]
+            if str(payload.get('conversation_url', '')).startswith('codex:'):
+                payload['conversation_url'] = ''
+            back = 'auto' if row['preferred'] == CODEX_LANE else row['preferred']
+            note = {'status': 'queued', 'files': [], 'to_web': True, 'codex_tried': True, 'to_web_at': time.time(),
+                    'fallback_from': (error or {}).get('code') or 'codex_failed'}
+            db.execute("UPDATE jobs SET status='queued',preferred=?,account_id=NULL,runtime_id=NULL,result=?,error=NULL,"
+                       "payload=?,thread=?,failures=0,park_count=0,retry_after=0,updated=? WHERE id=?",
+                       (back, json.dumps(note), json.dumps(payload, ensure_ascii=False),
+                        '' if row['thread'].startswith('codex:') else row['thread'], time.time(), job_id))
+        return True
+
+    def expire_handbacks(self, wait_seconds):
+        """A job Codex handed back that no web lane took in time fails with Codex's reason
+        instead of waiting forever (the web may be down as well)."""
+        with self.transaction() as db:
+            for row in db.execute("SELECT id,result FROM jobs WHERE status='queued' AND result LIKE ?",
+                                  ('%"to_web": true%',)).fetchall():
+                note = json.loads(row['result'] or '{}')
+                if time.time() - note.get('to_web_at', 0) < wait_seconds:
+                    continue
+                error = {'code': note.get('fallback_from') or 'codex_failed',
+                         'message': 'Codex could not generate this image and no web lane took it over in time.'}
+                db.execute("UPDATE jobs SET status='failed',error=?,result=?,updated=? WHERE id=?",
+                           (json.dumps(error), json.dumps({**note, 'status': 'failed', 'error': error}), time.time(), row['id']))
 
     def release_codex_handovers(self):
         """The lane stopped or was switched off: waiting hand-overs return to their web queue."""
@@ -734,8 +835,8 @@ class Pool:
         with self.connect() as db:
             active = db.execute("SELECT COUNT(*) FROM jobs WHERE account_id=? AND status IN ('dispatching','running')", (CODEX_LANE,)).fetchone()[0]
             waiting = db.execute("SELECT COUNT(*) FROM jobs WHERE preferred=? AND status='queued'", (CODEX_LANE,)).fetchone()[0]
-        return {'enabled': bool(settings), 'alive': time.time() - health.get('beat', 0) < CODEX_HEALTH_SECONDS,
-                'version': health.get('version'), 'active_jobs': active, 'handed_over_waiting': waiting,
+        return {'enabled': bool(settings), 'prefer': (settings or {}).get('prefer', 'web'), 'alive': time.time() - health.get('beat', 0) < CODEX_HEALTH_SECONDS,
+                'version': health.get('version'), 'degraded_until': health.get('degraded_until', 0), 'active_jobs': active, 'handed_over_waiting': waiting,
                 'parallel': (settings or {}).get('parallel', 3), 'queue_wait_seconds': (settings or {}).get('queue_wait_seconds', 90)}
 
     def due_parked(self, account_id):
@@ -778,7 +879,9 @@ class Pool:
                 # from absorbing a whole burst, so a busier login lets the other go first.
                 if not self.fair_turn(db, group):
                     return None
-                queued = db.execute("SELECT * FROM jobs WHERE status='queued' AND preferred='auto' AND " + free +
+                # Codex first: unpinned work belongs to Codex unless Codex handed it back.
+                handed_back = " AND result LIKE '%\"to_web\": true%'" if codex_first(self.root) else ''
+                queued = db.execute("SELECT * FROM jobs WHERE status='queued' AND preferred='auto' AND " + free + handed_back +
                                     " ORDER BY created,id LIMIT 1").fetchone()
             if not queued:
                 return None

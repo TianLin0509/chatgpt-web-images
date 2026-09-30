@@ -11,7 +11,7 @@ import time
 import sqlite3
 
 import web_images as w
-from image_pool import ADOPT_BACKOFF, PARK_AFTER_SECONDS, PARKED, Pool, TERMINAL, VERSION
+from image_pool import ADOPT_BACKOFF, PARK_AFTER_SECONDS, PARKED, Pool, TERMINAL, VERSION, codex_first
 import human_gate
 
 # Waiting for generation is minutes long, so tick fast only when something can change.
@@ -92,8 +92,10 @@ class Worker:
     def has_waiting_work(self):
         # Idle lanes never navigate browsers just to refresh a health badge.
         group=self.pool.account(self.account_id).get('login_group') or self.account_id
+        # With Codex first, unpinned work is the web's only once Codex handed it back.
+        auto = "(preferred='auto' AND result LIKE '%\"to_web\": true%')" if codex_first(self.pool.root) else "preferred='auto'"
         with self.pool.connect() as db:
-            return bool(db.execute("SELECT 1 FROM jobs WHERE (account_id=? AND (status IN ('dispatching','running','needs_attention') OR (status='parked' AND park_count<=? AND retry_after<=?))) OR (status='queued' AND preferred IN ('auto',?,?)) LIMIT 1",
+            return bool(db.execute("SELECT 1 FROM jobs WHERE (account_id=? AND (status IN ('dispatching','running','needs_attention') OR (status='parked' AND park_count<=? AND retry_after<=?))) OR (status='queued' AND (preferred IN (?,?) OR "+auto+")) LIMIT 1",
                                    (self.account_id,len(ADOPT_BACKOFF),time.time(),self.account_id,group)).fetchone())
 
     def record_result(self, job_id, result, runtime_id=None, *, confirm_recovery=True):
@@ -348,7 +350,8 @@ class Worker:
                 import hashlib
                 digest = hashlib.sha256((digest + '\n' + job['preferred']).encode()).hexdigest()
                 index = self.runtime.DATA / 'requests' / (payload['request_id'] + '.json')
-                if digest != job['request_hash'] and not index.exists():
+                rewritten = json.loads(job['result'] or '{}').get('to_web')  # the pool changed it on hand-back
+                if digest != job['request_hash'] and not index.exists() and not rewritten:
                     raise w.ImageError('reference_changed', 'Reference content changed while queued; restore it or cancel this job explicitly.')
                 result = self.runtime.start(**payload)
                 self.record_result(job['id'], result, result['job_id'])

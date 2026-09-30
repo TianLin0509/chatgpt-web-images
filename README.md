@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.24
+# ChatGPT Web Images 0.7.25
+
+0.7.25 可把 Codex 设为首选（`codex-fallback.json` 里加 `"prefer": "codex"`，本机已开启）：新任务立即交给 Codex 订阅生成（默认最多 4 个并行），网页车道只处理调用方明确指定账号的任务和 Codex 交回的任务。Codex 失败时交给网页重试一次，网页再失败就如实报错，不来回转；交回的任务若没有网页车道接手，按 Codex 的原因报失败，不无限等待。Codex 车道没在运行时网页照常接手全部任务。Codex 生成的图也能 `continue_from` 续改，上一轮的图作为参考图。返回结果只有文字和文件路径（路径、宽高、字节数、校验值），不含图片数据，也不含 Codex 内部记录。
 
 0.7.24 新增 Codex 订阅降级车道：网页车道仍是首选，但网页走不通时自动改由 Codex CLI 内置的 `image_gen` 工具生成，不经过浏览器，所以不受 Cloudflare 验证、页面卡死或 ChatGPT 网页事故影响（2026-09-30 实测：网页正处于官方故障期间，Codex 仍 132 秒出图）。触发条件：任务排队超过 `queue_wait_seconds`（默认 90 秒）还没有网页车道接手；网页在准备阶段失败（尚未提交）；网页任务卡住要被挂起、且还没保存任何图片。多个降级任务并行（默认 3 个）。结果标注 `provider=codex-imagegen` 和 `fallback_from`。**只用订阅**：Codex 目录必须是 ChatGPT 订阅登录（`auth_mode=chatgpt`），否则拒绝运行；调用时环境里所有 API Key 变量都被移除。配置写在队列目录的 `codex-fallback.json`：`{"enabled": true, "codex_home": "<Codex 订阅登录目录>", "parallel": 3, "queue_wait_seconds": 90}`；没有这个文件或 `"enabled": false` 就不启用（这是唯一开关，所有进程读同一个文件）；关闭时已转交、还在排队的任务自动退回网页队列。续图任务降级时，会把该对话最近一次的图片作为参考图交给 Codex。
 
