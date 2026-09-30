@@ -23,6 +23,11 @@ PROVIDER = 'codex-imagegen'
 # One image took 132-196 s, two 261 s; allow generously, then stop the whole process tree.
 BASE_SECONDS, PER_IMAGE_SECONDS, MAX_SECONDS = 300, 180, 3600
 IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.webp'}
+# A drawing run needs the image tool only. The owner's config.toml brings MCP servers, plugins
+# and skills: measured 2026-09-30, one image read 117k input tokens with it and 42k without.
+# The login still comes from CODEX_HOME. --ephemeral keeps drawing runs out of the owner's
+# Codex session history (the image files are saved all the same).
+CLEAN_START = ['--ignore-user-config', '--ignore-rules', '--ephemeral']
 
 
 class CodexImageError(RuntimeError):
@@ -176,7 +181,7 @@ def generate(*, prompt, count, output_dir, name, job_id, codex_home, work_dir, r
     work_dir = Path(work_dir); work_dir.mkdir(parents=True, exist_ok=True)
     output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
     argv = command(codex_command) + ['exec', '--json', '--skip-git-repo-check', '-C', str(work_dir),
-                                     '--sandbox', 'read-only',
+                                     '--sandbox', 'read-only'] + CLEAN_START + [
                                      '-c', 'approval_policy="never"', '-c', 'model_provider="openai"',
                                      '-c', 'model_reasoning_effort="low"']
     for ref in references:

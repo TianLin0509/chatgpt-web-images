@@ -36,7 +36,13 @@ def create_mcp(pool=None):
     pool = pool or Pool()
     server = FastMCP('chatgpt-web-images', instructions=(
         'Shared durable local image queue for ALL agents. Run work in parallel on purpose.\n\n'
-        'CONCURRENCY: one lane is one browser profile and runs one job at a time. Concurrency '
+        'BEFORE SUBMITTING: image_status reports can_generate and serving. When can_generate is true, '
+        'submit at once. serving=codex means the Codex subscription draws new work and the web lanes '
+        'are only a fallback: a web lane stuck on a verification check or signed out does not block '
+        'anything, so do not check web lanes or ask the user to verify. Only when can_generate is '
+        'false relay human_action to the user.\n\n'
+        'CONCURRENCY: Codex draws each image of a job as its own parallel run, shared by all jobs. '
+        'On the web, one lane is one browser profile and runs one job at a time. Concurrency '
         'equals the number of lanes, NOT the number of ChatGPT accounts. image_status reports '
         'lanes and load per login. account_id=auto picks a free lane and balances across logins '
         'so no single account absorbs a burst.\n\n'
@@ -71,7 +77,7 @@ def create_mcp(pool=None):
 
     @server.tool(structured_output=False)
     async def image_status() -> str:
-        """Read cached lane health, per-login load, running jobs, queue and account-action results. Does not navigate browsers."""
+        """Read whether images can be generated now (can_generate, serving, advice), lane health, per-login load, running jobs, queue and account-action results. Does not navigate browsers."""
         return await call(lambda: wake(pool, pool.status()))
 
     @server.tool(structured_output=False)

@@ -59,7 +59,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.26'
+VERSION = '0.7.27'
 # The Codex fallback lane (codex_lane.py): not a browser account, so it has no row in accounts.
 CODEX_LANE = 'codex'
 # The lane process writes a heartbeat every tick; older than this means it is not running.
@@ -998,12 +998,35 @@ class Pool:
             gates, egress_ok = human_gate.GateBook(self.root).summary()
         except OSError:
             gates, egress_ok = [], None
-        return {'ok': True, 'service': 'local-durable-pool', 'version': VERSION, 'accounts': accounts, 'jobs': counts,
-                'codex_fallback': self.codex_status(),
-                'human_action': gates, 'egress_last_ok': egress_ok,
-                'logins': sorted(groups.values(), key=lambda g: g['login_group']),
+        codex = self.codex_status()
+        first = codex_first(self.root)
+        codex_usable = bool(codex['enabled'] and codex['alive'] and codex['degraded_until'] <= time.time())
+        web_usable = sum(g['usable_lanes'] for g in groups.values())
+        logins = sorted(groups.values(), key=lambda g: g['login_group'])
+        if codex['enabled']:
+            # Listed with the web logins so a caller reading `logins` sees that Codex can draw.
+            logins.append({'login_group': CODEX_LANE, 'provider': 'codex-imagegen', 'lanes': codex['parallel'],
+                           'enabled_lanes': codex['parallel'], 'usable_lanes': codex['parallel'] if codex_usable else 0,
+                           'busy_lanes': codex['active_jobs'], 'parked_jobs': 0})
+        # One answer to "can I submit now?": an agent that sees only web lanes stuck on a check
+        # otherwise stops and asks the user to verify, although Codex would draw the images.
+        serving = 'codex' if first else ('web' if web_usable else ('codex' if codex_usable else None))
+        if first:
+            advice = ('Submit now. Codex draws new work; the web lanes are only a fallback, so their login or '
+                      'verification state does not block anything and needs no user action.')
+        elif serving:
+            advice = 'Submit now.'
+        else:
+            advice = 'No lane can draw right now; relay human_action to the user.'
+        web_capacity = sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and not a['worker_stalled'] and a['active_job_status'] != 'needs_attention') for a in accounts)
+        return {'ok': True, 'service': 'local-durable-pool', 'version': VERSION,
+                'can_generate': bool(serving), 'serving': serving, 'next_action': 'submit' if serving else 'resolve_human_action',
+                'advice': advice, 'accounts': accounts, 'jobs': counts,
+                'codex_fallback': codex,
+                'human_action': gates, 'human_action_blocks_generation': not serving, 'egress_last_ok': egress_ok,
+                'logins': logins,
                 'configured_capacity': sum(bool(a['enabled']) for a in accounts),
-                'parallel_capacity': sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and not a['worker_stalled'] and a['active_job_status'] != 'needs_attention') for a in accounts)}
+                'parallel_capacity': web_capacity + (codex['parallel'] if codex_usable else 0)}
 
     def worker_health(self, account_id):
         try:

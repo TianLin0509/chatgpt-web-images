@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.26
+# ChatGPT Web Images 0.7.27
+
+0.7.27 调用前一眼可判断能否出图：`status` 新增 `can_generate`、`serving`（codex / web）、`next_action` 与 `advice`，`logins` 里列出 Codex 车道；Codex 优先时网页车道卡验证不再被当成阻塞（`human_action_blocks_generation=false`）。起因（2026-09-30）：一个 agent 只看到网页车道全是 `browser_challenge`，就停下来让用户去点验证，没有提交任务，而 Codex 车道当时空闲。Codex 出图改为干净启动（不加载本机 config.toml 里的 MCP、插件与规则，也不写入 Codex 会话历史），实测每张图输入 token 从约 11.7 万降到约 4.2 万。
 
 0.7.26 Codex 按张并行：一个要 N 张图的任务拆成 N 路同时画（每路一个 Codex 进程，只画 1 张，并被告知"这是第 i 个方案，请用不同构图"），`parallel` 改为全局同时运行的 Codex 进程数，所有任务共用；新任务只在有空位时领取。每画完一张就写回任务，轮询能看到张数逐步增加；部分失败时交付已画好的图并标注数量不足。实测（2026-09-30）：2 个任务各 4 张、8 路并行，8/8 成功，约 3.3 分钟全部完成，未触发限流；此前一次画完多张要 4–12 分钟。`"fanout": false` 可恢复一次对话画完全部。修改 `parallel` 后需重启降级车道（队列目录建 `stop-codex`，心跳消失后删除，下一次调用会自动拉起）。
 

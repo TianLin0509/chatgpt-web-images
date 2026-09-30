@@ -260,6 +260,16 @@ class CodexFallbackContracts(unittest.TestCase):
         status = self.pool.status()['codex_fallback']
         self.assertEqual((status['enabled'], status['alive'], status['parallel']), (True, True, 2))
 
+    def test_status_answers_whether_images_can_be_made_now(self):
+        self.pool.account_state('primary', 'browser_challenge', False)
+        status = self.pool.status()
+        self.assertEqual((status['can_generate'], status['serving']), (True, 'codex'), 'Codex still takes auto work after the wait')
+        (self.pool.root / 'codex-lane-health.json').unlink()
+        status = self.pool.status()
+        self.assertEqual((status['can_generate'], status['serving'], status['next_action']), (False, None, 'resolve_human_action'))
+        self.assertTrue(status['human_action_blocks_generation'])
+        self.assertEqual({g['login_group']: g for g in status['logins']}['codex']['usable_lanes'], 0)
+
 
 class CodexFanOutContracts(CodexFallbackContracts):
     """Every image of a job is its own Codex run, in parallel within the lane's slots."""
@@ -430,6 +440,8 @@ class CodexRunnerContracts(unittest.TestCase):
         self.assertNotIn('OPENAI_API_KEY', seen['env'])
         self.assertIn('read-only', seen['argv'])
         self.assertIn('model_provider="openai"', seen['argv'])
+        for flag in ('--ignore-user-config', '--ignore-rules', '--ephemeral'):
+            self.assertIn(flag, seen['argv'], 'a drawing run starts clean: no MCP servers, plugins or history entry')
 
     def test_no_image_is_an_error_not_an_empty_success(self):
         self.login('chatgpt')
@@ -590,6 +602,18 @@ class CodexFirstContracts(CodexFallbackContracts):
         result = self.pool.get(job_id)
         self.assertEqual((result['served_by'], result['next_action']), ('codex', 'poll_same_job'))
         self.assertNotIn('blocking_accounts', result)
+
+    def test_status_says_submit_although_every_web_lane_waits_for_a_person(self):
+        # 2026-09-30: an agent read only the web lanes (browser_challenge, 0 usable), asked the
+        # user to pass the check and never submitted, while Codex was idle.
+        self.pool.account_state('primary', 'browser_challenge', False)
+        status = self.pool.status()
+        self.assertEqual((status['can_generate'], status['serving'], status['next_action']), (True, 'codex', 'submit'))
+        self.assertFalse(status['human_action_blocks_generation'])
+        self.assertIn('does not block', status['advice'])
+        codex = {g['login_group']: g for g in status['logins']}['codex']
+        self.assertEqual((codex['lanes'], codex['usable_lanes'], codex['provider']), (2, 2, 'codex-imagegen'))
+        self.assertEqual(status['parallel_capacity'], 2)
 
     def test_without_a_running_lane_the_web_takes_everything(self):
         (self.pool.root / 'codex-lane-health.json').unlink()
