@@ -122,6 +122,19 @@ class CodexFallbackContracts(unittest.TestCase):
         self.assertTrue(Worker(self.pool, 'primary', self.runtime).park(dict(job, runtime_id=None)))
         self.assertEqual(self.pool.row(job_id)['preferred'], CODEX_LANE)
 
+    def test_a_parked_job_the_web_cannot_reopen_goes_to_codex(self):
+        job_id = self.submit()
+        self.pool.claim('primary')
+        with self.pool.connect() as db:
+            db.execute("UPDATE jobs SET status='parked',runtime_id='rt',park_count=0,retry_after=0 WHERE id=?", (job_id,))
+        def refused(runtime_id):
+            raise w.ImageError('browser_challenge', 'Site challenged')
+        self.runtime.adopt = refused
+        self.assertTrue(Worker(self.pool, 'primary', self.runtime).adopt_parked())
+        row = self.pool.row(job_id)
+        self.assertEqual((row['status'], row['preferred']), ('queued', CODEX_LANE))
+        self.assertEqual(self.pool.get(job_id)['fallback_from'], 'browser_challenge')
+
     def test_a_job_with_saved_files_is_never_moved(self):
         job_id = self.submit()
         self.pool.claim('primary')

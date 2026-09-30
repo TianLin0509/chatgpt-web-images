@@ -254,6 +254,11 @@ class Worker:
             result = self.runtime.adopt(job['runtime_id'])
         except Exception as exc:
             error = error_value(exc)
+            # The web cannot even re-open this job (paused site, rate limit, dead page) and it
+            # has no image yet: the Codex lane generates it now instead of after more backoff.
+            if self.pool.codex_ready() and self.pool.fallback(job['id'], error):
+                self.log('job_fallback', job_id=job['id'], reason=error['code'])
+                return True
             if error['code']=='rate_limited':self.pool.defer_rate_limit(self.account_id)
             else:self.pool.park(job['id'], error)
             self.log('adopt_failed', job_id=job['id'], error_code=error['code'])
