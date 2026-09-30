@@ -34,6 +34,25 @@ class TabDaemon {
     const { BrowserTool } = require(path.join(hubCore, 'hub-browser-tool.js'));
     this.BrowserTool = BrowserTool;
     this.adaptSource = require(path.join(hubCore, 'chatgpt-selector-compat.js')).adaptSource;
+    // Shared challenge/handoff rules of the Hub (absent in older Hubs: then nothing changes).
+    try { this.guard = require(path.join(hubCore, 'web-risk-guard.js')); } catch { this.guard = null; }
+  }
+
+  // While a person verifies or signs in, this connection (attached to every page, including
+  // the challenge frame) must not exist: observed 2026-09-29, the person could not pass the
+  // check until it was gone. Checked before every step and on a timer.
+  async yieldToPerson() {
+    let lease = this.guard && this.guard.handoff(this.root);
+    // The person closed the window they were given: that ends the handoff (browser-level check only).
+    if (lease && this.guard.settleHandoff) lease = await this.guard.settleHandoff(this.tool('images-reaper').hub).catch(() => lease);
+    if (!lease) return false;
+    if (this.browser) {
+      const browser = this.browser;
+      this.browser = null; this.pages.clear();
+      try { await browser.close(); } catch {}
+      this.log('handoff_detached', { identity: lease.identity });
+    }
+    return true;
   }
 
   log(event, extra = {}) {
@@ -106,9 +125,17 @@ class TabDaemon {
     const tool = this.tool(lane);
     const { argumentsOf } = require(path.join(this.hubCore, 'hub-browser-tool.js'));
     const [command, ...args] = argumentsOf(argv);
+    if (command === 'human-open') { await this.yieldToPerson(); const r = await tool.execute(argv); await this.yieldToPerson(); return r; }
+    if (command === 'human-done') return tool.execute(argv);
+    if (this.guard && !['close', 'state-load', 'state-save'].includes(command)) {
+      if (await this.yieldToPerson()) this.guard.assertAutomationAllowed(this.root, { identity: this.identity });
+    }
     if (command === 'goto') {
+      if (this.guard) this.guard.assertAutomationAllowed(this.root, { identity: this.identity, url: args[0] });
       const page = await this.page(lane);
       await page.goto(args[0], { waitUntil: 'domcontentloaded' });
+      if (this.guard && await this.guard.inspectAndLeave(this.root, { identity: this.identity, page, url: args[0], source: lane }))
+        throw Error('Site challenged: the page asked for human verification; left it and paused this site');
       return { url: page.url() };
     }
     if (command === 'run-code') {
@@ -118,7 +145,16 @@ class TabDaemon {
       // Downloads need the Hub's passive relay connection; they are rare (once per job).
       if (/\bwaitForEvent\s*\(\s*['"]download['"]/.test(source)) return tool.execute(argv);
       const fn = new Function('return (' + source + '\n)')();
-      return fn(await this.page(lane));
+      const page = await this.page(lane);
+      if (this.guard) this.guard.assertAutomationAllowed(this.root, { identity: this.identity, url: page.url() });
+      const result = await fn(page);
+      if (this.guard && result && typeof result === 'object' && result.challenge === true) {
+        // The tool saw a human check: stop this tab retrying first, then record it for every Hub tool.
+        const site = this.guard.siteOf(page.url()) || 'unknown';
+        await page.goto('about:blank').catch(() => {});
+        try { this.guard.recordChallenge(this.root, { identity: this.identity, site, kind: 'reported', source: lane }); } catch {}
+      }
+      return result;
     }
     if (command === 'open') return this.open(lane, tool, argv);
     if (command === 'close') this.pages.delete(lane);
@@ -166,6 +202,7 @@ class TabDaemon {
 
   async reap() {
     // Close only tabs this daemon opened or reused for a lane and that no lane owns now.
+    if (await this.yieldToPerson()) return 0;  // never attach while a person has the browser
     const reg = readJson(this.registryPath());
     if (!reg?.tabs?.length) return 0;
     const ep = await this.endpoint();
@@ -223,7 +260,10 @@ function writeJson(file, value) {
 }
 
 function category(message) {
-  return /No browser session/.test(message) ? 'No browser session'
+  return /^Unsupported Hub browser command/.test(message) ? 'Unsupported command'
+    : /^Human handoff/.test(message) ? 'Human handoff'
+    : /^Site challenged/.test(message) ? 'Site challenged'
+    : /No browser session/.test(message) ? 'No browser session'
     : /IMAGE_TOOL_UNAVAILABLE/.test(message) ? 'IMAGE_TOOL_UNAVAILABLE'
     : /strict mode violation/.test(message) ? 'strict mode violation'
     : /Target.*closed/.test(message) ? 'Target closed'
@@ -260,6 +300,7 @@ async function serve(options) {
   setInterval(() => {
     if (Date.now() - daemon.lastCall > IDLE_EXIT_MS) { daemon.log('idle_exit'); process.exit(0); }
   }, 60000).unref();
+  setInterval(() => { daemon.yieldToPerson().catch(() => {}); }, 2000).unref();
   const reap = () => daemon.reap().catch(e => daemon.log('reap_failed', { error: category(String(e && e.message || e)) }));
   setTimeout(reap, 30000).unref();
   setInterval(reap, REAP_EVERY_MS).unref();

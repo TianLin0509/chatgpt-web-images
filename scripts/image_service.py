@@ -82,7 +82,7 @@ def create_mcp(pool=None):
     @server.tool(structured_output=False)
     async def image_account_check(account_id: str = 'primary') -> str:
         """After the user logs in, queue a login check for this account; image_status reports the result."""
-        return await call(lambda: wake(pool, pool.control(account_id, 'check')))
+        return await call(lambda: wake(pool, pool.control(account_id, 'check', person=True)))
 
     @server.tool(structured_output=False)
     async def image_select_account(account_name: str, remember: bool = True, account_id: str = 'primary') -> str:
@@ -204,7 +204,8 @@ def main(argv=None):
         if args.command == 'status':
             return pool.status()
         if args.command in {'open','check','select-account'}:
-            kwargs = {'account_name': args.account_name, 'remember': not args.no_remember} if args.command == 'select-account' else {}
+            kwargs = ({'account_name': args.account_name, 'remember': not args.no_remember} if args.command == 'select-account'
+                      else {'person': True} if args.command == 'check' else {})
             return pool.control(account, 'select' if args.command == 'select-account' else args.command, **kwargs)
         if args.command == 'generate':
             return pool.submit(account_id=args.account_id, prompt=args.prompt, prompt_file=args.prompt_file, output_dir=args.output_dir,

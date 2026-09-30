@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.23
+
+- A lane that meets a human check leaves the page at once. The check page reloads itself about every 85 s and each failure raises Cloudflare's partitioned retry counter; observed 2026-09-29, enough of them made even the person loop on "Verifying". 0.7.22's rule that kept a gated lane's page open is reversed; only a page just shown to a person by `open` stays.
+- Sibling lanes of a login with a pending human gate take no new work.
+- Lanes in the AI Hub shared browser: `open` becomes a person handoff through the Hub's shared guard (`core/web-risk-guard.js`): every Hub web tool pauses and whole-browser connections detach (the tab daemon closes its Playwright connection), challenge-state cookies of that site are reset (login cookies untouched), and an on-screen window with no debugger attached opens. Closing that window or `image_account_check` ends the handoff; it expires after 15 minutes. Older Hubs keep the previous behaviour.
+- Workers neither dispatch nor poll during a handoff and never charge a job for it (`human_handoff`, actionable by `retry`). A Hub refusal for a paused site maps to `browser_challenge`.
+- The tab daemon records a challenge reported by tool code and leaves that page, so every Hub tool sees the pause.
+- Cloudflare's localised title (请稍候) counts as a challenge.
+
 ## 0.7.22
 
 - An idle lane no longer moves its tab to about:blank while a person is using it: while its login has a pending human gate, or for 30 minutes after an explicit `open`. Observed 2026-09-29: a restarted worker navigated the secondary lane away from the page where the user was completing the Cloudflare check and login.

@@ -134,9 +134,11 @@ class Worker:
             else:
                 result = fn(**args)
             # Browser URLs and title are unnecessary in the shared status surface.
-            safe = {k: result[k] for k in ('logged_in','auth_state','visible','remembered','background_rate_limited') if k in result}
+            safe = {k: result[k] for k in ('logged_in','auth_state','visible','remembered','background_rate_limited','handoff','until') if k in result}
             safe['ok'] = True
-            if result.get('auth_state')=='rate_limited':
+            if result.get('handoff'):
+                pass  # the person has the browser now; the account keeps its gate until checked
+            elif result.get('auth_state')=='rate_limited':
                 error=({'code':'rate_limited','retry_at':cooldown['retry_after']} if result.get('cooldown_cached') else self.pool.defer_rate_limit(self.account_id))
                 safe['retry_at']=error['retry_at']
             elif result.get('logged_in') and cooldown and (cooldown['retry_after']>time.time() or row['action']!='check'):
@@ -149,6 +151,8 @@ class Worker:
             safe = {'ok': False, 'error': error_value(exc)}
             if safe['error']['code']=='rate_limited':
                 safe['error']=self.pool.defer_rate_limit(self.account_id)
+            elif safe['error']['code'] in {'account_busy', 'human_handoff'}:
+                pass  # nothing is wrong with the account; a person just has the browser
             elif safe['error']['code'] != 'account_busy':
                 self.pool.account_state(self.account_id, 'needs_attention', False, safe['error'])
             state = 'failed'
@@ -184,14 +188,14 @@ class Worker:
         self.page_left = True
 
     def person_on_page(self):
-        """The lane's page is being used by a person: a pending human gate, or a recent open.
+        """The lane's own page was just shown to a person by open (standalone browsers).
 
         Observed 2026-09-29: a restarted worker moved the secondary lane's tab to
-        about:blank while the user was completing its Cloudflare check and login.
+        about:blank while the user was completing its Cloudflare check and login. A pending
+        gate alone is not a reason to stay: a challenge page left open keeps retrying and
+        each failure counts against the login, so the lane leaves it (Hub lanes hand the
+        person a separate clean window instead).
         """
-        account = self.pool.account(self.account_id)
-        if human_gate.gate_code(account['state'], account.get('error')):
-            return True
         with self.pool.connect() as db:
             last = db.execute('SELECT action,updated FROM controls WHERE account_id=? ORDER BY created DESC LIMIT 1',
                               (self.account_id,)).fetchone()
@@ -253,6 +257,10 @@ class Worker:
             self.control_turn = False
             return
         self.control_turn = True
+        if getattr(self.runtime, 'human_handoff', None) and self.runtime.human_handoff():
+            # A person has the shared browser: no dispatch, no polling, nothing counted as failure.
+            self.delay = 5
+            return
         self.leave_idle_conversation()
         account = self.pool.account(self.account_id)
         cooldown=self.pool.cooldown(self.account_id)
@@ -339,6 +347,9 @@ class Worker:
                     self.delay = WATCH_TICK
         except Exception as exc:
             error = error_value(exc)
+            if error['code']=='human_handoff':
+                self.delay = 5  # the person's turn; the job keeps its state and is not charged
+                return
             if error['code']=='rate_limited':error=self.pool.defer_rate_limit(self.account_id)
             else:self.pool.failure(job['id'], error)
             print(json.dumps({'event': 'job_error', 'job_id': job['id'], 'account_id': self.account_id,

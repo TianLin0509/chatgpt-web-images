@@ -18,7 +18,9 @@ class BlankOwnedPage(unittest.TestCase):
         with patch.object(w,'run_js',side_effect=[dict(BLANK),challenge]),patch.object(w,'cli') as cli:
             with self.assertRaises(w.ImageError) as error:w.ensure_browser()
         self.assertEqual(error.exception.code,'browser_challenge')
-        cli.assert_called_once_with(['goto','https://chatgpt.com/'])
+        # 0.7.23: the only navigation after a challenge is leaving it; a check page left open
+        # retries by itself and every failure counts against the login.
+        self.assertEqual([c.args[0] for c in cli.call_args_list],[['goto','https://chatgpt.com/'],['goto','about:blank']])
 
     def test_loaded_conversation_is_not_navigated_for_a_health_check(self):
         signed={**SIGNED,'url':'https://chatgpt.com/c/fixture'}
@@ -36,6 +38,14 @@ class BlankOwnedPage(unittest.TestCase):
         old={'url':'https://chatgpt.com/c/fixture-old','logged_in':False,'auth_state':'browser_challenge','challenge':True}
         with patch.object(w,'run_js',return_value=old),patch.object(w,'cli') as cli:
             with self.assertRaises(w.ImageError) as error:w.ensure_browser(new_conversation=True)
-        self.assertEqual(error.exception.code,'browser_challenge');cli.assert_not_called()
+        self.assertEqual(error.exception.code,'browser_challenge')
+        # Never back into ChatGPT for a new task; only away from the challenge.
+        cli.assert_called_once_with(['goto','about:blank'])
+
+    def test_page_shown_to_a_person_keeps_its_challenge(self):
+        gate={'url':'https://chatgpt.com/','logged_in':False,'auth_state':'browser_challenge','challenge':True}
+        with patch.object(w,'run_js',return_value=gate),patch.object(w,'cli') as cli:
+            state=w.ensure_browser(require_login=False,for_person=True)
+        self.assertTrue(state['challenge']);cli.assert_not_called()
 
 if __name__=='__main__':unittest.main()
