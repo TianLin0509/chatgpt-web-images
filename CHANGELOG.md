@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.31
+
+- Web lanes use the Hub's shared failure inspection when available, so a navigation timeout at a challenge is paused instead of treated as a transient failure. The failed operation is never replayed.
+- A conversation title alone is insufficient evidence of Cloudflare: require challenge script evidence or a visible challenge frame.
+- Local candidate; production deployment and live account generation remain separate acceptance steps.
+
 ## 0.7.30
 
 - The Codex lane finds a proxy when its environment names none. A lane runs in the environment of the process that started it, and Codex starts MCP servers with an allow-list of variables that leaves proxies out. Observed 2026-09-30: after a Codex session's MCP server restarted the lane, every run failed with "workspace routing discovery timed out" (direct connections to chatgpt.com time out on that machine). An inherited proxy is kept; otherwise the AI Hub's proxy setting, then the Windows system proxy when switched on; `"proxy"` in `codex-fallback.json` names one explicitly.

@@ -31,6 +31,15 @@ class AccountBrowser(unittest.TestCase):
         from chatgpt_account import STATE_FUNCTION
         return self.page.evaluate(STATE_FUNCTION)
 
+    def test_conversation_title_is_not_a_cloudflare_gate(self):
+        self.page.set_content('<title>Just a moment - ChatGPT</title><article>Ordinary conversation</article><div id="prompt-textarea" contenteditable="true"></div><button data-testid="accounts-profile-button">Profile</button>')
+        self.assertFalse(self.state()['challenge'])
+        self.assertTrue(self.state()['logged_in'])
+
+    def test_real_cloudflare_title_needs_and_accepts_its_script(self):
+        self.page.set_content('<title>请稍候…</title><script>window._cf_chl_opt={}</script><p>Checking</p>')
+        self.assertTrue(self.state()['challenge'])
+
     def test_image_pill_survives_fill_before_selection(self):
         self.page.set_content('<div id="prompt-textarea" contenteditable="true"><span contenteditable="false" data-inline-selection-pill data-system-hint-type="picture_v2">Create image</span></div>')
         # Reproduce the old destructive ordering in real Chromium.
@@ -125,7 +134,7 @@ class AccountBrowser(unittest.TestCase):
     def test_password_and_challenge_are_reported(self):
         self.page.set_content('<input type="password">')
         self.assertEqual(self.state()['auth_state'],'credential_required')
-        self.page.set_content('<title>Just a moment...</title>')
+        self.page.set_content('<title>Just a moment...</title><script>window._cf_chl_opt={}</script>')
         self.assertEqual(self.state()['auth_state'],'browser_challenge')
 
     def test_no_auth_from_conversation_text(self):
@@ -158,7 +167,7 @@ const {chromium}=require(spec.driver);
   await page.evaluate(signed=>{window.clicks=0;document.querySelector('.account').onclick=()=>window.clicks++;setTimeout(()=>document.body.innerHTML=signed,100);},signed);
   result=await run(page);assert(result.logged_in);assert.equal(result.account_action,'wait_existing_login');assert.equal(await page.evaluate(()=>window.clicks),0);checks++;
   await page.setContent('<input type="password">');result=await run(page);assert.equal(result.error_code,'credential_required');checks++;
-  await page.setContent('<title>Just a moment</title>');result=await run(page);assert.equal(result.error_code,'browser_challenge');checks++;
+  await page.setContent('<title>Just a moment</title><script>window._cf_chl_opt={}</script>');result=await run(page);assert.equal(result.error_code,'browser_challenge');checks++;
   await page.setContent(chooser(['TIAN LIN']));
   await page.evaluate(()=>document.querySelector('.account').onclick=()=>document.body.innerHTML='<input autocomplete="one-time-code">');
   result=await run(page);assert.equal(result.error_code,'credential_required');checks++;

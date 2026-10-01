@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.30
+# ChatGPT Web Images 0.7.31
+
+0.7.31：支持 Hub 的失败后验证检测。网页导航或脚本超时后先检查是否出现真人验证，确认后离开并暂停站点，不重复执行原操作。需要 Hub 提供 `web-risk-guard.runProtected`；旧 Hub 保留原行为。普通对话的标题不再单独触发 Cloudflare 判断，必须同时有验证脚本或可见验证框。此版本为本地待验收候选，尚未发布。
 
 0.7.30 Codex 车道自己补代理：车道运行在拉起它的进程的环境里，而 Codex 启动 MCP 服务时不传代理变量。2026-09-30 一个 Codex 会话拉起车道后，所有出图都报「workspace routing discovery timed out」（本机直连 chatgpt.com 不通）。现在环境里没有代理时，依次采用 AI Hub 配置的代理、Windows 系统代理；`codex-fallback.json` 的 `"proxy"` 可显式指定。连不上 chatgpt.com 报 `codex_network`，不再混在 `codex_no_image` 里。
 

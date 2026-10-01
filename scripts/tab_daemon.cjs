@@ -174,7 +174,7 @@ class TabDaemon {
     if (command === 'goto') {
       if (this.guard) this.guard.assertAutomationAllowed(this.root, { identity: this.identity, url: args[0] });
       const page = await this.page(lane);
-      await page.goto(args[0], { waitUntil: 'domcontentloaded' });
+      await this.protectedStep(lane, page, () => page.goto(args[0], { waitUntil: 'domcontentloaded' }));
       if (this.guard && await this.guard.inspectAndLeave(this.root, { identity: this.identity, page, url: args[0], source: lane }))
         throw Error('Site challenged: the page asked for human verification; left it and paused this site');
       return { url: page.url() };
@@ -188,7 +188,7 @@ class TabDaemon {
       const fn = new Function('return (' + source + '\n)')();
       const page = await this.page(lane);
       if (this.guard) this.guard.assertAutomationAllowed(this.root, { identity: this.identity, url: page.url() });
-      const result = await fn(page);
+      const result = await this.protectedStep(lane, page, () => fn(page));
       if (this.guard && result && typeof result === 'object' && result.challenge === true) {
         // The tool saw a human check: stop this tab retrying first, then record it for every Hub tool.
         const site = this.guard.siteOf(page.url()) || 'unknown';
@@ -204,6 +204,12 @@ class TabDaemon {
   }
 
   endpoint() { return this.tool('images-reaper').hub.endpoint(); }
+  protectedStep(lane, page, fn) {
+    // The Hub owns the check classifier. Older Hubs keep their previous behavior.
+    return this.guard?.runProtected ? this.guard.runProtected(this.root, {
+      identity: this.identity, page, source: lane,
+    }, fn) : fn();
+  }
   registryPath() { return path.join(this.poolRoot, `tab-registry-${this.identity}.json`); }
   liveTargets() {
     const dir = path.join(this.root, 'tool-pages');

@@ -97,6 +97,20 @@ class TabDaemonTest(unittest.TestCase):
                                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_failures_use_shared_guard_without_replaying_the_step(self):
+        script = self.tmp / 'protected.cjs'
+        script.write_text('''
+const {TabDaemon}=require(process.argv[2]);
+const d=new TabDaemon({identity:'main',root:process.argv[3],poolRoot:process.argv[3],hubCore:process.argv[3],playwright:'unused'});
+let calls=0,inspected=0;
+d.guard={runProtected:async(root,options,fn)=>{try{return await fn();}catch(e){inspected++;if(options.identity!=='main'||options.source!=='lane-a')throw Error('wrong identity');throw Error('Site challenged');}}};
+(async()=>{let error='';try{await d.protectedStep('lane-a',{},async()=>{calls++;throw Error('Timeout');});}catch(e){error=e.message;}
+console.log(JSON.stringify({calls,inspected,error}));})().catch(()=>process.exit(1));
+''', encoding='utf-8')
+        proc = subprocess.run([NODE, str(script), str(HERE / 'tab_daemon.cjs'), str(self.tmp)], capture_output=True, text=True, timeout=10, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), {'calls': 1, 'inspected': 1, 'error': 'Site challenged'})
+
 
 REAP_SCRIPT = textwrap.dedent("""
   const { TabDaemon } = require(process.argv[2]);
