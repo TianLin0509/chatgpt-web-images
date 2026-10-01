@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.29
+
+- Web lanes attach to their own tab only. With a Hub that offers `core/scoped-cdp.js`, the tab daemon gives each lane a connection that sees its page and nothing else, instead of one long-lived whole-browser connection that was attached to the person's windows, other tools' tabs and the Cloudflare challenge frame inside pages. Orphan reaping lists and closes targets over a browser-level session without attaching to pages; a person's handoff closes every lane connection. Older Hubs keep the previous behaviour. Real Chrome (`scripts/e2e_hub_guard_daemon.cjs`): with the new Hub core only the lane's tab was attached while another tool's tab stayed unattached; with the production Hub core the old path still passes.
+
 ## 0.7.28
 
 - `"follow_hub": true` in `codex-fallback.json` draws on the Codex account AI Hub uses by default (`providers.codex.subscription_profile` of the Hub config, resolved like the Hub: a profile without a home is `~/.codex`). Read on every lane tick, so switching the account in the Hub switches the lane. When the Hub runs Codex on an API key, its config cannot be read or the profile is unknown, the lane stays off rather than guess; the subscription-only check still applies. `codex_fallback.account` in `image_status` names the account (profile and label, never paths or tokens). `codex_home` stays a real path so processes of older versions still running keep a valid setting.

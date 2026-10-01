@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.28
+# ChatGPT Web Images 0.7.29
+
+0.7.29 网页车道只连自己的标签页：AI Hub 提供单标签连接（`core/scoped-cdp.js`）时，常驻标签页守护进程为每条车道单独建一条只看得见自己页面的连接，不再长期挂着整浏览器连接（以前它会附着到你的窗口、其他工具的标签页和页面里的 Cloudflare 验证框）。清理孤儿标签页改用不附着页面的浏览器级查询；有人接管浏览器时所有车道连接立即断开。旧版 Hub 下行为不变。
 
 0.7.28 Codex 账号跟随 AI Hub：`codex-fallback.json` 加 `"follow_hub": true` 后，生图使用 AI Hub 当前默认的 Codex 订阅账号（Hub 配置 `providers.codex.subscription_profile`），每 2 秒重读一次，在 Hub 里切换账号后下一轮即生效。Hub 改用 API Key、配置读不到或账号不存在时，Codex 车道停用，交给网页，不会猜测账号；非订阅登录照旧拒绝。`image_status.codex_fallback.account` 显示当前用的是哪个账号。`codex_home` 仍保留一个真实目录，供仍在运行的旧版本进程读取。
 

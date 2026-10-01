@@ -162,5 +162,77 @@ class TabRegistryTest(unittest.TestCase):
         self.assertEqual(out['registry'], ['T-live', 'T-reused'])
 
 
+FAKE_SCOPED = textwrap.dedent('''
+  // Records every connection; a connection sees one page.
+  const opened = [];
+  async function connectPage(chromium, ep, targetId) {
+    const listeners = {}, state = { closed: false, connected: true };
+    const connection = { targetId, state,
+      page: { url: () => 'https://chatgpt.com/', isClosed: () => state.closed, once: (e, f) => { listeners[e] = f; } },
+      browser: { isConnected: () => state.connected, on: (e, f) => { listeners['b' + e] = f; } },
+      close: async () => { state.connected = false; } };
+    opened.push(connection);
+    return connection;
+  }
+  module.exports = { connectPage, opened };
+''')
+
+SCOPED_SCRIPT = textwrap.dedent("""
+  const { TabDaemon } = require(process.argv[2]);
+  const root = process.argv[3], fs = require('fs'), path = require('path');
+  const d = new TabDaemon({ identity: 'main', poolRoot: root, hubCore: root, root, playwright: path.join(root, 'pw.js') });
+  const { opened } = require(path.join(root, 'scoped-cdp.js'));
+  const quick = path.join(root, 'quick.js'); fs.writeFileSync(quick, 'async page => page.url()');
+  (async () => {
+    const out = { scoped: !!d.scoped };
+    const step = (lane, argv) => d.handle({ lane, argv, timeoutMs: 2000 });
+    await step('images-a', ['run-code', '--filename', quick]);
+    await step('images-a', ['run-code', '--filename', quick]);
+    await step('images-b', ['run-code', '--filename', quick]);
+    out.connections = opened.map(c => c.targetId);
+    out.whole_browser = d.browser;
+    await step('images-a', ['close']);
+    out.after_close = [...d.lanes.keys()];
+    out.a_closed = !opened[0].state.connected;
+    d.guard = { handoff: () => ({ identity: 'main' }), assertAutomationAllowed() {} };
+    out.yielded = await d.yieldToPerson();
+    out.after_handoff = [...d.lanes.keys()];
+    console.log(JSON.stringify(out));
+    process.exit(0);
+  })();
+""")
+
+
+@unittest.skipUnless(NODE, 'node is required for the tab daemon')
+class ScopedLaneTest(unittest.TestCase):
+    """With a Hub that offers scoped-cdp.js each lane attaches to its own page only."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / 'hub-browser-tool.js').write_text(FAKE_TOOL, encoding='utf-8')
+        (self.tmp / 'chatgpt-selector-compat.js').write_text(FAKE_COMPAT, encoding='utf-8')
+        (self.tmp / 'scoped-cdp.js').write_text(FAKE_SCOPED, encoding='utf-8')
+        (self.tmp / 'pw.js').write_text('module.exports = { chromium: {} };', encoding='utf-8')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_each_lane_attaches_to_its_own_page_and_lets_go_for_a_person(self):
+        script = self.tmp / 'scoped.cjs'
+        script.write_text(SCOPED_SCRIPT, encoding='utf-8')
+        proc = subprocess.run([NODE, str(script), str(HERE / 'tab_daemon.cjs'), str(self.tmp)],
+                              capture_output=True, text=True, encoding='utf-8', timeout=60,
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(out['scoped'])
+        self.assertEqual(out['connections'], ['t-images-a', 't-images-b'], 'one connection per lane, reused across its steps')
+        self.assertIsNone(out['whole_browser'], 'no whole-browser connection')
+        self.assertEqual(out['after_close'], ['images-b'])
+        self.assertTrue(out['a_closed'])
+        self.assertTrue(out['yielded'])
+        self.assertEqual(out['after_handoff'], [], 'a person verifying gets every lane connection closed')
+
+
 if __name__ == '__main__':
     unittest.main()

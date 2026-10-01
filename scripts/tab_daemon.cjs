@@ -36,6 +36,42 @@ class TabDaemon {
     this.adaptSource = require(path.join(hubCore, 'chatgpt-selector-compat.js')).adaptSource;
     // Shared challenge/handoff rules of the Hub (absent in older Hubs: then nothing changes).
     try { this.guard = require(path.join(hubCore, 'web-risk-guard.js')); } catch { this.guard = null; }
+    // Hubs from 2026-09-30 attach a tool to its own page only (core/scoped-cdp.js): each lane
+    // gets a connection that sees its tab and nothing else, so no other tab, no person's window
+    // and no challenge frame is attached. Older Hubs keep the whole-browser connection below.
+    try { this.scoped = require(path.join(hubCore, 'scoped-cdp.js')); } catch { this.scoped = null; }
+    this.lanes = new Map();       // lane id -> { targetId, connection } (scoped mode)
+  }
+
+  dropLane(lane, connection) {
+    const held = this.lanes.get(lane);
+    if (!held || (connection && held.connection !== connection)) return;
+    this.lanes.delete(lane);
+    held.connection.close().catch(() => {});
+  }
+
+  async lanePage(lane) {
+    const held = this.lanes.get(lane);
+    if (held && !held.connection.page.isClosed() && held.connection.browser.isConnected()) return held.connection.page;
+    if (held) this.dropLane(lane);
+    const target = await this.tool(lane).target();
+    if (!target) throw Error('No browser session: owned Hub page is not open');
+    const { chromium } = require(this.playwright);
+    const connection = await this.scoped.connectPage(chromium, target.ep, target.targetId);
+    this.lanes.set(lane, { targetId: target.targetId, connection });
+    connection.page.once('close', () => this.dropLane(lane, connection));
+    connection.browser.on('disconnected', () => this.dropLane(lane, connection));
+    return connection.page;
+  }
+
+  // Browser-level target list and close, without attaching to any page.
+  async browserSession(ep) {
+    if (this.scoped) {
+      const { CDP } = require(path.join(this.hubCore, 'web-roundtable', 'cdp.js'));
+      const cdp = await CDP.connect(ep.ws, ep.port);
+      return { send: (method, params) => cdp.call(method, params), detach: async () => cdp.close() };
+    }
+    return (await this.connection(ep)).newBrowserCDPSession();
   }
 
   // While a person verifies or signs in, this connection (attached to every page, including
@@ -46,6 +82,10 @@ class TabDaemon {
     // The person closed the window they were given: that ends the handoff (browser-level check only).
     if (lease && this.guard.settleHandoff) lease = await this.guard.settleHandoff(this.tool('images-reaper').hub).catch(() => lease);
     if (!lease) return false;
+    if (this.lanes.size) {
+      for (const lane of [...this.lanes.keys()]) this.dropLane(lane);
+      this.log('handoff_detached', { identity: lease.identity });
+    }
     if (this.browser) {
       const browser = this.browser;
       this.browser = null; this.pages.clear();
@@ -96,6 +136,7 @@ class TabDaemon {
   }
 
   async page(lane) {
+    if (this.scoped) return this.lanePage(lane);
     const cached = this.pages.get(lane);
     if (cached && !cached.page.isClosed() && this.browser && this.browser.isConnected()) return cached.page;
     const target = await this.tool(lane).target();
@@ -157,7 +198,7 @@ class TabDaemon {
       return result;
     }
     if (command === 'open') return this.open(lane, tool, argv);
-    if (command === 'close') this.pages.delete(lane);
+    if (command === 'close') { this.pages.delete(lane); this.dropLane(lane); }
     // close / state-load / state-save keep the Hub's exact semantics.
     return tool.execute(argv);
   }
@@ -184,7 +225,11 @@ class TabDaemon {
     // load (a short CDP health deadline) and then opens another tab, leaving the first one
     // polling ChatGPT with no owner; 23 such orphans pushed the login into HTTP 429.
     const record = readJson(path.join(this.root, 'tool-pages', lane + '.json'));
-    if (record?.targetId && record.identity === this.identity) {
+    if (this.scoped) {
+      // The Hub's own check (record, browser and identity context) without attaching to the tab.
+      const target = record?.targetId ? await tool.target().catch(() => null) || await tool.target().catch(() => null) : null;
+      if (target) { this.register(lane, target.targetId); return { targetId: target.targetId, reused: true }; }
+    } else if (record?.targetId && record.identity === this.identity) {
       const ep = await this.endpoint();
       if (ep && record.browserWs === ep.ws) {
         const page = await this.findPage(await this.connection(ep), record.targetId);
@@ -207,8 +252,7 @@ class TabDaemon {
     if (!reg?.tabs?.length) return 0;
     const ep = await this.endpoint();
     if (!ep) return 0;
-    const browser = await this.connection(ep);
-    const session = await browser.newBrowserCDPSession();
+    const session = await this.browserSession(ep);
     let closed = 0;
     try {
       const { targetInfos } = await session.send('Target.getTargets');
@@ -246,7 +290,7 @@ class TabDaemon {
       return await Promise.race([this.enqueue(lane, () => this.execute(lane, argv)), deadline]);
     } catch (e) {
       // A step that never settles must not block every later step of its lane.
-      if (/daemon step exceeded/.test(String(e && e.message))) { this.chains.delete(lane); this.pages.delete(lane); }
+      if (/daemon step exceeded/.test(String(e && e.message))) { this.chains.delete(lane); this.pages.delete(lane); this.dropLane(lane); }
       throw e;
     } finally { clearTimeout(timer); }
   }
