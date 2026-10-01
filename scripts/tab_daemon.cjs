@@ -183,7 +183,7 @@ class TabDaemon {
       const at = args.indexOf('--filename');
       if (at < 0 || !args[at + 1]) throw Error('run-code requires a local filename');
       const source = this.adaptSource(fs.readFileSync(args[at + 1], 'utf8'));
-      // Downloads need the Hub's passive relay connection; they are rare (once per job).
+      // Downloads run through the Hub tool's own download-capable connection; once per job.
       if (/\bwaitForEvent\s*\(\s*['"]download['"]/.test(source)) return tool.execute(argv);
       const fn = new Function('return (' + source + '\n)')();
       const page = await this.page(lane);
