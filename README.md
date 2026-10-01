@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.29
+# ChatGPT Web Images 0.7.30
+
+0.7.30 Codex 车道自己补代理：车道运行在拉起它的进程的环境里，而 Codex 启动 MCP 服务时不传代理变量。2026-09-30 一个 Codex 会话拉起车道后，所有出图都报「workspace routing discovery timed out」（本机直连 chatgpt.com 不通）。现在环境里没有代理时，依次采用 AI Hub 配置的代理、Windows 系统代理；`codex-fallback.json` 的 `"proxy"` 可显式指定。连不上 chatgpt.com 报 `codex_network`，不再混在 `codex_no_image` 里。
 
 0.7.29 网页车道只连自己的标签页：AI Hub 提供单标签连接（`core/scoped-cdp.js`）时，常驻标签页守护进程为每条车道单独建一条只看得见自己页面的连接，不再长期挂着整浏览器连接（以前它会附着到你的窗口、其他工具的标签页和页面里的 Cloudflare 验证框）。清理孤儿标签页改用不附着页面的浏览器级查询；有人接管浏览器时所有车道连接立即断开。旧版 Hub 下行为不变。
 

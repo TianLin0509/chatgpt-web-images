@@ -418,8 +418,8 @@ class CodexRunnerContracts(unittest.TestCase):
 
     def test_environment_never_carries_api_keys_and_pins_the_subscription_home(self):
         env = cx.environment(self.home, {'OPENAI_API_KEY': 'sk-x', 'OPENAI_BASE_URL': 'u', 'PATH': 'p', 'CHATGPT_WEB_IMAGES_POOL': 'x',
-                                         'DEEPSEEK_API_KEY': 'd', 'ANTHROPIC_AUTH_TOKEN': 'a'})
-        self.assertEqual(env, {'PATH': 'p', 'CODEX_HOME': str(self.home)})
+                                         'DEEPSEEK_API_KEY': 'd', 'ANTHROPIC_AUTH_TOKEN': 'a', 'HTTPS_PROXY': 'http://own:1'})
+        self.assertEqual(env, {'PATH': 'p', 'CODEX_HOME': str(self.home), 'HTTPS_PROXY': 'http://own:1'})
 
     def test_images_of_the_thread_are_copied_with_hashes_and_sizes(self):
         self.login('chatgpt')
@@ -473,6 +473,43 @@ class CodexRunnerContracts(unittest.TestCase):
         self.assertEqual(outcome, 'timeout')
         self.assertLess(time.monotonic() - started, 30)
 
+
+
+class CodexNetworkContracts(unittest.TestCase):
+    """A lane started without proxy variables still reaches chatgpt.com (2026-09-30)."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.hub = self.root / 'hub-config.json'
+
+    def test_the_hub_proxy_is_used_when_the_environment_names_none(self):
+        w.write_json(self.hub, {'proxy': {'http': 'http://127.0.0.1:7890'}})
+        self.assertEqual(cx.discover_proxy(self.hub, registry=False), 'http://127.0.0.1:7890')
+        w.write_json(self.hub, {'proxy': 'http://10.0.0.2:8080'})
+        self.assertEqual(cx.discover_proxy(self.hub, registry=False), 'http://10.0.0.2:8080')
+        self.assertIsNone(cx.discover_proxy(self.root / 'missing.json', registry=False))
+
+    def test_environment_keeps_an_inherited_proxy_and_adds_one_otherwise(self):
+        env = cx.environment(self.root, base={'PATH': 'p', 'https_proxy': 'http://own:1'}, proxy='http://other:2')
+        self.assertEqual(env.get('https_proxy'), 'http://own:1')
+        self.assertNotIn('HTTPS_PROXY', env, 'an inherited proxy is never replaced')
+        env = cx.environment(self.root, base={'PATH': 'p'}, proxy='http://127.0.0.1:7890')
+        self.assertEqual((env['HTTPS_PROXY'], env['HTTP_PROXY'], env['NO_PROXY']), ('http://127.0.0.1:7890',) * 2 + ('localhost,127.0.0.1',))
+
+    def test_an_unreachable_chatgpt_is_reported_as_a_network_failure(self):
+        home = self.root / 'home'
+        home.mkdir()
+        (home / 'auth.json').write_text(json.dumps({'auth_mode': 'chatgpt'}), encoding='utf-8')
+        events = chr(10).join(json.dumps(e) for e in ({'type': 'thread.started', 'thread_id': 't'},
+                                                    {'type': 'turn.failed', 'error': {'message': 'workspace routing discovery timed out'}}))
+        with self.assertRaises(cx.CodexImageError) as caught:
+            cx.generate(prompt='kite', count=1, output_dir=self.root / 'o', name='k', job_id='20260930-abcdef012345',
+                        codex_home=home, work_dir=self.root / 'w', codex_command=['codex'], proxy='http://127.0.0.1:7890',
+                        run=lambda argv, **kw: (1, events, 'exited'))
+        self.assertEqual(caught.exception.code, 'codex_network')
+        self.assertIn('proxy', str(caught.exception))
 
 
 class CodexFirstContracts(CodexFallbackContracts):

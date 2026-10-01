@@ -94,14 +94,55 @@ def prompt_for(prompt, count, has_references, variant=None):
     return '\n'.join(lines)
 
 
-def environment(codex_home, base=None):
-    """No API credentials of any vendor, no pool overrides; the subscription home only."""
+PROXY_KEYS = ('HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY')
+
+
+def discover_proxy(hub_config=None, registry=True):
+    """The proxy Codex needs to reach chatgpt.com when its own environment names none.
+
+    The lane runs in the environment of whoever started it, and Codex starts MCP servers
+    with a short allow-list of variables that leaves proxies out: observed 2026-09-30, a lane
+    started from a Codex session failed every run with "workspace routing discovery timed
+    out" while direct connections to chatgpt.com time out on this machine. Order: the AI
+    Hub's own proxy setting, then the Windows system proxy when it is switched on."""
+    path = Path(hub_config) if hub_config else Path.home() / '.claude-session-hub' / 'config.json'
+    try:
+        proxy = json.loads(path.read_text(encoding='utf-8')).get('proxy')
+    except (OSError, ValueError):
+        proxy = None
+    if isinstance(proxy, dict):
+        proxy = proxy.get('https') or proxy.get('http')
+    if isinstance(proxy, str) and proxy.strip():
+        return proxy.strip()
+    if registry and os.name == 'nt':
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Internet Settings') as key:
+                if winreg.QueryValueEx(key, 'ProxyEnable')[0]:
+                    server = str(winreg.QueryValueEx(key, 'ProxyServer')[0])
+                    parts = dict(item.split('=', 1) for item in server.split(';') if '=' in item)
+                    server = parts.get('https') or parts.get('http') or server
+                    return server if '://' in server else 'http://' + server
+        except OSError:
+            pass
+    return None
+
+
+def environment(codex_home, base=None, proxy=None):
+    """No API credentials of any vendor, no pool overrides; the subscription home only. A
+    proxy is added when the inherited environment names none (see discover_proxy)."""
     def dropped(name):
         upper = name.upper()
         return ('API_KEY' in upper or upper.startswith(('OPENAI_', 'ANTHROPIC_', 'AZURE_OPENAI')) or
                 upper.startswith('CHATGPT_WEB_IMAGES_') or upper == 'CODEX_API_KEY')
     env = {k: v for k, v in (base or os.environ).items() if not dropped(k)}
     env['CODEX_HOME'] = str(codex_home)
+    if not any(k.upper() in PROXY_KEYS and v for k, v in env.items()):
+        found = proxy or discover_proxy()
+        if found:
+            env['HTTPS_PROXY'] = env['HTTP_PROXY'] = found
+            if not any(k.upper() == 'NO_PROXY' for k in env):
+                env['NO_PROXY'] = 'localhost,127.0.0.1'
     return env
 
 
@@ -174,7 +215,7 @@ def image_size(path):
 
 
 def generate(*, prompt, count, output_dir, name, job_id, codex_home, work_dir, references=(),
-             codex_command=None, timeout=None, cancelled=lambda: False, run=default_runner, first_index=1, variant=None):
+             codex_command=None, timeout=None, cancelled=lambda: False, run=default_runner, first_index=1, variant=None, proxy=None):
     """Generate `count` images and copy them into output_dir. Returns a job-shaped result."""
     codex_home = Path(codex_home)
     check_home(codex_home)
@@ -189,7 +230,7 @@ def generate(*, prompt, count, output_dir, name, job_id, codex_home, work_dir, r
     argv.append('-')
     started = time.time()
     limit = timeout or min(MAX_SECONDS, BASE_SECONDS + PER_IMAGE_SECONDS * count)
-    returncode, stdout, outcome = run(argv, input=prompt_for(prompt, count, bool(references), variant), env=environment(codex_home),
+    returncode, stdout, outcome = run(argv, input=prompt_for(prompt, count, bool(references), variant), env=environment(codex_home, proxy=proxy),
                                       cwd=str(work_dir), timeout=limit, cancelled=cancelled, log_dir=work_dir)
     thread, usage, failure = parse_events(stdout)
     generated = []
@@ -203,6 +244,9 @@ def generate(*, prompt, count, output_dir, name, job_id, codex_home, work_dir, r
         if outcome == 'timeout':
             raise CodexImageError('codex_timeout', f'Codex image generation did not finish within {limit} s; it was stopped.')
         detail = failure if failure else f'exit {returncode}'
+        if re.search(r'routing discovery timed out|error sending request|stream disconnected|Reconnecting', str(detail)):
+            raise CodexImageError('codex_network', 'Codex could not reach chatgpt.com (network or proxy); no image was made. '
+                                  f'Check the proxy the lane uses ({str(detail)[:160]}).')
         raise CodexImageError('codex_no_image', f'Codex returned no generated image ({str(detail)[:300]}).')
     files = []
     for index, source in enumerate(generated[:count], first_index):

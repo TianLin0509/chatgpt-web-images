@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.30
+
+- The Codex lane finds a proxy when its environment names none. A lane runs in the environment of the process that started it, and Codex starts MCP servers with an allow-list of variables that leaves proxies out. Observed 2026-09-30: after a Codex session's MCP server restarted the lane, every run failed with "workspace routing discovery timed out" (direct connections to chatgpt.com time out on that machine). An inherited proxy is kept; otherwise the AI Hub's proxy setting, then the Windows system proxy when switched on; `"proxy"` in `codex-fallback.json` names one explicitly.
+- A run that cannot reach chatgpt.com fails as `codex_network` with a hint about the proxy, instead of `codex_no_image`.
+
 ## 0.7.29
 
 - Web lanes attach to their own tab only. With a Hub that offers `core/scoped-cdp.js`, the tab daemon gives each lane a connection that sees its page and nothing else, instead of one long-lived whole-browser connection that was attached to the person's windows, other tools' tabs and the Cloudflare challenge frame inside pages. Orphan reaping lists and closes targets over a browser-level session without attaching to pages; a person's handoff closes every lane connection. Older Hubs keep the previous behaviour. Real Chrome (`scripts/e2e_hub_guard_daemon.cjs`): with the new Hub core only the lane's tab was attached while another tool's tab stayed unattached; with the production Hub core the old path still passes.

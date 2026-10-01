@@ -141,7 +141,8 @@ class CodexLane:
         count, name = payload['count'], payload.get('name') or 'image'
         common = dict(prompt=payload['prompt'], output_dir=payload['output_dir'], name=name, job_id=job_id,
                       codex_home=self.settings['codex_home'], references=references,
-                      codex_command=self.settings.get('codex_command'), cancelled=self.cancel_watch(job_id))
+                      codex_command=self.settings.get('codex_command'), proxy=self.settings.get('proxy'),
+                      cancelled=self.cancel_watch(job_id))
         work = self.pool.root / 'codex-work' / job_id
         if count == 1 or not self.settings.get('fanout', True):
             try:
