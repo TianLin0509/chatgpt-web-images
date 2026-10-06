@@ -291,6 +291,14 @@ def main():
             except Exception as exc:
                 lane.log('tick_error', error=type(exc).__name__)
             write_health(pool, lane)
+            # Sleeping web lanes must also wake for a hand-back when the MCP client
+            # has disconnected. This daemon already owns the Codex lane.
+            try:
+                failures = pool.ensure_workers(include_codex=False)
+                if failures:
+                    lane.log('web_worker_start_error', count=len(failures))
+            except Exception as exc:
+                lane.log('web_worker_start_error', error=type(exc).__name__)
             time.sleep(TICK_SECONDS)
         while lane and lane.running:
             write_health(pool, lane)
@@ -298,6 +306,7 @@ def main():
         # Switched off or stopped: hand back what was waiting for this lane.
         with contextlib.suppress(Exception):
             durable(pool.release_codex_handovers)
+            pool.ensure_workers(include_codex=False)
         with contextlib.suppress(OSError):
             (pool.root / HEALTH_FILE).unlink()
 

@@ -554,6 +554,20 @@ class CodexFirstContracts(CodexFallbackContracts):
                                                                           'error': {'code': 'browser_timeout'}}, 'rt')
         self.assertEqual(self.pool.row(job_id)['status'], 'preparation_failed', 'no ping-pong')
 
+    def test_a_handback_wakes_sleeping_web_workers_without_another_client_poll(self):
+        job_id = self.submit('background-handback')
+        def broken(**kw):
+            raise cx.CodexImageError('codex_no_image', 'none')
+        self.run_lane(broken)
+        with patch('image_pool.subprocess.Popen') as spawn:
+            spawn.return_value.pid=12345
+            self.assertEqual(self.pool.ensure_workers(include_codex=False),[])
+            self.assertEqual(spawn.call_count,1)
+            self.assertEqual(Path(spawn.call_args.args[0][1]).name,'image_worker.py')
+            self.assertEqual(spawn.call_args.args[0][2],'primary')
+        self.assertEqual(self.pool.row(job_id)['status'],'queued')
+        self.assertEqual(self.pool.claim('primary')['id'],job_id)
+
     def test_a_hand_back_no_web_lane_takes_fails_with_the_codex_reason(self):
         job_id = self.submit()
         self.pool.claim_codex(90, first=True)

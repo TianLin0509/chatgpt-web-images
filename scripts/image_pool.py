@@ -1120,7 +1120,7 @@ class Pool:
                                 (account['id'], login_group(account))).fetchone()
         return bool(queued) and (queued['preferred'] != 'auto' or json.loads(queued['result'] or '{}').get('to_web') or not codex_first(self.root))
 
-    def ensure_workers(self):
+    def ensure_workers(self, *, include_codex=True):
         failures = []
         with self.connect() as db:
             accounts = [dict(r) for r in db.execute('SELECT * FROM accounts')]
@@ -1148,6 +1148,8 @@ class Pool:
                     w.write_json(reservation, {'pid': child.pid, 'started': time.time(), 'version': VERSION})
             except OSError as exc:
                 failures.append({'account_id': account['id'], 'code': 'worker_start_failed', 'type': type(exc).__name__})
+        if not include_codex:
+            return failures
         if not fallback_settings(self.root):
             self.release_codex_handovers()
         elif not (self.root / 'stop-codex').exists() and not self.codex_status()['alive']:

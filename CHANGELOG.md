@@ -3,6 +3,7 @@
 ## 0.7.32
 
 - Idle web lanes wake only for real jobs or explicit account actions and exit after 60 seconds without demand. Human verification gates remain paused until explicitly handled.
+- The subscription daemon also wakes web hand-backs and eligible work during its breaker interval, so fallback continues when the MCP client disconnects.
 - MCP and CLI status distinguish subscription worker startup from web login issues. Cached web failures do not block a usable subscription backend.
 - Subscription-only pools accept jobs without configured web accounts. Existing request IDs and uncertain submissions are retained.
 - This candidate has isolated contract tests and a live Claude MCP acceptance run; deployment is a separate step.
