@@ -434,9 +434,14 @@ def main():
         worker = Worker(pool, account_id)
         health = {'version': VERSION, 'pid': os.getpid(), 'tick_started': 0, 'tick_finished': 0}
         health_path = pool.root / ('worker-' + account_id + '-health.json')
+        last_needed = time.monotonic()
         try:
             while not (pool.root / ('stop-' + account_id)).exists():
                 try:
+                    if pool.worker_needed(pool.account(account_id)):
+                        last_needed = time.monotonic()
+                    elif time.monotonic() - last_needed >= 60:
+                        break
                     health['tick_started'] = time.time()
                     try:w.write_json(health_path, health)
                     except OSError:pass  # best-effort telemetry must not stop a worker

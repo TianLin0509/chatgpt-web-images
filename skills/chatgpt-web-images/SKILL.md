@@ -7,6 +7,8 @@ description: 本机生图入口：用用户自己的订阅生成图片、制作�
 
 通过已注册的 chatgpt-web-images MCP 调用，Claude、Codex 等客户端使用相同协议。不要另写浏览器脚本或后台轮询脚本。
 
+状态返回 `next_action=wait_for_backend_start` 表示订阅生图后台正在启动，稍后再查 `image_status`，无需网页登录。`fix_worker_start_then_poll_same_job` 表示后台启动故障，检查启动错误并保留原任务，也不要因此要求网页登录。只有 `resolve_human_action` 且列出了人工事项时才走登录或验证流程。网页车道无任务时会休眠；显式账号检查或真实网页任务会自动唤醒，休眠不等于登录失效。
+
 1. 首次使用调用 `image_status`（不访问网页）。**`can_generate=true` 就直接提交**，照 `advice` 做：`serving=codex` 时由 Codex 出图，网页车道即使显示 `browser_challenge`、未登录或可用车道为 0 也不影响，不要去 check 网页车道，也不要让用户去点验证。只有 `can_generate=false` 才处理网页登录：未登录或卡验证时 `image_open(account_id)`：跑在 AI Hub 浏览器里的账号会进入「人工接管」，所有网页自动化暂停并断开、屏幕上弹出干净窗口，告诉用户在里面完成验证或登录后关掉窗口；然后 `image_account_check(account_id)`，再查看 status。不要在用户操作期间反复 check 或重投任务。账号操作返回 queued 只表示已接收。status 的 `human_action` 列出需要人处理的登录（验证、登录失效等，Windows 通知也已提醒用户）；`human_action_blocks_generation=true` 时才把其中的 next_action 转告用户，否则它只是网页兜底的待办，不耽误出图；`egress_changed=true` 说明出口 IP 变了，一并告诉用户。
 2. 要在之前某张图的基础上修改（改配色、换标题、保持版式微调），传 `continue_from=<该任务的 job_id>`，追问会发进原对话，ChatGPT 仍看得见那些图；不相关的新图不要带 `continue_from`。同一对话同时只允许一个追问在跑，它会自动落到拥有该对话的账号的任意空闲车道。
    长提示词保存为带日期、任务标识的 UTF-8 文件。`image_generate(prompt_file=绝对路径, count=张数, request_id=全局唯一任务标识, output_dir=绝对路径, name=任务名, account_id="auto")`。prompt 与 prompt_file 二选一；reference_images 接受至多五个 PNG/JPEG/WebP 绝对路径，排队期间保持文件不变。

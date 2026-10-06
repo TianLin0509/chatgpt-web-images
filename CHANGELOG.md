@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.32
+
+- Idle web lanes wake only for real jobs or explicit account actions and exit after 60 seconds without demand. Human verification gates remain paused until explicitly handled.
+- MCP and CLI status distinguish subscription worker startup from web login issues. Cached web failures do not block a usable subscription backend.
+- Subscription-only pools accept jobs without configured web accounts. Existing request IDs and uncertain submissions are retained.
+- This candidate has isolated contract tests and a live Claude MCP acceptance run; deployment is a separate step.
+
 ## 0.7.31
 
 - Web lanes use the Hub's shared failure inspection when available, so a navigation timeout at a challenge is paused instead of treated as a transient failure. The failed operation is never replayed.

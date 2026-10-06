@@ -59,7 +59,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.31'
+VERSION = '0.7.32'
 # The Codex fallback lane (codex_lane.py): not a browser account, so it has no row in accounts.
 CODEX_LANE = 'codex'
 # The lane process writes a heartbeat every tick; older than this means it is not running.
@@ -400,7 +400,7 @@ class Pool:
     def prepare(self, account_id='auto', **kwargs):
         """Resolve one request into everything the queue needs, touching nothing yet."""
         with self.connect() as db:
-            if not db.execute('SELECT 1 FROM accounts LIMIT 1').fetchone():
+            if not db.execute('SELECT 1 FROM accounts LIMIT 1').fetchone() and not (account_id in ('auto', CODEX_LANE) and fallback_settings(self.root)):
                 raise w.ImageError('no_accounts', 'Register and log in to at least one isolated account before submitting.')
         parent = kwargs.pop('continue_from', '')
         thread = ''
@@ -1088,6 +1088,10 @@ class Pool:
                 'advice': advice, 'accounts': accounts, 'jobs': counts,
                 'codex_fallback': codex,
                 'human_action': gates, 'human_action_blocks_generation': not serving, 'egress_last_ok': egress_ok,
+                'web_fallback': {'state': 'ready' if web_usable else 'needs_recheck',
+                                 'available_lanes': web_usable, 'blocks_generation': not bool(serving),
+                                 'last_checked_at': max((a['updated'] for a in accounts), default=0),
+                                 'advice': 'Use the available generation backend. Cached web login failures do not block Codex; explicitly check a web account only when the web backend is needed.'},
                 'logins': logins,
                 'configured_capacity': sum(bool(a['enabled']) for a in accounts),
                 'parallel_capacity': web_capacity + (codex['parallel'] if codex_usable else 0)}
@@ -1100,11 +1104,29 @@ class Pool:
         except (OSError, ValueError):
             return {'error': 'worker_health_unreadable'}
 
+    def worker_needed(self, account):
+        """Wake lanes for actual work or explicit login controls, including disabled logins."""
+        with self.connect() as db:
+            if db.execute("SELECT 1 FROM controls WHERE account_id=? AND status IN ('queued','running') LIMIT 1", (account['id'],)).fetchone():
+                return True
+            if db.execute("SELECT 1 FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention') LIMIT 1", (account['id'],)).fetchone():
+                return True
+            if not account['enabled'] or human_gate.gate_code(account['state'], account.get('error')):
+                return False
+            if db.execute("SELECT 1 FROM jobs WHERE account_id=? AND status='parked' AND park_count<=? LIMIT 1",
+                          (account['id'], len(ADOPT_BACKOFF))).fetchone():
+                return True
+            queued = db.execute("SELECT preferred,result FROM jobs WHERE status='queued' AND preferred IN ('auto',?,?) ORDER BY preferred='auto',result LIKE '%\"to_web\": true%' DESC LIMIT 1",
+                                (account['id'], login_group(account))).fetchone()
+        return bool(queued) and (queued['preferred'] != 'auto' or json.loads(queued['result'] or '{}').get('to_web') or not codex_first(self.root))
+
     def ensure_workers(self):
         failures = []
         with self.connect() as db:
             accounts = [dict(r) for r in db.execute('SELECT * FROM accounts')]
         for account in accounts:
+            if not self.worker_needed(account):
+                continue
             if (self.root / ('stop-' + account['id'])).exists() or time.time() - account['heartbeat'] < 20:
                 continue
             env = account_env(account, self.root)

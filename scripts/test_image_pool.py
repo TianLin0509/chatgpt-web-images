@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -80,6 +81,32 @@ class FakeRuntime:
 
 
 class QueueContracts(unittest.TestCase):
+    def test_workers_wake_for_real_work_and_explicit_disabled_account_controls(self):
+        account = self.pool.account('primary')
+        self.assertFalse(self.pool.worker_needed(account))
+        self.pool.enable('primary', False)
+        self.assertFalse(self.pool.worker_needed(self.pool.account('primary')))
+        self.pool.control('primary', 'check', person=True)
+        self.assertTrue(self.pool.worker_needed(self.pool.account('primary')))
+
+    def test_network_recovery_keeps_queued_work_but_human_gates_do_not_autowake(self):
+        self.pool.submit(prompt='Fixture', request_id='worker-demand', output_dir=str(self.root/'out'), account_id='primary')
+        self.pool.account_state('primary','browser_unhealthy',False)
+        self.assertTrue(self.pool.worker_needed(self.pool.account('primary')))
+        self.pool.account_state('primary','browser_challenge',False)
+        self.assertFalse(self.pool.worker_needed(self.pool.account('primary')))
+
+    def test_web_fallback_and_delayed_original_job_keep_their_worker(self):
+        job=self.submit('returned-to-web')
+        with patch('image_pool.codex_first',return_value=True):
+            self.assertFalse(self.pool.worker_needed(self.pool.account('primary')))
+            with self.pool.connect() as db:
+                db.execute('UPDATE jobs SET result=? WHERE id=?',(json.dumps({'to_web':True}),job['job_id']))
+            self.assertTrue(self.pool.worker_needed(self.pool.account('primary')))
+        with self.pool.connect() as db:
+            db.execute("UPDATE jobs SET account_id='primary',status='parked',park_count=1,retry_after=? WHERE id=?",(time.time()+300,job['job_id']))
+        self.assertTrue(self.pool.worker_needed(self.pool.account('primary')))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -17,6 +17,16 @@ from test_image_pool import FakeRuntime
 
 
 class CodexFallbackContracts(unittest.TestCase):
+    def test_codex_only_pool_accepts_new_work_without_web_login(self):
+        with self.pool.connect() as db:
+            db.execute('DELETE FROM accounts')
+        self.enable(prefer='codex')
+        self.assertTrue(self.pool.status()['can_generate'])
+        job = self.submit('codex-only')
+        self.run_lane()
+        self.assertEqual(self.pool.get(job)['status'], 'complete')
+        self.assertEqual(self.pool.get(job)['provider'], 'codex-imagegen')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

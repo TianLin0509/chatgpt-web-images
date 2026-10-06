@@ -6,6 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Annotated
 
 from pydantic import Field
@@ -30,6 +31,21 @@ def wake(pool, result):
     return result
 
 
+def current_status(pool):
+    failures = pool.ensure_workers()
+    result = pool.status()
+    if failures:
+        result['worker_start_errors'] = failures
+        result['next_action'] = 'fix_worker_start_then_poll_same_job'
+    elif not result['can_generate'] and result['codex_fallback']['enabled']:
+        launch = pool.root / 'launch-codex.json'
+        if launch.exists() and time.time() - launch.stat().st_mtime < 20:
+            result['next_action'] = 'wait_for_backend_start'
+            result['human_action_blocks_generation'] = False
+            result['advice'] = 'The subscription image worker is starting. Check image_status shortly; do not request web login or resubmit jobs.'
+    return result
+
+
 def create_mcp(pool=None):
     from mcp.server.fastmcp import FastMCP
     from mcp.types import CallToolResult, TextContent
@@ -40,7 +56,9 @@ def create_mcp(pool=None):
         'submit at once. serving=codex means the Codex subscription draws new work and the web lanes '
         'are only a fallback: a web lane stuck on a verification check or signed out does not block '
         'anything, so do not check web lanes or ask the user to verify. Only when can_generate is '
-        'false relay human_action to the user.\n\n'
+        'false inspect next_action first: wait_for_backend_start means the subscription worker is '
+        'starting; check status shortly without asking for web login. fix_worker_start_then_poll_same_job '
+        'requires a worker repair, not login. Only resolve_human_action requires the listed human step.\n\n'
         'CONCURRENCY: Codex draws each image of a job as its own parallel run, shared by all jobs. '
         'On the web, one lane is one browser profile and runs one job at a time. Concurrency '
         'equals the number of lanes, NOT the number of ChatGPT accounts. image_status reports '
@@ -78,7 +96,7 @@ def create_mcp(pool=None):
     @server.tool(structured_output=False)
     async def image_status() -> str:
         """Read whether images can be generated now (can_generate, serving, advice), lane health, per-login load, running jobs, queue and account-action results. Does not navigate browsers."""
-        return await call(lambda: wake(pool, pool.status()))
+        return await call(lambda: current_status(pool))
 
     @server.tool(structured_output=False)
     async def image_open(account_id: str = 'primary') -> str:
@@ -208,7 +226,7 @@ def main(argv=None):
         if args.command == 'import-legacy':
             return pool.import_legacy(account)
         if args.command == 'status':
-            return pool.status()
+            return current_status(pool)
         if args.command in {'open','check','select-account'}:
             kwargs = ({'account_name': args.account_name, 'remember': not args.no_remember} if args.command == 'select-account'
                       else {'person': True} if args.command == 'check' else {})

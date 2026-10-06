@@ -54,6 +54,7 @@ class Reliability(fixtures.QueueContracts):
             self.assertEqual(spawn.call_count, 0)
 
     def test_many_clients_launch_at_most_one_worker_per_account(self):
+        self.submit('worker-demand')
         with patch('image_pool.subprocess.Popen') as spawn:
             spawn.return_value.pid = 12345
             with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
