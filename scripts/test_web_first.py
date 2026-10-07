@@ -146,14 +146,14 @@ class WebFirstContracts(unittest.TestCase):
         w.write_json(Path(account['config_dir']) / 'settings.json', {'data_dir': 'x', 'cli_entry': 'C:/x/playwright-cli.js'})
         self.assertIsNone(gate_revisit.lane_binding(account))
 
-    def test_hub_confirmation_after_the_gate_queues_one_check_per_enabled_lane(self):
+    def test_hub_confirmation_after_the_gate_queues_one_check_on_one_lane(self):
         self.gate('primary')
         self.gate('primary-2')
         self.write_last_check('main', time.time() - 3600)  # older than the gate: no evidence
         self.assertEqual(gate_revisit.revisit(self.pool), [])
         self.write_last_check('main', time.time() + 1)
         self.assertEqual(gate_revisit.revisit(self.pool), [('primary', 'hub_login_confirmed')])
-        self.assertEqual(self.checks_queued(), ['primary', 'primary-2'])
+        self.assertEqual(self.checks_queued(), ['primary'], 'one tab looks, not a burst of every lane')
         self.assertEqual(gate_revisit.revisit(self.pool), [], 'the same evidence queues nothing twice')
 
     def test_a_check_that_passes_clears_the_gate_and_web_serves_again(self):

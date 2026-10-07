@@ -10,6 +10,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import random
 import re
 import shutil
 import subprocess
@@ -22,7 +23,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.34'
+VERSION = '0.7.35'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -234,6 +235,10 @@ def cli(args, timeout=55):
         message = json.dumps(envelope, ensure_ascii=False)
         if 'Human handoff' in message:
             raise ImageError('human_handoff', 'A person is verifying or signing in in the Hub browser; automation waits until they finish.')
+        # The Hub holding automation back (a cool-down after a person's check, or the hourly
+        # page-load budget) is "try later": never a new human gate on this login.
+        if 'Hub cooldown' in message or 'Rate limited by Hub' in message:
+            raise ImageError('rate_limited', 'The AI Hub is pacing automation on this login; the job waits or Codex draws it.')
         if 'Site challenged' in message:
             raise ImageError('browser_challenge', 'This login met a human check and is paused; use open to let a person complete it.')
         if 'not open' in message or 'No browser' in message:
@@ -946,8 +951,9 @@ def download_asset(job, asset):
 # 1672x941 image while the page never rendered it). The page is therefore not the only
 # source of truth. After a grace period ask the server once, at a gentle cadence, and
 # reload the recorded conversation only when the server reports a finished image turn.
-SERVER_TRUTH_AFTER = 90
-SERVER_TRUTH_EVERY = (60, 120, 300)
+# Paced like a person who glances back now and then (0.7.35): later and rarer, with jitter.
+SERVER_TRUTH_AFTER = 150
+SERVER_TRUTH_EVERY = (120, 240, 480)
 SERVER_TRUTH_RELOADS = 3
 SERVER_TRUTH_JS = r"""async page => page.evaluate(async id => {
   const s = await (await fetch('/api/auth/session', {credentials: 'include'})).json();
@@ -984,11 +990,11 @@ def server_truth_reload(job):
     if truth.get('http') != 200:
         # A 429 here is the same pressure that stalled the page; back off, never hammer.
         job['server_truth_misses'] = misses + 1
-        job['server_truth_next'] = now + SERVER_TRUTH_EVERY[min(misses + 1, len(SERVER_TRUTH_EVERY) - 1)]
+        job['server_truth_next'] = now + SERVER_TRUTH_EVERY[min(misses + 1, len(SERVER_TRUTH_EVERY) - 1)] * random.uniform(0.8, 1.3)
         job['server_truth'] = {'http': truth.get('http')}
         return None
     job['server_truth_misses'] = 0
-    job['server_truth_next'] = now + SERVER_TRUTH_EVERY[0]
+    job['server_truth_next'] = now + SERVER_TRUTH_EVERY[0] * random.uniform(0.8, 1.3)
     job['server_truth'] = {'http': 200, 'finished': bool(truth.get('finished')), 'images': int(truth.get('images') or 0)}
     if not (truth.get('finished') and truth.get('images')):
         return None

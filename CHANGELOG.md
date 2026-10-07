@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.35
+
+- Paced like one restrained person (owner request 2026-10-08, after Cloudflare loops on chatgpt.com): page loads made through the AI Hub browser count against the Hub's hourly budget per login and site; a gated login reopens with one lane looking, not every lane at once; the server-side progress check starts at 150 s and repeats at 120/240/480 s with jitter.
+- The Hub's own pacing (`Hub cooldown` after a person's check, `Rate limited by Hub`) maps to `rate_limited`: the login cools down and Codex draws meanwhile; it is never mistaken for a new human gate.
+
 ## 0.7.33
 
 - Web first, Codex fallback by default (owner decision 2026-10-07). When no web lane could take work at all (every login disabled, waiting for a person or cooling down), the Codex lane takes new unpinned work at once instead of waiting `queue_wait_seconds`; pinned work and follow-ups keep the long wait. `image_status.serving` follows the same rule and reports `web_lanes_able`.

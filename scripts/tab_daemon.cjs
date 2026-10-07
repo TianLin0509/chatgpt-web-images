@@ -172,7 +172,8 @@ class TabDaemon {
       if (await this.yieldToPerson()) this.guard.assertAutomationAllowed(this.root, { identity: this.identity });
     }
     if (command === 'goto') {
-      if (this.guard) this.guard.assertAutomationAllowed(this.root, { identity: this.identity, url: args[0] });
+      // A page load counts against the Hub's hourly budget for this login and site.
+      if (this.guard) this.guard.assertAutomationAllowed(this.root, { identity: this.identity, url: args[0], navigate: true });
       const page = await this.page(lane);
       await this.protectedStep(lane, page, () => page.goto(args[0], { waitUntil: 'domcontentloaded' }));
       if (this.guard && await this.guard.inspectAndLeave(this.root, { identity: this.identity, page, url: args[0], source: lane }))
@@ -313,6 +314,8 @@ function category(message) {
   return /^Unsupported Hub browser command/.test(message) ? 'Unsupported command'
     : /^Human handoff/.test(message) ? 'Human handoff'
     : /^Site challenged/.test(message) ? 'Site challenged'
+    : /^Hub cooldown/.test(message) ? 'Hub cooldown'
+    : /^Rate limited by Hub/.test(message) ? 'Rate limited by Hub'
     : /No browser session/.test(message) ? 'No browser session'
     : /IMAGE_TOOL_UNAVAILABLE/.test(message) ? 'IMAGE_TOOL_UNAVAILABLE'
     : /strict mode violation/.test(message) ? 'strict mode violation'

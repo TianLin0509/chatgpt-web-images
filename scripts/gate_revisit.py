@@ -132,9 +132,9 @@ def revisit(pool, now=None):
         if not reason:
             continue
         book.update(group, auto_check_at=now, auto_check_reason=reason, **mark)
-        # Every enabled lane of the login keeps its own gated state; each needs its own check
-        # to take work again (a check never repeats while one is queued for that lane).
-        for lane in lanes:
-            pool.control(lane['id'], 'check')
+        # One lane looks, like one person opening one tab (0.7.35): when every lane of a login
+        # checked at once, chatgpt.com saw a burst right after the person's pass. Other lanes of
+        # the login keep their state; one lane per login is the recommended setup.
+        pool.control(lanes[0]['id'], 'check')
         queued.append((group, reason))
     return queued
