@@ -1,6 +1,6 @@
 ---
 name: chatgpt-web-images
-description: 本机生图入口：用用户自己的订阅生成图片、制作参考图变体并保存原图（Codex 订阅内置生图优先，ChatGPT 网页账号兜底，从不走付费 API）。适用于需要生成效果图、mock 图、插图或点名本工具；多个 agent 共用持久队列并行，只返回文字与本地文件路径。
+description: 本机生图入口：用用户自己的订阅生成图片、制作参考图变体并保存原图（ChatGPT 网页优先，Codex 订阅内置生图兜底，从不走付费 API）。适用于需要生成效果图、mock 图、插图或点名本工具；多个 agent 共用持久队列并行，只返回文字与本地文件路径。
 ---
 
 # ChatGPT 网页生图
@@ -9,7 +9,7 @@ description: 本机生图入口：用用户自己的订阅生成图片、制作�
 
 状态返回 `next_action=wait_for_backend_start` 表示订阅生图后台正在启动，稍后再查 `image_status`，无需网页登录。`fix_worker_start_then_poll_same_job` 表示后台启动故障，检查启动错误并保留原任务，也不要因此要求网页登录。只有 `resolve_human_action` 且列出了人工事项时才走登录或验证流程。网页车道无任务时会休眠；显式账号检查或真实网页任务会自动唤醒，休眠不等于登录失效。
 
-1. 首次使用调用 `image_status`（不访问网页）。**`can_generate=true` 就直接提交**，照 `advice` 做：`serving=codex` 时由 Codex 出图，网页车道即使显示 `browser_challenge`、未登录或可用车道为 0 也不影响，不要去 check 网页车道，也不要让用户去点验证。只有 `can_generate=false` 才处理网页登录：未登录或卡验证时 `image_open(account_id)`：跑在 AI Hub 浏览器里的账号会进入「人工接管」，所有网页自动化暂停并断开、屏幕上弹出干净窗口，告诉用户在里面完成验证或登录后关掉窗口；然后 `image_account_check(account_id)`，再查看 status。不要在用户操作期间反复 check 或重投任务。账号操作返回 queued 只表示已接收。status 的 `human_action` 列出需要人处理的登录（验证、登录失效等，Windows 通知也已提醒用户）；`human_action_blocks_generation=true` 时才把其中的 next_action 转告用户，否则它只是网页兜底的待办，不耽误出图；`egress_changed=true` 说明出口 IP 变了，一并告诉用户。
+1. 首次使用调用 `image_status`（不访问网页）。**`can_generate=true` 就直接提交**，照 `advice` 做：`serving=web` 时网页先画，网页画不了会自动交给 Codex；`serving=codex` 时（没有网页车道能接活，或用户设了 Codex 优先）由 Codex 立即出图，网页车道即使显示 `browser_challenge`、未登录或可用车道为 0 也不影响，不要去 check 网页车道，也不要让用户去点验证——AI Hub 账号页会提醒用户，卡住的网页登录在 Hub 确认登录后或每 12 小时会自动复检一次。只有 `can_generate=false` 才处理网页登录：未登录或卡验证时 `image_open(account_id)`：跑在 AI Hub 浏览器里的账号会进入「人工接管」，所有网页自动化暂停并断开、屏幕上弹出干净窗口，告诉用户在里面完成验证或登录后关掉窗口；然后 `image_account_check(account_id)`，再查看 status。不要在用户操作期间反复 check 或重投任务。账号操作返回 queued 只表示已接收。status 的 `human_action` 列出需要人处理的登录（验证、登录失效等，Windows 通知也已提醒用户）；`human_action_blocks_generation=true` 时才把其中的 next_action 转告用户，否则它只是网页兜底的待办，不耽误出图；`egress_changed=true` 说明出口 IP 变了，一并告诉用户。
 2. 要在之前某张图的基础上修改（改配色、换标题、保持版式微调），传 `continue_from=<该任务的 job_id>`，追问会发进原对话，ChatGPT 仍看得见那些图；不相关的新图不要带 `continue_from`。同一对话同时只允许一个追问在跑，它会自动落到拥有该对话的账号的任意空闲车道。
    长提示词保存为带日期、任务标识的 UTF-8 文件。`image_generate(prompt_file=绝对路径, count=张数, request_id=全局唯一任务标识, output_dir=绝对路径, name=任务名, account_id="auto")`。prompt 与 prompt_file 二选一；reference_images 接受至多五个 PNG/JPEG/WebP 绝对路径，排队期间保持文件不变。
 3. count=1..20 是一个任务要的图片数量，不是账号并发数或额度保证。Codex 出图时每张图单独并行生成（各自换一种构图），网页出图时是一次请求出 N 张。遵从指定张数，多图要求独立附件，不能用拼图或裁切代替，不静默压缩或降低要求。
@@ -24,7 +24,7 @@ description: 本机生图入口：用用户自己的订阅生成图片、制作�
    queued 时先看 blocking_accounts；账号故障后后台会自行重检有限次，仍是 browser_unhealthy 才需排查后 account_check，不通过反复提交试错。worker_stalled 表示进程仍有心跳但操作停滞，不等于可用。已有活动任务不可切换账号。resume 只恢复观察，不重发；同一超时反复出现时交代阻塞原因，不无限 resume。
 11. 只有请求、观察与下载数量相符才是 complete。partial / count_mismatch / failed 必须如实交代，交付已保存文件。确认本地文件存在并用本地看图工具检查，不把图片 base64 放进工具文字。
 
-图片来源看结果的 `provider`：`codex-imagegen` 是 Codex 订阅的内置生图工具，`chatgpt-web` 是 ChatGPT 网页（内部模型未核实，称为“ChatGPT 网页生成”）。Codex 优先模式（status 的 `codex_fallback.prefer=codex`）下新任务先交 Codex，网页兜底；交付时如实说明图片来源。结果只含文件路径等文字，不要自己直接调用 Codex 生图工具（那会把图片数据带进上下文），统一走本 MCP。任何情况下都不走付费 API。Codex 生成的图同样可以用 `continue_from` 续改。尺寸以原图为准。不绕过登录、校验、额度；密码和验证码只由用户在专属浏览器输入。
+图片来源看结果的 `provider`：`codex-imagegen` 是 Codex 订阅的内置生图工具，`chatgpt-web` 是 ChatGPT 网页（内部模型未核实，称为“ChatGPT 网页生成”）。默认网页优先：有网页车道能接活时新任务先等网页（约 90 秒无人接再交 Codex），没有就立即交 Codex；`codex_fallback.prefer=codex` 时反过来，新任务先交 Codex、网页兜底；交付时如实说明图片来源。结果只含文件路径等文字，不要自己直接调用 Codex 生图工具（那会把图片数据带进上下文），统一走本 MCP。任何情况下都不走付费 API。Codex 生成的图同样可以用 `continue_from` 续改。尺寸以原图为准。不绕过登录、校验、额度；密码和验证码只由用户在专属浏览器输入。
 
 ## MCP 尚未加载
 

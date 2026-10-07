@@ -18,6 +18,7 @@ import asyncio
 import web_images as w
 import image_limits
 import human_gate
+import gate_revisit
 
 TERMINAL = w.TERMINAL | {'cancelled'}
 LIVE = ('dispatching', 'running', 'needs_attention')
@@ -59,7 +60,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.32'
+VERSION = '0.7.33'
 # The Codex fallback lane (codex_lane.py): not a browser account, so it has no row in accounts.
 CODEX_LANE = 'codex'
 # The lane process writes a heartbeat every tick; older than this means it is not running.
@@ -197,6 +198,7 @@ class Pool:
         self.root = Path(root or pool_root()).resolve()
         # Only the worker process passes alerts; clients and tests never raise toasts.
         self.alerts = alerts
+        self.gate_scan_at = 0
         self.root.mkdir(parents=True, exist_ok=True)
         self.db = self.root / 'queue.sqlite3'
         with self.connect() as db:
@@ -625,7 +627,9 @@ class Pool:
             result['parked_reason'] = 'lane_released_for_queue'
             result['auto_retry_attempts_left'] = max(0, len(ADOPT_BACKOFF) - row['park_count'] + 1)
             result['auto_retry_at'] = row['retry_after'] if not attended else None
-        if row['status'] == 'queued' and row['preferred'] in ('auto', CODEX_LANE) and codex_first(self.root) \
+        if row['status'] == 'queued' and row['preferred'] in ('auto', CODEX_LANE) \
+                and (codex_first(self.root) or row['preferred'] == CODEX_LANE
+                     or (not row['thread'] and codex_can_serve(self.root) and not self.web_takers())) \
                 and not json.loads(row['result'] or '{}').get('to_web'):
             with self.connect() as db:
                 result['queue_position'] = db.execute("SELECT COUNT(*) FROM jobs WHERE status='queued' AND created<=?", (row['created'],)).fetchone()[0]
@@ -763,6 +767,37 @@ class Pool:
                        (CODEX_LANE, json.dumps(note), time.time(), job_id))
         return True
 
+    def web_takers(self, db=None, now=None):
+        """Web lanes that would take unpinned work now: enabled, last seen signed in, not
+        stalled, not holding a paused job, and their login neither waiting for a person nor
+        cooling down. A sleeping worker still counts: queued work wakes it in seconds."""
+        now = now or time.time()
+        gated = set(human_gate.GateBook(self.root).read()['gates'])
+        own = db is None
+        if own:
+            ctx = self.connect()
+            db = ctx.__enter__()
+        try:
+            takers = []
+            for row in db.execute('SELECT * FROM accounts WHERE enabled=1 AND ready=1'):
+                group = login_group(row)
+                if group in gated:
+                    continue
+                cooldown = db.execute('SELECT retry_after FROM login_cooldowns WHERE login_group=?', (group,)).fetchone()
+                if cooldown and cooldown['retry_after'] > now:
+                    continue
+                if db.execute("SELECT 1 FROM jobs WHERE account_id=? AND status='needs_attention' LIMIT 1", (row['id'],)).fetchone():
+                    continue
+                health = self.worker_health(row['id'])
+                if (now - row['heartbeat'] < 20 and health.get('pid') == row['pid']
+                        and health.get('tick_started', 0) > health.get('tick_finished', 0) and now - health['tick_started'] > 300):
+                    continue  # stalled
+                takers.append(row['id'])
+            return takers
+        finally:
+            if own:
+                ctx.__exit__(None, None, None)
+
     def claim_codex(self, queue_wait_seconds, exclude=(), first=False):
         """The next job for the Codex lane: one handed over by a web lane, or one no web lane
         has taken within queue_wait_seconds."""
@@ -785,15 +820,19 @@ class Pool:
             # Unpinned new work waits queue_wait_seconds for a web lane; work pinned to an account
             # or continuing a conversation waits three times as long, since only the web keeps it
             # in that conversation (the Codex fallback passes its last images as references).
+            # Web first (owner, 2026-10-07): but when no web lane could take it at all (every
+            # login disabled, waiting for a person or cooling down), waiting only wastes time.
+            # Pinned work keeps its long wait: only the web can keep it on that login.
+            auto_wait = queue_wait_seconds if self.web_takers(db, now) else 0
             row = db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 AND COALESCE(result, '') NOT LIKE ? AND "
                              "(preferred=? OR (preferred='auto' AND thread='' AND created<=?) OR created<=?) "
                              "ORDER BY (preferred=?) DESC, created, id LIMIT 1",
-                             ('%"codex_tried": true%', CODEX_LANE, now - queue_wait_seconds, now - 3 * queue_wait_seconds, CODEX_LANE)).fetchone()
+                             ('%"codex_tried": true%', CODEX_LANE, now - auto_wait, now - 3 * queue_wait_seconds, CODEX_LANE)).fetchone()
             note = None
             if row and row['id'] not in exclude:
                 note = json.loads(row['result'] or '{}')
                 if row['preferred'] != CODEX_LANE:
-                    note = {'status': 'queued', 'files': [], 'fallback_from': 'queue_wait'}
+                    note = {'status': 'queued', 'files': [], 'fallback_from': 'queue_wait' if auto_wait else 'web_unavailable'}
             else:
                 row = self.stranded_parked(db, now, exclude)
                 if row:
@@ -1075,12 +1114,18 @@ class Pool:
                            'busy_lanes': codex['active_jobs'], 'parked_jobs': 0})
         # One answer to "can I submit now?": an agent that sees only web lanes stuck on a check
         # otherwise stops and asks the user to verify, although Codex would draw the images.
-        serving = 'codex' if first else ('web' if web_usable else ('codex' if codex_usable else None))
+        # Web first unless the owner chose Codex: the web serves when any lane would take work
+        # (a sleeping lane wakes for it); otherwise Codex takes new work at once.
+        web_able = len(self.web_takers())
+        serving = 'codex' if first else ('web' if web_able else ('codex' if codex_usable else None))
         if first:
             advice = ('Submit now. Codex draws new work; the web lanes are only a fallback, so their login or '
                       'verification state does not block anything and needs no user action.')
+        elif serving == 'codex':
+            advice = ('Submit now. No web lane can take work right now, so the Codex subscription draws it at once; '
+                      'pending web login or verification items are only reported, they do not block generation.')
         elif serving:
-            advice = 'Submit now.'
+            advice = 'Submit now. The ChatGPT web draws first; Codex takes over if the web cannot.'
         else:
             advice = 'No lane can draw right now; relay human_action to the user.'
         return {'ok': True, 'service': 'local-durable-pool', 'version': VERSION,
@@ -1088,6 +1133,7 @@ class Pool:
                 'advice': advice, 'accounts': accounts, 'jobs': counts,
                 'codex_fallback': codex,
                 'human_action': gates, 'human_action_blocks_generation': not serving, 'egress_last_ok': egress_ok,
+                'web_lanes_able': web_able,
                 'web_fallback': {'state': 'ready' if web_usable else 'needs_recheck',
                                  'available_lanes': web_usable, 'blocks_generation': not bool(serving),
                                  'last_checked_at': max((a['updated'] for a in accounts), default=0),
@@ -1122,6 +1168,12 @@ class Pool:
 
     def ensure_workers(self, *, include_codex=True):
         failures = []
+        if time.time() - self.gate_scan_at >= gate_revisit.SCAN_EVERY_SECONDS:
+            self.gate_scan_at = time.time()
+            try:
+                gate_revisit.revisit(self)
+            except Exception:
+                pass  # a gate scan must never cost a caller its workers
         with self.connect() as db:
             accounts = [dict(r) for r in db.execute('SELECT * FROM accounts')]
         for account in accounts:
