@@ -9,8 +9,10 @@ Two things now queue that check, never more than one per gate and reason:
   1. fresh evidence from the AI Hub, read from files in its browser root: an account check
      that confirmed this login on chatgpt.com after the gate began (last-check.json), or a
      person's handoff for this login that has ended since (web-risk.json);
-  2. a conservative timer: a gate older than GATE_RECHECK_SECONDS is checked once every
-     GATE_RECHECK_SECONDS.
+  (0.7.34) There is no timer any more: an unattended check visits chatgpt.com from automation,
+  and on 2026-10-07 one such visit met Cloudflare again and added to the login's challenge
+  counters, after which the person looped on "Verify you are human". Only a person's evidence
+  reopens a gated login.
 Neither visits anything while the Hub has paused this login's ChatGPT (a recent challenge)
 or a person holds the browser. Logins whose lanes are all disabled are left alone: the
 owner switched them off on purpose. Which Hub identity a lane is follows from its own
@@ -127,8 +129,6 @@ def revisit(pool, now=None):
                 reason, mark = 'hub_login_confirmed', {'evidence_at': confirmed}
             elif gate.get('handoff_seen') and gate.get('handoff_done') != gate['handoff_seen']:
                 reason, mark = 'hub_handoff_ended', {'handoff_done': gate['handoff_seen']}
-        if not reason and now - since >= GATE_RECHECK_SECONDS and now - float(gate.get('auto_check_at') or 0) >= GATE_RECHECK_SECONDS:
-            reason, mark = 'periodic', {}
         if not reason:
             continue
         book.update(group, auto_check_at=now, auto_check_reason=reason, **mark)

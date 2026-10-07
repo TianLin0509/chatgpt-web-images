@@ -3,7 +3,7 @@
 ## 0.7.33
 
 - Web first, Codex fallback by default (owner decision 2026-10-07). When no web lane could take work at all (every login disabled, waiting for a person or cooling down), the Codex lane takes new unpinned work at once instead of waiting `queue_wait_seconds`; pinned work and follow-ups keep the long wait. `image_status.serving` follows the same rule and reports `web_lanes_able`.
-- Human gates no longer stay forever: a gated login whose lanes run in the AI Hub browser gets one account check per lane when the Hub confirms that login on chatgpt.com after the gate began (`last-check.json`) or a person's handoff for it has ended (`web-risk.json`); any gated login is also re-checked once every 12 hours. Nothing is visited while the Hub pauses that site or a person holds the browser; logins with every lane disabled are left alone.
+- Human gates no longer stay forever: a gated login whose lanes run in the AI Hub browser gets one account check per lane when the Hub confirms that login on chatgpt.com after the gate began (`last-check.json`) or a person's handoff for it has ended (`web-risk.json`). (0.7.34: the 12-hour unattended re-check was removed — an automated visit met Cloudflare again and fed the login's challenge counters.) Nothing is visited while the Hub pauses that site or a person holds the browser; logins with every lane disabled are left alone.
 
 ## 0.7.32
 

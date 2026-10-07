@@ -204,16 +204,12 @@ class WebFirstContracts(unittest.TestCase):
         w.write_json(self.hub / 'web-risk.json', {'handoff': None, 'sites': {}})
         self.assertEqual(gate_revisit.revisit(self.pool), [])
 
-    def test_periodic_recheck_every_twelve_hours_at_most(self):
+    def test_no_unattended_recheck_however_old_the_gate(self):
         self.gate('secondary')
         self.assertEqual(gate_revisit.revisit(self.pool), [], 'a fresh gate waits for a person or evidence')
-        self.age_gate('secondary', gate_revisit.GATE_RECHECK_SECONDS + 1)
-        self.assertEqual(gate_revisit.revisit(self.pool), [('secondary', 'periodic')])
-        with self.pool.connect() as db:
-            db.execute("UPDATE controls SET status='complete'")
-        self.assertEqual(gate_revisit.revisit(self.pool), [], 'not again within 12 hours')
-        later = time.time() + gate_revisit.GATE_RECHECK_SECONDS + 1
-        self.assertEqual(gate_revisit.revisit(self.pool, now=later), [('secondary', 'periodic')])
+        self.age_gate('secondary', gate_revisit.GATE_RECHECK_SECONDS * 10)
+        self.assertEqual(gate_revisit.revisit(self.pool), [], 'an old gate still waits: no automated visit on a timer')
+        self.assertEqual(self.checks_queued(), [])
 
     def test_logins_switched_off_by_the_owner_are_left_alone(self):
         self.gate('secondary')
@@ -227,10 +223,17 @@ class WebFirstContracts(unittest.TestCase):
         self.gate('secondary')
         (self.hub / 'last-check.json').write_text('{not json', encoding='utf-8')
         (self.hub / 'web-risk.json').write_text('[]', encoding='utf-8')
-        self.age_gate('secondary', gate_revisit.GATE_RECHECK_SECONDS + 1)
         self.pool.ensure_workers = Pool.ensure_workers.__get__(self.pool)
         import image_pool
         original = image_pool.subprocess.Popen
+        image_pool.subprocess.Popen = lambda *a, **k: type('P', (), {'pid': 1})()
+        try:
+            self.pool.ensure_workers(include_codex=False)
+        finally:
+            image_pool.subprocess.Popen = original
+        self.assertEqual(self.checks_queued(), [], 'broken Hub files are no evidence')
+        self.write_last_check('alt', time.time() + 1)
+        self.pool.gate_scan_at = 0
         image_pool.subprocess.Popen = lambda *a, **k: type('P', (), {'pid': 1})()
         try:
             self.pool.ensure_workers(include_codex=False)
