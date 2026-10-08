@@ -204,12 +204,32 @@ class WebFirstContracts(unittest.TestCase):
         w.write_json(self.hub / 'web-risk.json', {'handoff': None, 'sites': {}})
         self.assertEqual(gate_revisit.revisit(self.pool), [])
 
-    def test_no_unattended_recheck_however_old_the_gate(self):
+    def test_no_visit_without_work_however_old_the_gate(self):
         self.gate('secondary')
         self.assertEqual(gate_revisit.revisit(self.pool), [], 'a fresh gate waits for a person or evidence')
         self.age_gate('secondary', gate_revisit.GATE_RECHECK_SECONDS * 10)
-        self.assertEqual(gate_revisit.revisit(self.pool), [], 'an old gate still waits: no automated visit on a timer')
+        self.assertEqual(gate_revisit.revisit(self.pool), [], 'no image asked for: no automated visit on a timer')
         self.assertEqual(self.checks_queued(), [])
+
+    def test_with_work_a_gated_login_is_looked_at_again_after_growing_waits(self):
+        self.gate('secondary')
+        self.submit('demand-now')
+        self.assertEqual(gate_revisit.revisit(self.pool), [], 'not within the first six hours')
+        self.age_gate('secondary', 6 * 3600 + 1)
+        self.assertEqual(gate_revisit.revisit(self.pool), [('secondary', 'demand_retry')])
+        self.assertEqual(len(self.checks_queued()), 1, 'one tab looks')
+        with self.pool.connect() as db:
+            db.execute("UPDATE controls SET status='complete'")
+        now = time.time()
+        self.assertEqual(gate_revisit.revisit(self.pool, now=now + 6 * 3600 + 5), [], 'the second return waits twelve hours')
+        self.submit('demand-later')
+        later = now + 12 * 3600 + 5
+        with self.pool.connect() as db:
+            db.execute('UPDATE jobs SET created=?', (later - 60,))
+        self.assertEqual(gate_revisit.revisit(self.pool, now=later), [('secondary', 'demand_retry')])
+        gate = human_gate.GateBook(self.pool.root).read()['gates']['secondary']
+        self.assertEqual(gate['auto_tries'], 2)
+        self.assertGreater(gate_revisit.next_retry_at(gate), later + 23 * 3600, 'then a day')
 
     def test_logins_switched_off_by_the_owner_are_left_alone(self):
         self.gate('secondary')

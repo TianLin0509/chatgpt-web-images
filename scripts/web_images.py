@@ -23,7 +23,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.35'
+VERSION = '0.7.36'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -951,7 +951,7 @@ def download_asset(job, asset):
 # 1672x941 image while the page never rendered it). The page is therefore not the only
 # source of truth. After a grace period ask the server once, at a gentle cadence, and
 # reload the recorded conversation only when the server reports a finished image turn.
-# Paced like a person who glances back now and then (0.7.35): later and rarer, with jitter.
+# Paced like a person who glances back now and then (0.7.36): later and rarer, with jitter.
 SERVER_TRUTH_AFTER = 150
 SERVER_TRUTH_EVERY = (120, 240, 480)
 SERVER_TRUTH_RELOADS = 3

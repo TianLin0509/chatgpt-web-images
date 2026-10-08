@@ -60,7 +60,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.35'
+VERSION = '0.7.36'
 # The Codex fallback lane (codex_lane.py): not a browser account, so it has no row in accounts.
 CODEX_LANE = 'codex'
 # The lane process writes a heartbeat every tick; older than this means it is not running.

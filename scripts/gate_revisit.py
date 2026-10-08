@@ -28,6 +28,30 @@ import time
 import human_gate
 
 GATE_RECHECK_SECONDS = 12 * 3600
+# A person whose page showed a check comes back hours later, when there is work, and usually
+# gets in (0.7.36). A gated login is looked at again only after these waits, growing after
+# each failed return, and only when an image was asked for within DEMAND_WINDOW: no work, no
+# visit. Codex draws everything meanwhile.
+RETRY_AFTER = (6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600)
+DEMAND_WINDOW = 3600
+
+
+def retry_due(gate, now):
+    tries = int(gate.get('auto_tries') or 0)
+    base = max(float(gate.get('since') or 0), float(gate.get('auto_check_at') or 0))
+    return now - base >= RETRY_AFTER[min(tries, len(RETRY_AFTER) - 1)]
+
+
+def next_retry_at(gate):
+    """When the login is looked at again at the earliest (given work), in seconds."""
+    tries = int(gate.get('auto_tries') or 0)
+    base = max(float(gate.get('since') or 0), float(gate.get('auto_check_at') or 0))
+    return base + RETRY_AFTER[min(tries, len(RETRY_AFTER) - 1)]
+
+
+def recent_demand(pool, now):
+    with pool.connect() as db:
+        return bool(db.execute('SELECT 1 FROM jobs WHERE created>=? LIMIT 1', (now - DEMAND_WINDOW,)).fetchone())
 # The pool is asked for status many times a minute; the files change far less often.
 SCAN_EVERY_SECONDS = 30
 _ENTRY_FIELD = r'"%s"\s*:\s*"((?:[^"\\]|\\.)+)"'
@@ -129,6 +153,8 @@ def revisit(pool, now=None):
                 reason, mark = 'hub_login_confirmed', {'evidence_at': confirmed}
             elif gate.get('handoff_seen') and gate.get('handoff_done') != gate['handoff_seen']:
                 reason, mark = 'hub_handoff_ended', {'handoff_done': gate['handoff_seen']}
+        if not reason and retry_due(gate, now) and recent_demand(pool, now):
+            reason, mark = 'demand_retry', {'auto_tries': int(gate.get('auto_tries') or 0) + 1}
         if not reason:
             continue
         book.update(group, auto_check_at=now, auto_check_reason=reason, **mark)

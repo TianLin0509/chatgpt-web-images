@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.36
+
+- A gated login comes back like a person who returns hours later when there is work: one lane looks again only after 6, 12, 24, then 48 hours, and only when an image was asked for within the last hour. No work, no visit. Codex draws meanwhile.
+
 ## 0.7.35
 
 - Paced like one restrained person (owner request 2026-10-08, after Cloudflare loops on chatgpt.com): page loads made through the AI Hub browser count against the Hub's hourly budget per login and site; a gated login reopens with one lane looking, not every lane at once; the server-side progress check starts at 150 s and repeats at 120/240/480 s with jitter.
