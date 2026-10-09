@@ -5,6 +5,8 @@ description: 本机生图入口：用用户自己的订阅生成图片、制作�
 
 # ChatGPT 网页生图
 
+0.7.38 在支持的 Hub 上与 AI 网页圆桌、中转入口共用一个普通 Chrome 扩展连接和账号 Tab 登录态。处理验证时所有共用工具先断开，完成后显式检查原账号即可，不需要关窗口。旧 Hub 保留 0.7.37 的独立普通浏览器扩展通道。
+
 通过已注册的 chatgpt-web-images MCP 调用，Claude、Codex 等客户端使用相同协议。不要另写浏览器脚本或后台轮询脚本。
 
 0.7.37 普通浏览器扩展通道：配置了 `transport=extension` 的车道直接复用账号 Tab 的普通 Chrome 和登录，只操作自己新建的标签页组，不隐藏或关闭用户 Chrome，也不回退到调试浏览器。网站自动检查会在同一页面只读等待最多 12 秒，真正持续的验证仍交给用户。`image_open` 断开生图自动化并打开普通浏览器，处理后调用 `image_account_check` 即可，不需要关闭窗口。`extension_pairing_required` 是首次扩展配对问题，需在该身份的普通 Chrome 配对官方 Playwright 扩展后再检查，不反复访问登录页。用户明确要求验证或修复网页通道时，使用网页账号钉定任务，验收以 `provider=chatgpt-web` 的原图保存为准，Codex 出图不能代表网页已恢复。

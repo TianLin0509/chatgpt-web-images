@@ -8,6 +8,13 @@ const {EventEmitter}=require('events');
 const {ExtensionTabDaemon,statePath,EXTENSION_ID}=require('./extension_tab_daemon.cjs');
 const {main}=require('./extension_tab_client.cjs');
 
+test('new Hub broker is delegated once without starting an independent image connection',async t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'images-shared-broker-test-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  fs.writeFileSync(path.join(root,'ordinary-browser-client.js'),'module.exports.main=async(binding,argv)=>({shared:true,lane:binding.id,argv});');
+  const result=await main({hubCore:root,id:'images-primary'},['open']);
+  assert.deepEqual(result,{shared:true,lane:'images-primary',argv:['open']});
+});
+
 function fixture({initialHumanPage=false}={}) {
   const calls=[];
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'images-extension-test-'));

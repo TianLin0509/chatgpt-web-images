@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.38
+
+- Use the shared AI Hub ordinary-browser broker when available, so image generation, website roundtables and the legacy bridge share one official extension connection and the account Tab's existing login. Older Hubs retain the standalone ordinary-browser extension transport.
+- Manual handoff detaches automation across the shared connection; finishing a different site's verification cannot release another site's handoff. Chrome windows and human tabs remain owned by the user.
+
 ## 0.7.37
 
 - Optional official Playwright extension transport shares the account Tab's ordinary Chrome and its login. It launches no debugging port, creates only its own tab group, and never switches to another browser on a connection failure. Pairing is pinned to the identity and browser root and encrypted with Windows current-user DPAPI.

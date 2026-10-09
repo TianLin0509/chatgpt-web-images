@@ -45,6 +45,10 @@ function category(error) {
 }
 
 async function main(binding,argv=process.argv.slice(2),{ensure=ensureDaemon,fetchImpl=fetch}={}) {
+  // New Hubs provide one ordinary-browser broker shared with the web roundtable
+  // and bridge. Older Hubs retain the already verified standalone extension path.
+  const shared=path.join(binding.hubCore,'ordinary-browser-client.js');
+  if(ensure===ensureDaemon&&fs.existsSync(shared))return require(shared).main(binding,argv);
   let out;
   try {
     if(!/^[a-z0-9_-]{1,64}$/.test(binding.id||''))throw Error('Invalid extension lane');
