@@ -40,6 +40,23 @@ class AccountBrowser(unittest.TestCase):
         self.page.set_content('<title>请稍候…</title><script>window._cf_chl_opt={}</script><p>Checking</p>')
         self.assertTrue(self.state()['challenge'])
 
+    def test_background_cloudflare_widgets_do_not_block_a_signed_in_page(self):
+        shell = '<title>ChatGPT</title><button data-testid="accounts-profile-button">Profile</button><div id="prompt-textarea" contenteditable="true">Ask anything</div>'
+        for style in ('width:0;height:0;border:0',
+                      'position:absolute;left:-9999px;width:300px;height:65px',
+                      'position:absolute;top:-9999px;width:300px;height:65px',
+                      'width:300px;height:65px;opacity:0',
+                      'width:300px;height:65px;visibility:hidden'):
+            with self.subTest(style=style):
+                self.page.set_content(shell + '<iframe src="https://challenges.cloudflare.com/test-widget" style="' + style + '"></iframe>')
+                self.assertFalse(self.state()['challenge'])
+                self.assertTrue(self.state()['logged_in'])
+
+    def test_visible_cloudflare_widget_still_requires_a_person(self):
+        self.page.set_content('<title>ChatGPT</title><p>Verify you are human</p><iframe src="https://challenges.cloudflare.com/test-widget" style="width:300px;height:65px"></iframe>')
+        self.assertTrue(self.state()['challenge'])
+        self.assertEqual(self.state()['auth_state'], 'browser_challenge')
+
     def test_image_pill_survives_fill_before_selection(self):
         self.page.set_content('<div id="prompt-textarea" contenteditable="true"><span contenteditable="false" data-inline-selection-pill data-system-hint-type="picture_v2">Create image</span></div>')
         # Reproduce the old destructive ordering in real Chromium.

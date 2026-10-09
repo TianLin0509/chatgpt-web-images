@@ -18,8 +18,15 @@ STATE_FUNCTION = r'''() => {
     /Welcome back|欢迎回来|Choose an account/i.test(document.body.innerText));
  // Cloudflare localises its interstitial title (the main profile prefers zh-CN).
  const cf = typeof window._cf_chl_opt === 'object' || !!document.querySelector('script[src*="/cdn-cgi/challenge-platform/"]');
+ // Turnstile also uses background widgets. A DOM rectangle can exist with zero
+ // area or outside the viewport; neither asks the person to verify anything.
+ const visibleChallenge = n => {
+   if (!visible(n) || (n.checkVisibility && !n.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}))) return false;
+   const r = n.getBoundingClientRect();
+   return r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
+ };
  const challenge = (/^(Just a moment|checking your browser|请稍候|請稍候|Attention Required)/i.test(document.title) && cf) ||
-   nodes('iframe[src*="challenges.cloudflare.com"]').length > 0;
+   Array.from(document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]')).some(visibleChallenge);
  const credential = nodes('input[type="password"],input[autocomplete="one-time-code"],input[name="code"]').length > 0;
  // Tabs of one account can render in different UI languages (a zh-CN tab loaded earlier
  // next to a fresh en-US one, observed 2026-09-27); the login check must not depend on it.

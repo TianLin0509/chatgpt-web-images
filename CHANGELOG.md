@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.37
+
+- Ignore zero-area, offscreen and CSS-hidden Cloudflare widgets when detecting a human verification prompt. A real visible widget or Cloudflare interstitial still pauses automation. Added isolated Chromium regressions; live account recovery remains a separate check.
+
 ## 0.7.36
 
 - A gated login comes back like a person who returns hours later when there is work: one lane looks again only after 6, 12, 24, then 48 hours, and only when an image was asked for within the last hour. No work, no visit. Codex draws meanwhile.

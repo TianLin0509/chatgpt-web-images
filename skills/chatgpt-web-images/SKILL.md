@@ -26,6 +26,10 @@ description: 本机生图入口：用用户自己的订阅生成图片、制作�
 
 图片来源看结果的 `provider`：`codex-imagegen` 是 Codex 订阅的内置生图工具，`chatgpt-web` 是 ChatGPT 网页（内部模型未核实，称为“ChatGPT 网页生成”）。默认网页优先：有网页车道能接活时新任务先等网页（约 90 秒无人接再交 Codex），没有就立即交 Codex；`codex_fallback.prefer=codex` 时反过来，新任务先交 Codex、网页兜底；交付时如实说明图片来源。结果只含文件路径等文字，不要自己直接调用 Codex 生图工具（那会把图片数据带进上下文），统一走本 MCP。任何情况下都不走付费 API。Codex 生成的图同样可以用 `continue_from` 续改。尺寸以原图为准。不绕过登录、校验、额度；密码和验证码只由用户在专属浏览器输入。
 
+## 网页通道排障
+
+账号 Tab 的「打开」可能使用独立的个人浏览器；判断生图可用性时，核对 MCP 的实际浏览器绑定与任务结果。页面里存在 Cloudflare 组件不等于需要本人验证，应确认它确实可见或出现验证拦截页；尺寸为零、屏幕外、透明的后台组件不算人工关卡。只有真实网页生成并保存原图，才宣称网页通道恢复。
+
 ## MCP 尚未加载
 
 优先重新加载 MCP 或开启新会话。统一 CLI 同样使用持久队列：`chatgpt-web-images generate --prompt-file ... --request-id ...`、`poll --job-id ... --wait-seconds 20`、`status`。不截断 JSON，不另建轮询守护进程。安装与账号初始化见项目 README；普通调用无需阅读源码或编辑任务文件。
