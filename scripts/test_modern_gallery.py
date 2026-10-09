@@ -39,6 +39,13 @@ class GalleryDOM(unittest.TestCase):
         self.assertTrue(all('current-response' in a['key'] for a in r['images']))
         self.assertTrue(r['turn_complete'])
 
+    def test_rendered_image_hint_is_removed_without_removing_authored_words(self):
+        for hint in ('<span data-inline-selection-pill data-id="picture_v2">Create image</span>',
+                     '<span data-prompt-link-href="chatgpt-system-hint://picture_v2" data-layout="selection-pill">Create image</span>'):
+            with self.subTest(hint=hint):
+                self.page.set_content('<div data-turn-key="current"><div data-user-message-bubble><div data-search-result-target>Keep literal Create image.\nFive options.'+hint+'</div></div></div>')
+                self.assertEqual(prompt_hash(self.observe()['user_text']),prompt_hash('Keep literal Create image.\nFive options.'))
+
     def test_unloaded_thumbnail_is_pending_not_missing(self):
         self.fixture();self.page.locator('button[aria-label="Show generated image 5"] img').evaluate("i=>Object.defineProperties(i,{naturalWidth:{value:0},currentSrc:{value:''},complete:{value:false}})")
         r=self.observe();self.assertEqual(len(r['images']),4);self.assertEqual(r['pending_images'],1)

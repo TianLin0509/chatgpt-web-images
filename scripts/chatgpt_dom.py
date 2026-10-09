@@ -53,8 +53,9 @@ POLL_JS = r'''async page => {
    const users=messageUsers(),lastUser=users.at(-1);
    const userContent=lastUser?.querySelector('[data-testid="collapsible-user-message-content"],[data-search-result-target]')||lastUser;
    let userText=userContent?.innerText||'';
-   if(userContent?.querySelector('[data-inline-selection-pill][data-id="picture_v2"]')){
-     const copy=userContent.cloneNode(true);copy.querySelectorAll('[data-inline-selection-pill][data-id="picture_v2"]').forEach(n=>n.remove());userText=copy.textContent||'';
+   const imagePill='[data-inline-selection-pill][data-id="picture_v2"],[data-prompt-link-href="chatgpt-system-hint://picture_v2"]';
+   if(userContent?.querySelector(imagePill)){
+     const copy=userContent.cloneNode(true);copy.querySelectorAll(imagePill).forEach(n=>n.remove());userText=copy.textContent||'';
    }
    const modern=!!lastUser?.hasAttribute('data-user-message-bubble');
    const turns=Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"]'));

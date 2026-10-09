@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-web-images",
-  "version": "0.7.38",
+  "version": "0.7.39",
   "description": "Subscription image MCP with a durable queue, ChatGPT web-first generation in the ordinary account browser and Codex fallback.",
   "author": {
     "name": "TianLin0509"

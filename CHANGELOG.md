@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.39
+
+- Recognize the rendered `chatgpt-system-hint://picture_v2` image tool chip as UI metadata when verifying the prompt. Keep the authored words unchanged and retain strict conversation identity checks. Resume the original submitted task rather than sending it again.
+
 ## 0.7.38
 
 - Use the shared AI Hub ordinary-browser broker when available, so image generation, website roundtables and the legacy bridge share one official extension connection and the account Tab's existing login. Older Hubs retain the standalone ordinary-browser extension transport.
