@@ -56,6 +56,7 @@ ACTIONABLE = {
     'codex_not_subscription': 'human', 'codex_missing': 'human',
     'login_required': 'human', 'browser_challenge': 'human', 'account_selection_required': 'human',
     'credential_required': 'human', 'image_tool_unavailable': 'human', 'output_exists': 'human',
+    'extension_pairing_required': 'human',
     'output_changed': 'human', 'conversation_changed': 'human', 'legacy_job_active': 'human',
 }
 # A job in one of these states will not change on its own while a caller waits.

@@ -1,12 +1,16 @@
 """Temporary page-local focus for real input, never for background polling."""
 
 
-def interactive(source):
+def interactive(source, *, emulate_focus=True):
     """Hidden Chrome menus close on blur. Focus only this owned target in CDP.
 
     This changes document focus emulation, not the Windows foreground window.
     Always restore the page on failure; never attach to other browser targets.
     """
+    # The ordinary extension browser is visible and already gives real focus to
+    # its own tab. It forbids browser-level CDP sessions; do not emulate focus.
+    if not emulate_focus:
+        return source
     return r'''async page => {
  const session=await page.context().newCDPSession(page);
  let emulated=false;

@@ -22,9 +22,10 @@ import time
 import urllib.request
 from xml.sax.saxutils import escape
 
-HUMAN_GATES = {'login_required', 'browser_challenge', 'account_selection_required', 'credential_required'}
+HUMAN_GATES = {'login_required', 'browser_challenge', 'account_selection_required', 'credential_required', 'extension_pairing_required'}
 LABELS = {'browser_challenge': '卡在 Cloudflare 真人验证', 'login_required': '登录已失效',
-          'credential_required': '需要输入密码或验证码', 'account_selection_required': '需要选择登录账号'}
+          'credential_required': '需要输入密码或验证码', 'account_selection_required': '需要选择登录账号',
+          'extension_pairing_required': '需要配对普通浏览器扩展'}
 # A gate the person has not handled yet is announced again at most this often.
 REALERT_SECONDS = 2 * 3600
 # The address that last worked is refreshed at most this often; one tiny request per hour.
@@ -95,6 +96,8 @@ def show_toast(title, body):
 
 
 def alert_text(gate):
+    if gate['code'] == 'extension_pairing_required':
+        return 'ChatGPT 生图需要配对浏览器', '在账号 Tab 使用的普通 Chrome 安装并配对官方 Playwright 扩展后，再调用 image_account_check。'
     label = LABELS.get(gate['code'], gate['code'])
     lines = ['账号 %s %s。在 agent 里调用 image_open("%s")，在弹出的浏览器里处理完后 image_account_check。'
              % (gate['account_id'], label, gate['account_id'])]
@@ -196,7 +199,8 @@ class GateBook:
         items = []
         for group, gate in sorted(data['gates'].items()):
             item = {'login_group': group, **{k: gate[k] for k in ('code', 'account_id', 'since') if k in gate},
-                    'next_action': 'image_open(%s) then image_account_check' % gate.get('account_id')}
+                    'next_action': ('pair_official_extension_then_image_account_check' if gate['code']=='extension_pairing_required'
+                                    else 'image_open(%s) then image_account_check' % gate.get('account_id'))}
             if gate.get('egress'):
                 item['egress'] = gate['egress']
                 item['egress_changed'] = bool(ok and ok.get('ip') and ok['ip'] != gate['egress']['ip'])
@@ -229,7 +233,8 @@ class Alerts:
             fn(arg)
 
     def _announce(self, group):
-        egress = self.fetch()
+        current = self.book.read()['gates'].get(group)
+        egress = None if current and current['code']=='extension_pairing_required' else self.fetch()
         ok = self.book.read().get('egress_last_ok')
         gate = self.book.update(group, egress=egress, egress_last_ok=ok)
         if gate and self.notify:

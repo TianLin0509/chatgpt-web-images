@@ -1,7 +1,7 @@
 {
   "name": "chatgpt-web-images",
   "version": "0.7.37",
-  "description": "Subscription image MCP with a durable queue, Codex-first generation and ChatGPT web fallback.",
+  "description": "Subscription image MCP with a durable queue, ChatGPT web-first generation in the ordinary account browser and Codex fallback.",
   "author": {
     "name": "TianLin0509"
   },
@@ -9,8 +9,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "订阅生图",
-    "shortDescription": "Codex 订阅优先，ChatGPT 网页兜底，后台保存原图。",
-    "longDescription": "标准 stdio MCP；Claude、Codex 共用持久队列。订阅生图优先，网页账号按需唤醒，支持持久去重、错误隔离和原任务恢复。",
+    "shortDescription": "ChatGPT 网页优先，复用账号浏览器，保存原图。",
+    "longDescription": "标准 stdio MCP；Claude、Codex 共用持久队列。网页优先，支持普通 Chrome 扩展与订阅兜底，持久去重、错误隔离和原任务恢复。",
     "developerName": "TianLin0509",
     "category": "Productivity",
     "capabilities": [

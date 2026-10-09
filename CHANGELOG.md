@@ -2,6 +2,9 @@
 
 ## 0.7.37
 
+- Optional official Playwright extension transport shares the account Tab's ordinary Chrome and its login. It launches no debugging port, creates only its own tab group, and never switches to another browser on a connection failure. Pairing is pinned to the identity and browser root and encrypted with Windows current-user DPAPI.
+- Give a Cloudflare managed check up to 12 seconds to finish on the same page without refresh, clicks or cookie changes. A persistent check still stops the task and detaches automation. Live web-only acceptance completed and saved the original image in about 35 seconds.
+- Shared ordinary windows are never hidden; input uses real page focus rather than the legacy browser-level CDP focus emulation. Missing pairing is an explicit setup gate, without repeated login-page probes. A transport timeout disconnects and ends only the plugin daemon.
 - Ignore zero-area, offscreen and CSS-hidden Cloudflare widgets when detecting a human verification prompt. A real visible widget or Cloudflare interstitial still pauses automation. Added isolated Chromium regressions; live account recovery remains a separate check.
 
 ## 0.7.36

@@ -312,6 +312,8 @@ function writeJson(file, value) {
 
 function category(message) {
   return /^Unsupported Hub browser command/.test(message) ? 'Unsupported command'
+    : /^Extension pairing/.test(message) ? 'Extension pairing required'
+    : /^Extension ownership/.test(message) ? 'Extension ownership check failed'
     : /^Human handoff/.test(message) ? 'Human handoff'
     : /^Site challenged/.test(message) ? 'Site challenged'
     : /^Hub cooldown/.test(message) ? 'Hub cooldown'
@@ -323,8 +325,8 @@ function category(message) {
     : /Timeout|timeout/.test(message) ? 'Timeout' : 'Hub browser operation failed';
 }
 
-async function serve(options) {
-  const daemon = new TabDaemon(options);
+async function serve(options, { createDaemon = opts => new TabDaemon(opts), stateFile = statePath(options.poolRoot, options.identity) } = {}) {
+  const daemon = createDaemon(options);
   // One lane's failure must never stop the connection every other lane depends on.
   process.on('unhandledRejection', e => daemon.log('unhandled_rejection', { error: category(String(e && e.message || e)) }));
   process.on('uncaughtException', e => daemon.log('uncaught_exception', { error: category(String(e && e.message || e)) }));
@@ -340,11 +342,18 @@ async function serve(options) {
       catch (e) { out = { isError: true, error: category(String(e && e.message || e)) }; daemon.log('step_error', { error: out.error }); }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(out));
+      // An extension relay waiting for a missing pairing can otherwise resolve
+      // after the caller timed out. End ONLY this daemon after returning the
+      // timeout: the ordinary Chrome and the person's pages stay open.
+      if(options.transport==='extension' && out.isError && out.error==='Timeout') {
+        daemon.log('timeout_exit');
+        setTimeout(()=>process.exit(0),100).unref();
+      }
     });
   });
   server.listen(0, '127.0.0.1', () => {
     const state = { protocol: PROTOCOL, pid: process.pid, port: server.address().port, token, identity: options.identity, started: Date.now() / 1000 };
-    const file = statePath(options.poolRoot, options.identity);
+    const file = stateFile;
     const tmp = file + '.' + process.pid + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(state), 'utf8');
     fs.renameSync(tmp, file);

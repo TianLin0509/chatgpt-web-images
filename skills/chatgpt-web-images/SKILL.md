@@ -7,6 +7,8 @@ description: 本机生图入口：用用户自己的订阅生成图片、制作�
 
 通过已注册的 chatgpt-web-images MCP 调用，Claude、Codex 等客户端使用相同协议。不要另写浏览器脚本或后台轮询脚本。
 
+0.7.37 普通浏览器扩展通道：配置了 `transport=extension` 的车道直接复用账号 Tab 的普通 Chrome 和登录，只操作自己新建的标签页组，不隐藏或关闭用户 Chrome，也不回退到调试浏览器。网站自动检查会在同一页面只读等待最多 12 秒，真正持续的验证仍交给用户。`image_open` 断开生图自动化并打开普通浏览器，处理后调用 `image_account_check` 即可，不需要关闭窗口。`extension_pairing_required` 是首次扩展配对问题，需在该身份的普通 Chrome 配对官方 Playwright 扩展后再检查，不反复访问登录页。用户明确要求验证或修复网页通道时，使用网页账号钉定任务，验收以 `provider=chatgpt-web` 的原图保存为准，Codex 出图不能代表网页已恢复。
+
 状态返回 `next_action=wait_for_backend_start` 表示订阅生图后台正在启动，稍后再查 `image_status`，无需网页登录。`fix_worker_start_then_poll_same_job` 表示后台启动故障，检查启动错误并保留原任务，也不要因此要求网页登录。只有 `resolve_human_action` 且列出了人工事项时才走登录或验证流程。网页车道无任务时会休眠；显式账号检查或真实网页任务会自动唤醒，休眠不等于登录失效。
 
 1. 首次使用调用 `image_status`（不访问网页）。**`can_generate=true` 就直接提交**，照 `advice` 做：`serving=web` 时网页先画，网页画不了会自动交给 Codex；`serving=codex` 时（没有网页车道能接活，或用户设了 Codex 优先）由 Codex 立即出图，网页车道即使显示 `browser_challenge`、未登录或可用车道为 0 也不影响，不要去 check 网页车道，也不要让用户去点验证——AI Hub 账号页会提醒用户，卡住的网页登录在用户亲自处理（人工接管结束）后自动复检一次；没人处理时，只在有生图任务时隔 6/12/24/48 小时由 1 个标签再试一次，不会空闲时自动访问网页。只有 `can_generate=false` 才处理网页登录：未登录或卡验证时 `image_open(account_id)`：跑在 AI Hub 浏览器里的账号会进入「人工接管」，所有网页自动化暂停并断开、屏幕上弹出干净窗口，告诉用户在里面完成验证或登录后关掉窗口；然后 `image_account_check(account_id)`，再查看 status。不要在用户操作期间反复 check 或重投任务。账号操作返回 queued 只表示已接收。status 的 `human_action` 列出需要人处理的登录（验证、登录失效等，Windows 通知也已提醒用户）；`human_action_blocks_generation=true` 时才把其中的 next_action 转告用户，否则它只是网页兜底的待办，不耽误出图；`egress_changed=true` 说明出口 IP 变了，一并告诉用户。

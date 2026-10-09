@@ -174,7 +174,9 @@ def _hub_root_of(entry):
     if entry.suffix != '.cjs':
         return None
     try:
-        match = re.search(r'"root"\s*:\s*"((?:[^"\\]|\\.)+)"', entry.read_text(encoding='utf-8'))
+        source = entry.read_text(encoding='utf-8')
+        key = 'browserRoot' if re.search(r'"transport"\s*:\s*"extension"', source) else 'root'
+        match = re.search(r'"' + key + r'"\s*:\s*"((?:[^"\\]|\\.)+)"', source)
     except OSError:
         return None
     return Path(json.loads('"' + match.group(1) + '"')) if match else None
@@ -241,6 +243,8 @@ def cli(args, timeout=55):
             raise ImageError('rate_limited', 'The AI Hub is pacing automation on this login; the job waits or Codex draws it.')
         if 'Site challenged' in message:
             raise ImageError('browser_challenge', 'This login met a human check and is paused; use open to let a person complete it.')
+        if 'Extension pairing' in message:
+            raise ImageError('extension_pairing_required', 'Install and pair the official Playwright extension in the account browser once; no login is copied.')
         if 'not open' in message or 'No browser' in message:
             code = 'browser_not_open'
         elif 'strict mode violation' in message:
@@ -281,6 +285,9 @@ STATUS_JS = ACCOUNT_STATUS_JS
 
 def set_visible(visible):
     """Only touch the window with our unique title; never enumerate/kill browser PIDs."""
+    if shared_extension_browser():
+        # A tool group can be in the person's window: never hide that window.
+        return False
     if os.name != 'nt':
         return False
     import ctypes
@@ -320,6 +327,20 @@ def set_visible(visible):
     user32.ShowWindowAsync(found[0], 5 if visible else 0)
     time.sleep(0.2)
     return bool(user32.IsWindowVisible(found[0])) == visible
+
+
+@functools.lru_cache(maxsize=8)
+def _shared_extension_entry(entry):
+    if entry.suffix != '.cjs':
+        return False
+    try:
+        return bool(re.search(r'"transport"\s*:\s*"extension"', entry.read_text(encoding='utf-8')))
+    except OSError:
+        return False
+
+
+def shared_extension_browser():
+    return _shared_extension_entry(CLI_ENTRY)
 
 
 def leave_challenge():
@@ -749,7 +770,11 @@ FILL_PROMPT_JS = r'''async page => {
 }'''
 
 from chatgpt_dom import DOM_IMAGES_JS, POLL_JS, MODERN_DOWNLOAD_JS
-from chatgpt_interaction import interactive
+from chatgpt_interaction import interactive as _interactive
+
+
+def interactive(source):
+    return _interactive(source, emulate_focus=not shared_extension_browser())
 
 
 DOWNLOAD_JS = (r'''async page => {

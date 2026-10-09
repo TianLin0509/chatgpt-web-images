@@ -58,6 +58,7 @@ async function ensureDaemon(opts) {
 }
 
 async function main(binding, argv = process.argv.slice(2)) {
+  if(binding.transport==='extension')return require('./extension_tab_client.cjs').main(binding,argv);
   const opts = { identity: binding.identity, poolRoot: binding.poolRoot, hubCore: binding.hubCore, root: binding.root, playwright: binding.playwright };
   let out;
   try {

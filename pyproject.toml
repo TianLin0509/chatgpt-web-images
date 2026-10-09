@@ -21,5 +21,5 @@ Repository = "https://github.com/TianLin0509/chatgpt-web-images"
 Issues = "https://github.com/TianLin0509/chatgpt-web-images/issues"
 
 [tool.setuptools]
-py-modules = ["web_images", "web_images_setup", "chatgpt_account", "chatgpt_dom", "chatgpt_interaction", "image_limits", "image_pool", "image_worker", "image_service", "human_gate", "gate_revisit", "codex_imagegen", "codex_lane"]
+py-modules = ["web_images", "web_images_setup", "chatgpt_account", "chatgpt_dom", "chatgpt_interaction", "image_limits", "image_pool", "image_worker", "image_service", "human_gate", "gate_revisit", "codex_imagegen", "codex_lane", "extension_token_dpapi"]
 package-dir = {"" = "scripts"}

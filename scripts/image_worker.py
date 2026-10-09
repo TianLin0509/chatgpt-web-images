@@ -79,7 +79,7 @@ class Worker:
         # page every 30 seconds. Explicit open/check/select controls still work.
         error=account.get('error') or {}
         if isinstance(error,str):error=json.loads(error)
-        manual={'login_required','browser_challenge','account_selection_required','credential_required','legacy_job_active'}
+        manual=human_gate.HUMAN_GATES | {'legacy_job_active'}
         if account['state'] in manual or error.get('code') in manual:
             return False
         waited = time.monotonic() - self.last_check
@@ -374,7 +374,7 @@ class Worker:
             else:self.pool.failure(job['id'], error)
             print(json.dumps({'event': 'job_error', 'job_id': job['id'], 'account_id': self.account_id,
                               'error_code': error['code']}), flush=True)
-            if error['code'] in {'login_required','browser_challenge','account_selection_required','credential_required'}:
+            if error['code'] in human_gate.HUMAN_GATES:
                 self.pool.account_state(self.account_id, error['code'], False, error)
 
 

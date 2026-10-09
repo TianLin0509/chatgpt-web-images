@@ -1,4 +1,10 @@
-# ChatGPT Web Images 0.7.33
+# ChatGPT Web Images 0.7.37
+
+0.7.37 增加普通浏览器扩展通道：生图与账号 Tab 使用同一个普通 Chrome、同一份登录。通过微软官方 Playwright 扩展连接，只控制本工具自己新建的标签页组，不接管已有聊天。启动时不加调试端口，不隐藏用户窗口；原有队列、参考图、续图与订阅兜底接口保持兼容。
+
+自动检查最多在原页面等待 12 秒，让网站自行检查结束；不刷新、不点击验证码、不修改 cookie。仍要求真人处理时断开自动化，再由 `image_open` 打开同一个普通浏览器，完成后 `image_account_check` 接上，不必关闭 Chrome。真实网页通道已完成一次约 35 秒的原图保存验收；网站未来仍可能要求真人验证。
+
+扩展运输为显式配置，不自动改用另一份浏览器资料。生图入口 binding 保持原 `root` 用于 Hub 元数据识别，增加 `transport: "extension"`、`browserRoot`（账号 Tab 普通浏览器目录）和 `tokenFile`（Windows 当前用户 DPAPI 加密配对记录）。配对记录绑定浏览器目录与主/副号身份，不导出登录 cookie，不写入代码仓库。使用固定 Playwright runtime 与官方扩展协议 2；缺少配对时提示 `extension_pairing_required`，停止后台复检。`scripts/pair_extension.cjs` 仅用于已经授权的首次设置连接，不会自动重启 Chrome 开调试端口。
 
 0.7.33 网页优先、Codex 兜底：默认先交 ChatGPT 网页；没有任何网页车道能接活（全部停用、等人处理或冷却中）时，新任务立即交 Codex，不再白等 90 秒。卡在人工关卡的网页登录不再永久停摆：AI Hub 确认该账号已登录、或人工接管结束后，自动对该登录的车道各检查一次；（0.7.34 起取消定时自动复检：自动访问会再次触发 Cloudflare、累积验证失败计数。）Hub 暂停该站点或有人正在操作浏览器时不访问；全部车道停用的登录不碰。`codex-fallback.json` 的 `"prefer": "codex"` 仍可切回 Codex 优先。
 
