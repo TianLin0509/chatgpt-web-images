@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.40
+# ChatGPT Web Images 0.7.41
+
+Version 0.7.41 selects actionable image-menu buttons/menuitems rather than same-named sidebar chat titles, and supports the new button-only composer menu. Extension lanes share ordinary Chrome login state while owning independent tabs. Use count=N for variants in one request, continue_from for follow-ups in the original conversation, and separate conversations for independent tasks.
 
 Version 0.7.40 separates viewing from manual login. `image_open` opens a separate personal tab in the same ordinary account Chrome without pausing automation or changing login health. Use `for_login=true` only for human login or verification; `image_account_check` resumes immediately when done. Active manual pauses are reported explicitly and excluded from available web lanes.
 

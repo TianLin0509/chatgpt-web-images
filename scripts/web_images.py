@@ -23,7 +23,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.40'
+VERSION = '0.7.41'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -698,17 +698,7 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
             run_js(interactive(FILL_PROMPT_JS.replace('__PROMPT__',json.dumps(prompt))))
             job['operation_stage'] = 'select_image_tool'
             save_job(job)
-            run_js(interactive(r'''async page => {
-              await page.getByTestId('composer-plus-btn').press('Enter',{timeout:10000});
-              // The sidebar can contain a chat also titled 'Create image'.
-              // Only the open composer action group/menu is a valid tool entry.
-              const tool=page.locator('[role="menu"], [role="group"]')
-                .getByText(/^(Create image|Create images|创建图片|创建图像|生成图片)$/);
-              try { await tool.click({timeout:15000}); }
-              catch(e) { throw new Error('IMAGE_TOOL_UNAVAILABLE: '+e.name); }
-              await page.locator('#prompt-textarea [data-inline-selection-pill][data-system-hint-type="picture_v2"]').waitFor({state:'attached',timeout:10000});
-              return true;
-            }'''))
+            run_js(interactive(SELECT_IMAGE_TOOL_JS))
             if refs:
                 job['operation_stage'] = 'upload_references'
                 save_job(job)
@@ -766,6 +756,18 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
 FILL_PROMPT_JS = r'''async page => {
  const composer=page.locator('#prompt-textarea');
  await composer.fill(__PROMPT__);
+ return true;
+}'''
+
+SELECT_IMAGE_TOOL_JS = r'''async page => {
+ await page.getByTestId('composer-plus-btn').press('Enter',{timeout:10000});
+ // Match actionable menu entries. Sidebar chat titles are links inside groups,
+ // and the new composer menu uses buttons without a menu/group ancestor.
+ const name=/^(Create (?:an? )?images?|创建图片|创建图像|生成图片)(?:\s|$)/;
+ const tool=page.getByRole('button',{name}).or(page.getByRole('menuitem',{name})).and(page.locator(':visible'));
+ try { await tool.click({timeout:15000}); }
+ catch(e) { throw new Error('IMAGE_TOOL_UNAVAILABLE: '+e.name); }
+ await page.locator('#prompt-textarea [data-inline-selection-pill][data-system-hint-type="picture_v2"]').waitFor({state:'attached',timeout:10000});
  return true;
 }'''
 

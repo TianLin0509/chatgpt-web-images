@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.41
+
+- Select the image tool by its actionable button or menuitem, including descriptive label suffixes. Same-named sidebar chat links can no longer shadow the tool; the new button-only composer menu is supported.
+- Clarify that extension lanes share one ordinary Chrome login and isolate tasks in independent tabs. Same-prompt variants use one count=N request; follow-ups use continue_from in the original conversation.
+- Add a real headless DOM regression with duplicate Create image sidebar titles, descriptive menu labels, and English/Chinese menu variants.
+
 ## 0.7.40
 
 - Separate browser viewing from manual login: `image_open` opens a personal tab in the account's ordinary Chrome without acquiring a handoff lease or disconnecting any web tool. Explicit `for_login=true` retains human verification protection; the account check resumes immediately.

@@ -5,6 +5,8 @@ description: 本机生图入口：用用户自己的订阅生成图片、制作�
 
 # ChatGPT 网页生图
 
+0.7.41 兼容新版生图菜单按钮，避免侧栏同名历史聊天干扰。普通 Chrome 扩展车道共用账号 Tab 的登录态，每条车道独占一个标签页与任务数据。同一任务的多张备选用 count=N，一次请求一个网页对话；后续修改用 continue_from 继续原对话。多个 session 的独立任务使用不同网页对话，由空闲车道并发处理，超出启用车道数后排队。
+
 0.7.40 将查看窗口与手动登录分开：`image_open(account_id)` 只在同一个普通 Chrome 打开独立的个人标签页，自动化继续工作。仅在明确需要本人登录或验证时使用 `image_open(account_id, for_login=true)`；处理完调用 `image_account_check` 立即接续，不用等 15 分钟、不用关窗口。账号状态中的 `automation_pause` 明确给出人工接管原因与接续动作。打开窗口不会改变账号登录健康状态。
 
 0.7.39 兼容网页新版「Create image」工具标记，只剔除有明确图片系统标识的 UI 芯片，保留用户写的文字和对话身份检查。误报对话变化后修复采集器，继续同一 job，不重新发送。
@@ -22,7 +24,7 @@ description: 本机生图入口：用用户自己的订阅生成图片、制作�
    长提示词保存为带日期、任务标识的 UTF-8 文件。`image_generate(prompt_file=绝对路径, count=张数, request_id=全局唯一任务标识, output_dir=绝对路径, name=任务名, account_id="auto")`。prompt 与 prompt_file 二选一；reference_images 接受至多五个 PNG/JPEG/WebP 绝对路径，排队期间保持文件不变。
 3. count=1..20 是一个任务要的图片数量，不是账号并发数或额度保证。Codex 出图时每张图单独并行生成（各自换一种构图），网页出图时是一次请求出 N 张。遵从指定张数，多图要求独立附件，不能用拼图或裁切代替，不静默压缩或降低要求。
    判据：**同一提示词要多张备选**（例如一页 PPT 的若干方案）就用一个 count=N 请求，不要拆成 N 个任务——一个请求只占一条车道、只消耗账号一次请求额度，固定的提交与导航开销也只付一次。**提示词确实不同**（不同页、不同主题）才分成多个任务。提交结果里出现 `hint.code=consider_one_multi_image_request` 时，先回答"这些是不是同一提示词的备选"，是就合并重提，不是就照常继续。失败后重投同一任务属于重试，与本条无关。
-4. 提交立即返回 job_id；queued、dispatching、running 是正常状态。多个 agent 可以同时提交，其余持久排队。Codex 车道按张计并发（`logins` 里 `login_group=codex` 的 `lanes` 即同时在画的张数，所有任务共用）；网页车道每条执行一个任务。auto 分配空闲车道，也可明确指定已经配置的账号别名。并发上限是车道数（一个浏览器 Profile 一条），不是账号数，也不随排队时长变化；排队久属正常，不要改 ID 重投。auto 会在登录账号之间自动均衡，不要为了"换个账号试试"而改 account_id。`image_status` 的 `logins` 给出每个账号的车道数与在跑数量；车道不够时由用户决定是否扩容，agent 不自行扩。
+4. 提交立即返回 job_id；queued、dispatching、running 是正常状态。多个 agent 可以同时提交，其余持久排队。Codex 车道按张计并发（`logins` 里 `login_group=codex` 的 `lanes` 即同时在画的张数，所有任务共用）；网页车道每条执行一个任务。普通 Chrome 扩展车道共用原登录态，每条车道独占一个标签页，旧通道使用独立 Profile。auto 分配空闲车道，也可明确指定已经配置的账号别名。并发上限是启用的车道数，不是账号数，也不随排队时长变化；排队久属正常，不要改 ID 重投。auto 会在登录账号之间自动均衡，不要为了"换个账号试试"而改 account_id。`image_status` 的 `logins` 给出每个账号的车道数与在跑数量；车道不够时由用户决定是否扩容，agent 不自行扩。
 5. 保持同一 request_id 和参数；超时重试返回原任务。ID 应含日期、任务或席位标识。不得自动换 ID 或账号重发不确定提交。
 6. **先把已知的活全部提交，再统一轮询**；`submit → 等 → submit` 会让车道空转，是批量变慢的主因。多个不同提示词用一次 `image_generate_batch(requests=[...], output_dir=...)` 排入，每条 entry 自带 request_id；等待用 `image_poll(job_ids=[...], wait_seconds=20)` 一次覆盖整批，`return_when="any"` 可先取回已完成的。批量里未知的 job_id 只在结果中标出，不会让整批失败。
 7. `image_poll(job_id, wait_seconds=20)` 等待单个结果。后台自主执行、下载、收尾，agent 断开仍会继续。无需额外 shell 循环、高频 status 或自建后台任务。phase 是浏览器实际阶段。查询自己的任务，不接管其他人的任务。
