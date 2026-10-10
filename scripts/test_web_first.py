@@ -186,6 +186,41 @@ class WebFirstContracts(unittest.TestCase):
         self.assertEqual(gate_revisit.revisit(self.pool), [])
         self.assertEqual(self.checks_queued(), [])
 
+    def test_manual_login_pause_is_reported_and_not_advertised_as_web_ready(self):
+        until = time.time() * 1000 + 600000
+        w.write_json(self.hub / 'web-risk.json', {'handoff': {'identity': 'main', 'site': 'chatgpt', 'until': until}})
+        status = self.pool.status()
+        self.assertEqual(status['serving'], 'codex')
+        self.assertEqual(status['web_lanes_able'], 0)
+        pause = next(a for a in status['accounts'] if a['id'] == 'primary')['automation_pause']
+        self.assertEqual(pause['until'], until)
+        self.assertEqual(pause['next_action'], 'image_account_check')
+        self.assertEqual(pause['reason'], 'manual_login_or_verification')
+        w.write_json(self.hub / 'web-risk.json', {'handoff': None})
+        self.assertEqual(self.pool.status()['serving'], 'web')
+
+    def test_ordinary_browser_pause_is_read_from_the_actual_profile(self):
+        ordinary = self.root / 'ordinary-chrome'
+        ordinary.mkdir()
+        entry = self.root / 'entrypoints' / 'images-primary.cjs'
+        entry.write_text('x(' + json.dumps({'transport': 'extension', 'root': str(self.hub), 'browserRoot': str(ordinary), 'identity': 'main'}) + ');', encoding='utf-8')
+        until = time.time() * 1000 + 600000
+        w.write_json(ordinary / 'web-risk.json', {'handoff': {'identity': 'main', 'site': 'chatgpt', 'until': until}})
+        self.assertNotIn('primary', self.pool.web_takers())
+        status = self.pool.status()
+        self.assertEqual(next(a for a in status['accounts'] if a['id'] == 'primary')['automation_pause']['until'], until)
+        w.write_json(ordinary / 'web-risk.json', {'handoff': None})
+        self.assertIn('primary', self.pool.web_takers())
+
+    def test_ordinary_login_recovery_keeps_hub_account_check_evidence(self):
+        ordinary = self.root / 'ordinary-evidence'
+        ordinary.mkdir()
+        entry = self.root / 'entrypoints' / 'images-primary.cjs'
+        entry.write_text('x(' + json.dumps({'transport': 'extension', 'root': str(self.hub), 'browserRoot': str(ordinary), 'identity': 'main'}) + ');', encoding='utf-8')
+        self.gate('primary')
+        self.write_last_check('main', time.time() + 1)
+        self.assertEqual(gate_revisit.revisit(self.pool), [('primary', 'hub_login_confirmed')])
+
     def test_an_ended_handoff_queues_a_check(self):
         self.gate('secondary')
         now_ms = time.time() * 1000

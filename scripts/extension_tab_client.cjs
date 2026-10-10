@@ -45,6 +45,21 @@ function category(error) {
 }
 
 async function main(binding,argv=process.argv.slice(2),{ensure=ensureDaemon,fetchImpl=fetch}={}) {
+  const [command,...args]=require(path.join(binding.hubCore,'hub-browser-tool.js')).argumentsOf(argv);
+  if(command==='browser-show') {
+    let out;
+    try {
+      validate(binding);
+      // Reuse the account Tab's launcher. This opens a personal tab without
+      // attaching automation, disconnecting other tools or changing any lease.
+      const {PersonalChrome}=require(path.join(binding.hubCore,'personal-chrome.js'));
+      await new PersonalChrome({root:binding.browserRoot}).open(binding.identity,[args[0]||'https://chatgpt.com/']);
+      out={result:{visible:true,handoff:false,automation_paused:false,sharedBrowser:true}};
+    }catch(error){out={isError:true,error:category(error)};}
+    process.stdout.write(JSON.stringify(out)+'\n');
+    if(out.isError)process.exitCode=1;
+    return out;
+  }
   // New Hubs provide one ordinary-browser broker shared with the web roundtable
   // and bridge. Older Hubs retain the already verified standalone extension path.
   const shared=path.join(binding.hubCore,'ordinary-browser-client.js');

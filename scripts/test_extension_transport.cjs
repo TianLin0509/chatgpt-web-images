@@ -11,8 +11,27 @@ const {main}=require('./extension_tab_client.cjs');
 test('new Hub broker is delegated once without starting an independent image connection',async t=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'images-shared-broker-test-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   fs.writeFileSync(path.join(root,'ordinary-browser-client.js'),'module.exports.main=async(binding,argv)=>({shared:true,lane:binding.id,argv});');
+  fs.writeFileSync(path.join(root,'hub-browser-tool.js'),'module.exports.argumentsOf=args=>args;');
   const result=await main({hubCore:root,id:'images-primary'},['open']);
   assert.deepEqual(result,{shared:true,lane:'images-primary',argv:['open']});
+});
+
+test('view opens a personal tab without touching the shared connection or handoff state',async t=>{
+  const f=fixture();t.after(()=>fs.rmSync(f.root,{recursive:true,force:true}));
+  await f.daemon.execute('images-primary',['open']);
+  const owned=await f.daemon.page('images-primary');
+  const riskFile=path.join(f.root,'web-risk.json');
+  fs.writeFileSync(riskFile,JSON.stringify({handoff:{id:'other-person',until:Date.now()+60000}}));
+  const riskBefore=fs.readFileSync(riskFile,'utf8');
+  fs.writeFileSync(path.join(f.options.hubCore,'personal-chrome.js'), 'module.exports.PersonalChrome=class{constructor(o){this.root=o.root;}async open(identity,urls){require("fs").writeFileSync(require("path").join(this.root,"view-proof.json"),JSON.stringify({identity,urls}));}};');
+  let daemonCalls=0;const oldWrite=process.stdout.write;process.stdout.write=()=>true;
+  let result;
+  try{result=await main({...f.options,id:'images-primary'},['browser-show','https://chatgpt.com/'],{ensure:async()=>{daemonCalls++;throw Error('Must not touch automation');}});}
+  finally{process.stdout.write=oldWrite;}
+  assert.equal(result.result.automation_paused,false);
+  assert.equal(daemonCalls,0);assert.equal(f.browser.connected,true);assert.equal(owned.closed,false);
+  assert.equal(fs.readFileSync(riskFile,'utf8'),riskBefore);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.root,'view-proof.json'),'utf8')),{identity:'main',urls:['https://chatgpt.com/']});
 });
 
 function fixture({initialHumanPage=false}={}) {

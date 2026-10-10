@@ -143,10 +143,10 @@ class Worker:
             else:
                 result = fn(**args)
             # Browser URLs and title are unnecessary in the shared status surface.
-            safe = {k: result[k] for k in ('logged_in','auth_state','visible','remembered','background_rate_limited','handoff','until') if k in result}
+            safe = {k: result[k] for k in ('logged_in','auth_state','visible','remembered','background_rate_limited','handoff','until','automation_paused','reason','next_action','advice') if k in result}
             safe['ok'] = True
-            if result.get('handoff'):
-                pass  # the person has the browser now; the account keeps its gate until checked
+            if result.get('handoff') or (row['action']=='open' and 'logged_in' not in result):
+                pass  # Opening a view or handing over a browser is not a login check.
             elif result.get('auth_state')=='rate_limited':
                 error=({'code':'rate_limited','retry_at':cooldown['retry_after']} if result.get('cooldown_cached') else self.pool.defer_rate_limit(self.account_id))
                 safe['retry_at']=error['retry_at']

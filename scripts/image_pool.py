@@ -61,7 +61,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.39'
+VERSION = '0.7.40'
 # The Codex fallback lane (codex_lane.py): not a browser account, so it has no row in accounts.
 CODEX_LANE = 'codex'
 # The lane process writes a heartbeat every tick; older than this means it is not running.
@@ -782,6 +782,8 @@ class Pool:
             takers = []
             for row in db.execute('SELECT * FROM accounts WHERE enabled=1 AND ready=1'):
                 group = login_group(row)
+                if gate_revisit.lane_handoff(row, now):
+                    continue
                 if group in gated:
                     continue
                 cooldown = db.execute('SELECT retry_after FROM login_cooldowns WHERE login_group=?', (group,)).fetchone()
@@ -1063,6 +1065,9 @@ class Pool:
             for row in db.execute('SELECT * FROM accounts ORDER BY id'):
                 account = {k: row[k] for k in ('id','enabled','ready','state','heartbeat','updated')}
                 account['login_group'] = login_group(row)
+                pause = gate_revisit.lane_handoff(row)
+                if pause:
+                    account['automation_pause'] = pause
                 cooldown=db.execute('SELECT retry_after FROM login_cooldowns WHERE login_group=?',(account['login_group'],)).fetchone()
                 if cooldown:account['retry_at']=cooldown['retry_after']
                 account['worker_alive'] = time.time() - row['heartbeat'] < 20
@@ -1090,7 +1095,7 @@ class Pool:
                                      'lanes': 0, 'enabled_lanes': 0, 'usable_lanes': 0, 'busy_lanes': 0, 'parked_jobs': 0})
             slot['lanes'] += 1
             slot['enabled_lanes'] += bool(account['enabled'])
-            slot['usable_lanes'] += bool(account['enabled'] and account['ready'] and account['worker_alive'] and not account['worker_stalled'])
+            slot['usable_lanes'] += bool(account['enabled'] and account['ready'] and account['worker_alive'] and not account['worker_stalled'] and not account.get('automation_pause'))
             slot['busy_lanes'] += bool(account['active_job_id'])
             slot['parked_jobs'] += account['parked_jobs']
         try:
@@ -1098,13 +1103,13 @@ class Pool:
         except OSError:
             gates, egress_ok = [], None
         codex = self.codex_status()
-        web_capacity = sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and not a['worker_stalled'] and a['active_job_status'] != 'needs_attention') for a in accounts)
+        web_capacity = sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and not a['worker_stalled'] and a['active_job_status'] != 'needs_attention' and not a.get('automation_pause')) for a in accounts)
         # Lanes claim() would actually hand work to: a login waiting for a person or cooling
         # down takes nothing, although its idle lanes still look ready.
         gated = {g.get('login_group') for g in gates}
         web_usable = sum(bool(a['enabled'] and a['ready'] and a['worker_alive'] and not a['worker_stalled']
                               and a['active_job_status'] != 'needs_attention' and a['login_group'] not in gated
-                              and a.get('retry_at', 0) <= time.time()) for a in accounts)
+                              and a.get('retry_at', 0) <= time.time() and not a.get('automation_pause')) for a in accounts)
         codex_usable = codex_can_serve(self.root)
         first = codex_usable and codex['prefer'] == 'codex'
         logins = sorted(groups.values(), key=lambda g: g['login_group'])

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.40
+
+- Separate browser viewing from manual login: `image_open` opens a personal tab in the account's ordinary Chrome without acquiring a handoff lease or disconnecting any web tool. Explicit `for_login=true` retains human verification protection; the account check resumes immediately.
+- Preserve login health when opening a browser, report active manual pauses and exclude them from ready web lanes. Read the actual ordinary browser root when checking handoff state.
+- Add queue admission and shared connection regressions for open-then-generate and explicit manual login.
+
+
 ## 0.7.39
 
 - Recognize the rendered `chatgpt-system-hint://picture_v2` image tool chip as UI metadata when verifying the prompt. Keep the authored words unchanged and retain strict conversation identity checks. Resume the original submitted task rather than sending it again.

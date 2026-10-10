@@ -1,8 +1,10 @@
-# ChatGPT Web Images 0.7.37
+# ChatGPT Web Images 0.7.40
+
+0.7.40：`image_open` 默认只打开同一账号普通 Chrome 的独立个人标签页，查看后可以立即自动生图，不暂停其他网页工具、不改变登录健康状态。需要本人登录或验证时使用 `image_open(for_login=true)`（CLI：`open --for-login`），完成后 `image_account_check` 立即接续。人工接管期间状态明确返回 `automation_pause` 的原因、时间与接续动作，不再把暂停的车道报成网页可用。
 
 0.7.37 增加普通浏览器扩展通道：生图与账号 Tab 使用同一个普通 Chrome、同一份登录。通过微软官方 Playwright 扩展连接，只控制本工具自己新建的标签页组，不接管已有聊天。启动时不加调试端口，不隐藏用户窗口；原有队列、参考图、续图与订阅兜底接口保持兼容。
 
-自动检查最多在原页面等待 12 秒，让网站自行检查结束；不刷新、不点击验证码、不修改 cookie。仍要求真人处理时断开自动化，再由 `image_open` 打开同一个普通浏览器，完成后 `image_account_check` 接上，不必关闭 Chrome。真实网页通道已完成一次约 35 秒的原图保存验收；网站未来仍可能要求真人验证。
+自动检查最多在原页面等待 12 秒，让网站自行检查结束；不刷新、不点击验证码、不修改 cookie。仍要求真人处理时断开自动化，再由 `image_open(for_login=true)` 打开同一个普通浏览器，完成后 `image_account_check` 接上，不必关闭 Chrome。真实网页通道已完成一次约 35 秒的原图保存验收；网站未来仍可能要求真人验证。
 
 扩展运输为显式配置，不自动改用另一份浏览器资料。生图入口 binding 保持原 `root` 用于 Hub 元数据识别，增加 `transport: "extension"`、`browserRoot`（账号 Tab 普通浏览器目录）和 `tokenFile`（Windows 当前用户 DPAPI 加密配对记录）。配对记录绑定浏览器目录与主/副号身份，不导出登录 cookie，不写入代码仓库。使用固定 Playwright runtime 与官方扩展协议 2；缺少配对时提示 `extension_pairing_required`，停止后台复检。`scripts/pair_extension.cjs` 仅用于已经授权的首次设置连接，不会自动重启 Chrome 开调试端口。
 
@@ -242,7 +244,7 @@ codex mcp add chatgpt-web-images --env PYTHONIOENCODING=utf-8 --env "CHATGPT_WEB
 | image_generate_batch | 一次排入整批不同提示词，立刻占满所有空闲车道；整体校验、按 request_id 幂等 |
 | image_poll | 读取/等待自己的任务；传 job_ids 一次等待整批，return_when=any 可提前取回 |
 | image_status | 缓存健康、后台存活、任务状态数量和账号操作结果 |
-| image_open | 异步打开指定账号专属浏览器 |
+| image_open | 默认打开账号浏览器供查看，不暂停自动化；for_login=true 才进入人工登录接管 |
 | image_account_check | 用户登录后检查账号状态 |
 | image_select_account | 只选择用户授权的已记住账号，不处理密码或验证码 |
 | image_resume | 接续 needs_attention 或 parked 原任务，保持同一账号和请求身份 |

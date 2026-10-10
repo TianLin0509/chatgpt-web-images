@@ -66,7 +66,7 @@ class HumanGateContracts(unittest.TestCase):
         gate = status['human_action'][0]
         self.assertEqual((gate['code'], gate['account_id']), ('browser_challenge', 'primary'))
         self.assertEqual(gate['egress']['ip'], '203.0.113.7')
-        self.assertIn('image_open(primary)', gate['next_action'])
+        self.assertIn('image_open(primary, for_login=true)', gate['next_action'])
 
     def test_authentication_clears_gate_and_remembers_working_exit(self):
         self.check('primary')
@@ -237,8 +237,38 @@ class HumanGateContracts(unittest.TestCase):
         with patch.object(w, 'CLI_ENTRY', entry), patch.object(w, 'locked'),              patch.object(w, 'cli', side_effect=w.ImageError('browser_operation_failed', 'real failure')),              patch.object(w, 'ensure_browser') as lane_tab:
             self.assertTrue(w.hub_has_guard())
             with self.assertRaises(w.ImageError):
-                w.open_browser()
+                w.open_browser(for_login=True)
             lane_tab.assert_not_called()  # never falls back to showing the automated lane tab
+
+    def test_viewing_an_ordinary_browser_does_not_start_a_handoff(self):
+        from unittest.mock import patch
+        entry = self.root / 'ordinary-view.cjs'
+        entry.write_text('x(' + json.dumps({'transport': 'extension', 'browserRoot': str(self.root)}) + ')', encoding='utf-8')
+        with patch.object(w, 'CLI_ENTRY', entry), patch.object(w, 'locked'), patch.object(w, 'hub_has_guard', return_value=True), patch.object(w, 'cli', return_value={'visible': True, 'automation_paused': False}) as cli:
+            result = w.open_browser()
+        cli.assert_called_once_with(['browser-show', 'https://chatgpt.com/'])
+        self.assertFalse(result['handoff'])
+        self.assertFalse(result['automation_paused'])
+
+    def test_explicit_login_still_detaches_automation_and_finishes_by_check(self):
+        from unittest.mock import patch
+        with patch.object(w, 'locked'), patch.object(w, 'hub_has_guard', return_value=True), patch.object(w, 'cli', return_value={'until': 123}) as cli:
+            result = w.open_browser(for_login=True)
+        cli.assert_called_once_with(['human-open', 'https://chatgpt.com/'])
+        self.assertTrue(result['handoff'])
+        self.assertEqual(result['next_action'], 'image_account_check')
+
+    def test_view_control_preserves_login_health_and_accepts_the_next_job(self):
+        self.runtimes['primary'].open_browser = lambda: {'visible': True, 'handoff': False, 'automation_paused': False}
+        worker = Worker(self.pool, 'primary', self.runtimes['primary'])
+        self.pool.control('primary', 'open')
+        worker.tick()
+        account = self.pool.account('primary')
+        self.assertEqual((account['state'], account['ready']), ('authenticated', 1))
+        job = self.pool.submit(prompt='Draw a square.', output_dir=str(self.root / 'out'), request_id='after-view', account_id='primary')
+        worker.tick()
+        self.assertEqual(self.runtimes['primary'].starts, 1)
+        self.assertEqual(self.pool.poll(job['job_id'])['phase'], 'generating')
 
     def test_toast_script_escapes_markup_and_quotes(self):
         script = human_gate.toast_script("a<b>&'c'", 'x"y')

@@ -23,7 +23,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.39'
+VERSION = '0.7.40'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -1203,14 +1203,22 @@ def probe_rate_limit():
     return status(force_refresh=True)
 
 
-def open_browser():
+def open_browser(for_login=False):
     with locked():
-        if hub_has_guard():
+        if not for_login and CLI_ENTRY.suffix == '.cjs' and re.search(r'"transport"\s*:\s*"extension"', CLI_ENTRY.read_text(encoding='utf-8')):
+            # A separate personal tab shares Chrome's login, not the tool's page or
+            # automation ownership. Showing it must never acquire a handoff lease.
+            shown = cli(['browser-show', 'https://chatgpt.com/'])
+            return {**shown, 'visible': True, 'handoff': False, 'automation_paused': False}
+        if for_login and hub_has_guard():
             # Shared Hub browser: hand it to the person. Every automated connection detaches,
             # challenge counters are reset and a clean window opens on screen. A failure here is
             # reported as is; showing the automated lane tab instead is what the handoff avoids.
             handed = cli(['human-open', 'https://chatgpt.com/'])
-            return {'visible': True, 'handoff': True, 'until': (handed or {}).get('until')}
+            return {'visible': True, 'handoff': True, 'automation_paused': True,
+                    'reason': 'manual_login_or_verification', 'until': (handed or {}).get('until'),
+                    'next_action': 'image_account_check',
+                    'advice': 'Finish login or verification, then call image_account_check to resume immediately; no timer wait is needed.'}
         result=ensure_browser(require_login=False, hide_on_open=False, for_person=True)
         result['visible']=set_visible(True)
         return result
@@ -1292,9 +1300,9 @@ def create_mcp():
         """Check the isolated browser login and active image job. No credentials returned."""
         return call(status)
     @mcp.tool(structured_output=False)
-    def image_open() -> str:
-        """Show only the dedicated image browser for login or inspecting a failed job."""
-        return call(open_browser)
+    def image_open(for_login: bool=False) -> str:
+        """Show the account browser without pausing automation; for_login=true explicitly hands it over for manual login or verification."""
+        return call(open_browser,for_login=for_login)
     @mcp.tool(structured_output=False)
     def image_select_account(account_name: str, remember: bool=True) -> str:
         """Select an explicitly user-authorized remembered ChatGPT account. Wait if already signing in. Optionally remember its name for automatic recovery; never handles passwords or verification codes."""

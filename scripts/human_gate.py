@@ -99,7 +99,7 @@ def alert_text(gate):
     if gate['code'] == 'extension_pairing_required':
         return 'ChatGPT 生图需要配对浏览器', '在账号 Tab 使用的普通 Chrome 安装并配对官方 Playwright 扩展后，再调用 image_account_check。'
     label = LABELS.get(gate['code'], gate['code'])
-    lines = ['账号 %s %s。在 agent 里调用 image_open("%s")，在弹出的浏览器里处理完后 image_account_check。'
+    lines = ['账号 %s %s。在 agent 里调用 image_open("%s", for_login=true)，在弹出的浏览器里处理完后 image_account_check 立即继续，不用关闭窗口。'
              % (gate['account_id'], label, gate['account_id'])]
     egress, ok = gate.get('egress'), gate.get('egress_last_ok')
     if egress:
@@ -200,7 +200,7 @@ class GateBook:
         for group, gate in sorted(data['gates'].items()):
             item = {'login_group': group, **{k: gate[k] for k in ('code', 'account_id', 'since') if k in gate},
                     'next_action': ('pair_official_extension_then_image_account_check' if gate['code']=='extension_pairing_required'
-                                    else 'image_open(%s) then image_account_check' % gate.get('account_id'))}
+                                    else 'image_open(%s, for_login=true) then image_account_check' % gate.get('account_id'))}
             if gate.get('egress'):
                 item['egress'] = gate['egress']
                 item['egress_changed'] = bool(ok and ok.get('ip') and ok['ip'] != gate['egress']['ip'])

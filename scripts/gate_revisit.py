@@ -77,12 +77,32 @@ def lane_binding(account):
     except OSError:
         return None
     fields = {}
+    ordinary = bool(re.search(r'"transport"\s*:\s*"extension"', text))
     for name in ('root', 'identity'):
-        match = re.search(_ENTRY_FIELD % name, text)
+        match = re.search(_ENTRY_FIELD % ('browserRoot' if ordinary and name == 'root' else name), text)
         if not match:
             return None
         fields[name] = json.loads('"' + match.group(1) + '"')
-    return {'root': Path(fields['root']), 'identity': fields['identity']}
+    binding = {'root': Path(fields['root']), 'identity': fields['identity']}
+    if ordinary:
+        # Hub account-check evidence stays in its metadata directory; only the
+        # ordinary browser's risk/handoff state lives beside the actual profile.
+        metadata = re.search(_ENTRY_FIELD % 'root', text)
+        if metadata:
+            binding['evidence_root'] = Path(json.loads('"' + metadata.group(1) + '"'))
+    return binding
+
+
+def lane_handoff(account, now=None):
+    binding = lane_binding(account)
+    if not binding:
+        return None
+    lease = (_json(binding['root'] / 'web-risk.json') or {}).get('handoff')
+    if isinstance(lease, dict) and lease.get('until', 0) > (time.time() if now is None else now) * 1000:
+        return {'reason': 'manual_login_or_verification', 'until': lease['until'],
+                'next_action': 'image_account_check',
+                'advice': 'Automation is paused for manual login or verification. Call image_account_check when done to resume immediately.'}
+    return None
 
 
 def hub_blocked(root, identity, now=None):
@@ -148,7 +168,7 @@ def revisit(pool, now=None):
                 continue
             if hub_blocked(root, identity, now):
                 continue
-            confirmed = hub_login_confirmed_at(root, identity)
+            confirmed = hub_login_confirmed_at(binding.get('evidence_root', root), identity)
             if confirmed > max(since, float(gate.get('evidence_at') or 0)):
                 reason, mark = 'hub_login_confirmed', {'evidence_at': confirmed}
             elif gate.get('handoff_seen') and gate.get('handoff_done') != gate['handoff_seen']:

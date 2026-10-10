@@ -62,6 +62,10 @@ def create_mcp(pool=None):
         'false inspect next_action first: wait_for_backend_start means the subscription worker is '
         'starting; check status shortly without asking for web login. fix_worker_start_then_poll_same_job '
         'requires a worker repair, not login. Only resolve_human_action requires the listed human step.\n\n'
+        'BROWSER VIEWING: image_open opens a separate personal tab without pausing web automation. '
+        'Only use image_open(for_login=true) for actual manual login or verification; after the person finishes, '
+        'image_account_check resumes immediately without closing Chrome or waiting for a timer. '
+        'accounts[].automation_pause reports an active manual pause and its next action.\n\n'
         'CONCURRENCY: Codex draws each image of a job as its own parallel run, shared by all jobs. '
         'On the web, one lane is one browser profile and runs one job at a time. Concurrency '
         'equals the number of lanes, NOT the number of ChatGPT accounts. image_status reports '
@@ -102,9 +106,9 @@ def create_mcp(pool=None):
         return await call(lambda: current_status(pool))
 
     @server.tool(structured_output=False)
-    async def image_open(account_id: str = 'primary') -> str:
-        """Queue opening this account's isolated login browser; inspect image_status for completion."""
-        return await call(lambda: wake(pool, pool.control(account_id, 'open')))
+    async def image_open(account_id: str = 'primary', for_login: bool = False) -> str:
+        """Open the account browser for viewing without pausing automation. Only set for_login=true when a person must log in or verify: automation detaches, and image_account_check resumes it immediately when done. Inspect image_status for the control result."""
+        return await call(lambda: wake(pool, pool.control(account_id, 'open', **({'for_login': True} if for_login else {}))))
 
     @server.tool(structured_output=False)
     async def image_account_check(account_id: str = 'primary') -> str:
@@ -191,6 +195,7 @@ def main(argv=None):
     parser.add_argument('--requests-file', default='')
     parser.add_argument('--account-name', default='')
     parser.add_argument('--no-remember', action='store_true')
+    parser.add_argument('--for-login', action='store_true')
     parser.add_argument('--prompt-file', default='')
     parser.add_argument('--prompt', default='')
     parser.add_argument('--output-dir', default='')
@@ -232,7 +237,8 @@ def main(argv=None):
             return current_status(pool)
         if args.command in {'open','check','select-account'}:
             kwargs = ({'account_name': args.account_name, 'remember': not args.no_remember} if args.command == 'select-account'
-                      else {'person': True} if args.command == 'check' else {})
+                      else {'person': True} if args.command == 'check'
+                      else {'for_login': True} if args.for_login else {})
             return pool.control(account, 'select' if args.command == 'select-account' else args.command, **kwargs)
         if args.command == 'generate':
             return pool.submit(account_id=args.account_id, prompt=args.prompt, prompt_file=args.prompt_file, output_dir=args.output_dir,

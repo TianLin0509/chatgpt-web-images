@@ -5,17 +5,19 @@ description: 本机生图入口：用用户自己的订阅生成图片、制作�
 
 # ChatGPT 网页生图
 
+0.7.40 将查看窗口与手动登录分开：`image_open(account_id)` 只在同一个普通 Chrome 打开独立的个人标签页，自动化继续工作。仅在明确需要本人登录或验证时使用 `image_open(account_id, for_login=true)`；处理完调用 `image_account_check` 立即接续，不用等 15 分钟、不用关窗口。账号状态中的 `automation_pause` 明确给出人工接管原因与接续动作。打开窗口不会改变账号登录健康状态。
+
 0.7.39 兼容网页新版「Create image」工具标记，只剔除有明确图片系统标识的 UI 芯片，保留用户写的文字和对话身份检查。误报对话变化后修复采集器，继续同一 job，不重新发送。
 
 0.7.38 在支持的 Hub 上与 AI 网页圆桌、中转入口共用一个普通 Chrome 扩展连接和账号 Tab 登录态。处理验证时所有共用工具先断开，完成后显式检查原账号即可，不需要关窗口。旧 Hub 保留 0.7.37 的独立普通浏览器扩展通道。
 
 通过已注册的 chatgpt-web-images MCP 调用，Claude、Codex 等客户端使用相同协议。不要另写浏览器脚本或后台轮询脚本。
 
-0.7.37 普通浏览器扩展通道：配置了 `transport=extension` 的车道直接复用账号 Tab 的普通 Chrome 和登录，只操作自己新建的标签页组，不隐藏或关闭用户 Chrome，也不回退到调试浏览器。网站自动检查会在同一页面只读等待最多 12 秒，真正持续的验证仍交给用户。`image_open` 断开生图自动化并打开普通浏览器，处理后调用 `image_account_check` 即可，不需要关闭窗口。`extension_pairing_required` 是首次扩展配对问题，需在该身份的普通 Chrome 配对官方 Playwright 扩展后再检查，不反复访问登录页。用户明确要求验证或修复网页通道时，使用网页账号钉定任务，验收以 `provider=chatgpt-web` 的原图保存为准，Codex 出图不能代表网页已恢复。
+0.7.37 普通浏览器扩展通道：配置了 `transport=extension` 的车道直接复用账号 Tab 的普通 Chrome 和登录，只操作自己新建的标签页组，不隐藏或关闭用户 Chrome，也不回退到调试浏览器。网站自动检查会在同一页面只读等待最多 12 秒，真正持续的验证仍交给用户。人工验证使用 `image_open(for_login=true)` 断开生图自动化并打开普通浏览器，处理后调用 `image_account_check` 即可，不需要关闭窗口。`extension_pairing_required` 是首次扩展配对问题，需在该身份的普通 Chrome 配对官方 Playwright 扩展后再检查，不反复访问登录页。用户明确要求验证或修复网页通道时，使用网页账号钉定任务，验收以 `provider=chatgpt-web` 的原图保存为准，Codex 出图不能代表网页已恢复。
 
 状态返回 `next_action=wait_for_backend_start` 表示订阅生图后台正在启动，稍后再查 `image_status`，无需网页登录。`fix_worker_start_then_poll_same_job` 表示后台启动故障，检查启动错误并保留原任务，也不要因此要求网页登录。只有 `resolve_human_action` 且列出了人工事项时才走登录或验证流程。网页车道无任务时会休眠；显式账号检查或真实网页任务会自动唤醒，休眠不等于登录失效。
 
-1. 首次使用调用 `image_status`（不访问网页）。**`can_generate=true` 就直接提交**，照 `advice` 做：`serving=web` 时网页先画，网页画不了会自动交给 Codex；`serving=codex` 时（没有网页车道能接活，或用户设了 Codex 优先）由 Codex 立即出图，网页车道即使显示 `browser_challenge`、未登录或可用车道为 0 也不影响，不要去 check 网页车道，也不要让用户去点验证——AI Hub 账号页会提醒用户，卡住的网页登录在用户亲自处理（人工接管结束）后自动复检一次；没人处理时，只在有生图任务时隔 6/12/24/48 小时由 1 个标签再试一次，不会空闲时自动访问网页。只有 `can_generate=false` 才处理网页登录：未登录或卡验证时 `image_open(account_id)`：跑在 AI Hub 浏览器里的账号会进入「人工接管」，所有网页自动化暂停并断开、屏幕上弹出干净窗口，告诉用户在里面完成验证或登录后关掉窗口；然后 `image_account_check(account_id)`，再查看 status。不要在用户操作期间反复 check 或重投任务。账号操作返回 queued 只表示已接收。status 的 `human_action` 列出需要人处理的登录（验证、登录失效等，Windows 通知也已提醒用户）；`human_action_blocks_generation=true` 时才把其中的 next_action 转告用户，否则它只是网页兜底的待办，不耽误出图；`egress_changed=true` 说明出口 IP 变了，一并告诉用户。
+1. 首次使用调用 `image_status`（不访问网页）。**`can_generate=true` 就直接提交**，照 `advice` 做：`serving=web` 时网页先画，网页画不了会自动交给 Codex；`serving=codex` 时（没有网页车道能接活，或用户设了 Codex 优先）由 Codex 立即出图，网页车道即使显示 `browser_challenge`、未登录或可用车道为 0 也不影响，不要去 check 网页车道，也不要让用户去点验证——AI Hub 账号页会提醒用户，卡住的网页登录在用户亲自处理（人工接管结束）后自动复检一次；没人处理时，只在有生图任务时隔 6/12/24/48 小时由 1 个标签再试一次，不会空闲时自动访问网页。只有 `can_generate=false` 才处理网页登录：未登录或卡验证时 `image_open(account_id, for_login=true)`：跑在 AI Hub 浏览器里的账号会进入「人工接管」，所有网页自动化暂停并断开、屏幕上弹出干净窗口，告诉用户在里面完成验证或登录，无需关窗口；然后 `image_account_check(account_id)`，再查看 status。不要在用户操作期间反复 check 或重投任务。账号操作返回 queued 只表示已接收。status 的 `human_action` 列出需要人处理的登录（验证、登录失效等，Windows 通知也已提醒用户）；`human_action_blocks_generation=true` 时才把其中的 next_action 转告用户，否则它只是网页兜底的待办，不耽误出图；`egress_changed=true` 说明出口 IP 变了，一并告诉用户。
 2. 要在之前某张图的基础上修改（改配色、换标题、保持版式微调），传 `continue_from=<该任务的 job_id>`，追问会发进原对话，ChatGPT 仍看得见那些图；不相关的新图不要带 `continue_from`。同一对话同时只允许一个追问在跑，它会自动落到拥有该对话的账号的任意空闲车道。
    长提示词保存为带日期、任务标识的 UTF-8 文件。`image_generate(prompt_file=绝对路径, count=张数, request_id=全局唯一任务标识, output_dir=绝对路径, name=任务名, account_id="auto")`。prompt 与 prompt_file 二选一；reference_images 接受至多五个 PNG/JPEG/WebP 绝对路径，排队期间保持文件不变。
 3. count=1..20 是一个任务要的图片数量，不是账号并发数或额度保证。Codex 出图时每张图单独并行生成（各自换一种构图），网页出图时是一次请求出 N 张。遵从指定张数，多图要求独立附件，不能用拼图或裁切代替，不静默压缩或降低要求。
@@ -25,7 +27,7 @@ description: 本机生图入口：用用户自己的订阅生成图片、制作�
 6. **先把已知的活全部提交，再统一轮询**；`submit → 等 → submit` 会让车道空转，是批量变慢的主因。多个不同提示词用一次 `image_generate_batch(requests=[...], output_dir=...)` 排入，每条 entry 自带 request_id；等待用 `image_poll(job_ids=[...], wait_seconds=20)` 一次覆盖整批，`return_when="any"` 可先取回已完成的。批量里未知的 job_id 只在结果中标出，不会让整批失败。
 7. `image_poll(job_id, wait_seconds=20)` 等待单个结果。后台自主执行、下载、收尾，agent 断开仍会继续。无需额外 shell 循环、高频 status 或自建后台任务。phase 是浏览器实际阶段。查询自己的任务，不接管其他人的任务。
 8. 失败结果的 `error.actionable_by` 指明谁能处理：`agent` 就自己改提示词重投（典型是 `no_image_in_reply` / `generation_failed`，`message` 里有 ChatGPT 的原话）；`retry` 等一下重试；`human` 交回用户，不要空转重试。
-9. needs_attention 表示暂停核查并保留原账号和请求身份。按错误检查账号，必要时 image_open；处理后 `image_resume(job_id)` 接续原任务，不换账号重发。仅在用户要求取消时 `image_cancel(job_id)`；活动任务取消为异步请求，确认 cancelled 后才宣称取消成功。
+9. needs_attention 表示暂停核查并保留原账号和请求身份。按错误检查账号，需要本人登录或验证时 image_open(for_login=true)；处理后 `image_resume(job_id)` 接续原任务，不换账号重发。仅在用户要求取消时 `image_cancel(job_id)`；活动任务取消为异步请求，确认 cancelled 后才宣称取消成功。
 10. parked 表示该任务已交回车道让队列继续，账号、会话和已存文件都保留，不是失败也没有重发。auto_retry_attempts_left 大于零时它会自行回到原会话重新观察，继续 image_poll 即可；为零且 next_action 为 inspect_account_then_resume 才需要检查账号后 image_resume。不要因为看到 parked 就换账号、换 request_id 或重新提交。
    queued 时先看 blocking_accounts；账号故障后后台会自行重检有限次，仍是 browser_unhealthy 才需排查后 account_check，不通过反复提交试错。worker_stalled 表示进程仍有心跳但操作停滞，不等于可用。已有活动任务不可切换账号。resume 只恢复观察，不重发；同一超时反复出现时交代阻塞原因，不无限 resume。
 11. 只有请求、观察与下载数量相符才是 complete。partial / count_mismatch / failed 必须如实交代，交付已保存文件。确认本地文件存在并用本地看图工具检查，不把图片 base64 放进工具文字。

@@ -1,4 +1,6 @@
-# ChatGPT Web Images 0.7.11
+# ChatGPT Web Images 0.7.40
+
+Version 0.7.40 separates viewing from manual login. `image_open` opens a separate personal tab in the same ordinary account Chrome without pausing automation or changing login health. Use `for_login=true` only for human login or verification; `image_account_check` resumes immediately when done. Active manual pauses are reported explicitly and excluded from available web lanes.
 
 Version 0.7.11 uses one real task as the exclusive recovery probe after cooling. A healthy homepage does not prove that conversation reads recovered. Rejected probes preserve escalating backoff, durable request identity and parked retry budget; a new task verifies its own composer rather than a failed old thread.
 
