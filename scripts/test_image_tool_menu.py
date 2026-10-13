@@ -18,17 +18,23 @@ const input=JSON.parse(require('fs').readFileSync(0,'utf8'));
 (async()=>{
  const browser=await chromium.launch({headless:true,...(process.env.CHATGPT_WEB_IMAGES_TEST_CHROME?{executablePath:process.env.CHATGPT_WEB_IMAGES_TEST_CHROME}:{})});
  try{
-  for(const [tag,label] of [['button','Create image Visualize anything'],['button','Create an image'],['div role="menuitem"','创建图片']]){
+  for(const [tag,label,modern] of [['button','Create image Visualize anything',false],['button','Create an image',false],['div role="menuitem"','创建图片',false],['button','Create image Visualize anything',true]]){
    const page=await browser.newPage();
    await page.setContent(`<nav><div role="group"><a href="#foreign"><span>Create image</span><span>Create image</span></a></div></nav>
-    <button data-testid="composer-plus-btn">Add files and more</button><div id="prompt-textarea"></div>
+    <div data-composer-body><button data-testid="composer-plus-btn" aria-label="Add files and more">Add files and more</button><div id="prompt-textarea" role="textbox" contenteditable="true"></div></div>
     <section id="tools" hidden><${tag} id="image-tool">${label}</${tag.split(' ')[0]}></section>`);
-   await page.evaluate(()=>{
-    document.querySelector('[data-testid="composer-plus-btn"]').onkeydown=e=>{if(e.key==='Enter')document.querySelector('#tools').hidden=false;};
-    document.querySelector('#image-tool').onclick=()=>{document.querySelector('#prompt-textarea').innerHTML='<span data-inline-selection-pill data-system-hint-type="picture_v2"></span>';};
-   });
+   await page.evaluate(modern=>{
+    if(modern)Object.defineProperty(document,'hidden',{get:()=>true});
+    document.querySelector('[data-testid="composer-plus-btn"]').onclick=()=>{document.querySelector('#tools').hidden=false;};
+    document.querySelector('#image-tool').onclick=()=>{
+     const input=document.querySelector('[role="textbox"]');
+     // React replaces the old compatibility attributes when the mode changes.
+     if(modern){input.removeAttribute('id');document.querySelector('[data-testid="composer-plus-btn"]').removeAttribute('data-testid');}
+     input.innerHTML='<span data-inline-selection-pill data-system-hint-type="picture_v2">Create image</span>';
+    };
+   },modern);
    assert.equal(await new Function('return ('+input+')')()(page),true);
-   assert.equal(await page.locator('#prompt-textarea [data-inline-selection-pill]').count(),1);
+   assert.equal(await page.locator('[data-composer-body] [data-inline-selection-pill]').count(),1);
    assert.equal(page.url(),'about:blank');
    await page.close();
   }

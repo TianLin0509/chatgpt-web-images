@@ -41,6 +41,10 @@ class ExtensionTabDaemon extends TabDaemon {
     this.readToken = readToken || (() => readProtectedToken(options));
     this.extensionPages = new Map();
     this.ownedSelectorPage = null;
+    this.inputTail=Promise.resolve();
+    this.recoveryUrls=new Map();
+    this.laneEpochs=new Map();
+    this.touched=new Map();
     this.settleMs=settleMs;
     this.sleep=sleep;
     this.now=now;
@@ -67,7 +71,9 @@ class ExtensionTabDaemon extends TabDaemon {
     if (this.launchProfile) await this.launchProfile(this.options);
     else {
       const { PersonalChrome } = require(path.join(this.hubCore, 'personal-chrome.js'));
-      await new PersonalChrome({root:this.root}).open(this.identity, [`chrome-extension://${EXTENSION_ID}/status.html`]);
+      const personal=new PersonalChrome({root:this.root});
+      let lastUsed;try{lastUsed=JSON.parse(fs.readFileSync(path.join(this.root,'Local State'),'utf8')).profile?.last_used;}catch{}
+      if(!personal.held()||lastUsed!==this.identity)await personal.open(this.identity, [`chrome-extension://${EXTENSION_ID}/status.html`]);
     }
     process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN = token;
     delete process.env.DEBUG; // Never log the relay URL containing the pairing token.
@@ -98,12 +104,22 @@ class ExtensionTabDaemon extends TabDaemon {
     return this.browser;
   }
 
-  async disconnect() {
+  async disconnect({preservePages=true}={}) {
     const browser = this.browser;
+    const owned=[this.ownedSelectorPage,...(preservePages?[]:this.extensionPages.values())].filter(Boolean);
+    const closed=await Promise.allSettled(owned.map(page=>this.closeOwned(page)));
+    if(closed.some(x=>x.status==='rejected'))this.log('owned_page_close_failed');
     this.browser = null;
     this.extensionPages.clear();
+    this.touched.clear();
     this.ownedSelectorPage = null;
     if (browser) await browser.close(); // An attached browser close disconnects the relay.
+  }
+
+  async closeOwned(page) {
+    if(!page||page.isClosed())return;
+    let timer;try{await Promise.race([page.close(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Owned page close timeout')),3000);})]);}
+    finally{clearTimeout(timer);}
   }
 
   async yieldToPerson() {
@@ -121,11 +137,13 @@ class ExtensionTabDaemon extends TabDaemon {
   }
 
   async execute(lane, argv) {
+    this.touched.set(lane,this.now());
     const { argumentsOf } = require(path.join(this.hubCore,'hub-browser-tool.js'));
     const [command,...args]=argumentsOf(argv);
     if(command==='transport-release') {
       if([...this.chains.keys()].some(key=>key!==lane))throw Error('Extension browser busy');
-      await this.disconnect();
+      if([...this.extensionPages.keys()].some(key=>key!==lane))throw Error('Extension browser busy');
+      await this.disconnect({preservePages:false});
       return {released:true,browserPreserved:true};
     }
     if (command==='human-open') {
@@ -149,19 +167,23 @@ class ExtensionTabDaemon extends TabDaemon {
     if(command==='close') {
       const page=this.extensionPages.get(lane);
       this.extensionPages.delete(lane);
+      this.touched.delete(lane);this.recoveryUrls.delete(lane);
       if(page && !page.isClosed())await page.close();
       return {closed:!!page};
     }
     if(await this.yieldToPerson()) throw Error('Human handoff: browser automation is paused');
     this.guard.assertAutomationAllowed(this.root,{identity:this.identity});
     if(command==='open') {
+      const epoch=this.laneEpochs.get(lane)||0;
       const page=this.extensionPages.get(lane);
       if(page && !page.isClosed())return {reused:true,sharedBrowser:true};
       const browser=await this.extensionBrowser();
       const owned=await browser.contexts()[0].newPage();
+      if(epoch!==(this.laneEpochs.get(lane)||0)){await this.closeOwned(owned);throw Error('Target closed after deadline');}
       this.extensionPages.set(lane,owned);
-      const url=args.find(a=>!a.startsWith('--'))||'about:blank';
+      const url=this.recoveryUrls.get(lane)||args.find(a=>!a.startsWith('--'))||'about:blank';
       if(url!=='about:blank')await this.navigate(lane,owned,url);
+      this.recoveryUrls.delete(lane);
       return {reused:false,sharedBrowser:true};
     }
     const page=await this.page(lane);
@@ -172,7 +194,12 @@ class ExtensionTabDaemon extends TabDaemon {
       const source=this.adaptSource(fs.readFileSync(args[at+1],'utf8'));
       const fn=new Function('return ('+source+'\n)')();
       this.guard.assertAutomationAllowed(this.root,{identity:this.identity,url:page.url()});
-      const result=await this.protectedStep(lane,page,()=>fn(page));
+      const epoch=this.laneEpochs.get(lane)||0;
+      const action=async()=>{if(epoch!==(this.laneEpochs.get(lane)||0))throw Error('Target closed after deadline');this.guard.assertAutomationAllowed(this.root,{identity:this.identity,url:page.url()});await page.bringToFront();return this.protectedStep(lane,page,()=>fn(page));};
+      let result;
+      if(source.startsWith('/* @web-images-interactive */')){
+        const work=this.inputTail.catch(()=>{}).then(action);this.inputTail=work.catch(()=>{});result=await work;
+      }else result=await this.protectedStep(lane,page,()=>fn(page));
       if(result?.challenge===true) {
         // A status script can finish while the managed check is still visible,
         // just before the post-step passive wait observes it clearing. Return
@@ -240,15 +267,38 @@ class ExtensionTabDaemon extends TabDaemon {
     return result;
   }
 
-  async reap() { return 0; } // The extension controls only its group; never enumerate all Chrome tabs.
+  async reap() {
+    if(this.reaping||this.guard?.handoff(this.root))return 0;
+    this.reaping=true;let closed=0;
+    try{
+      for(const [lane,page] of this.extensionPages){
+        if(this.chains.has(lane)||page.url()!=='about:blank'||this.now()-(this.touched.get(lane)||0)<120000)continue;
+        this.extensionPages.delete(lane);this.touched.delete(lane);
+        try{await this.closeOwned(page);closed++;}catch{this.log('idle_page_close_failed',{lane});}
+      }
+      return closed;
+    }finally{this.reaping=false;}
+  } // Only our own empty pages; never enumerate all Chrome tabs.
   dropLane(lane) { this.extensionPages.delete(lane); }
 
   async handle(body) {
-    try {return await super.handle(body);}
+    const {lane,argv,timeoutMs=55000}=body;
+    if(!/^[a-z0-9_-]{1,64}$/.test(lane||'')||!Array.isArray(argv)||!Number.isInteger(timeoutMs)||timeoutMs<1||timeoutMs>180000)throw Error('Invalid request');
+    this.lastCall=Date.now();let timer,cancelled=false,started=false;
+    const work=this.enqueue(lane,()=>{if(cancelled)throw Error('Timeout: daemon step exceeded before execution');started=true;return this.execute(lane,argv);});
+    try {return await Promise.race([work,new Promise((_,reject)=>{timer=setTimeout(()=>{cancelled=true;reject(Error('Timeout: daemon step exceeded'));},timeoutMs);})]);}
     catch(error) {
-      if(/daemon step exceeded/.test(String(error?.message)))await this.disconnect();
+      if(cancelled&&started){
+        this.laneEpochs.set(lane,(this.laneEpochs.get(lane)||0)+1);
+        const page=this.extensionPages.get(lane);this.extensionPages.delete(lane);
+        this.touched.delete(lane);
+        if(page&&!page.isClosed()){
+          if(/^https:\/\/chatgpt\.com\/c\/[a-zA-Z0-9-]+$/.test(page.url()))this.recoveryUrls.set(lane,page.url());
+          await this.closeOwned(page).catch(()=>{});
+        }
+      }
       throw error;
-    }
+    }finally{clearTimeout(timer);}
   }
 }
 

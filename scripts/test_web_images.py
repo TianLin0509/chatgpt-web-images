@@ -125,7 +125,7 @@ class Contracts(unittest.TestCase):
             result=w.start(prompt='my prompt',count=5,output_dir=str(self.data))
         self.assertEqual(result['requested_count'],5)
         sources=[c.args[0] for c in js.call_args_list]
-        self.assertEqual(sum('button.click' in source for source in sources),1)
+        self.assertEqual(sum('await activate(button)' in source for source in sources),1)
         fill=next(i for i,source in enumerate(sources) if 'composer.fill' in source)
         select=next(i for i,source in enumerate(sources) if 'composer-plus-btn' in source and 'press' in source)
         self.assertLess(fill,select)

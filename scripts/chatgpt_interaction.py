@@ -7,10 +7,10 @@ def interactive(source, *, emulate_focus=True):
     This changes document focus emulation, not the Windows foreground window.
     Always restore the page on failure; never attach to other browser targets.
     """
-    # The ordinary extension browser is visible and already gives real focus to
-    # its own tab. It forbids browser-level CDP sessions; do not emulate focus.
+    # The shared extension broker serializes these short input/menu operations
+    # across lanes. Image generation and read-only polling remain concurrent.
     if not emulate_focus:
-        return source
+        return '/* @web-images-interactive */\n' + source
     return r'''async page => {
  const session=await page.context().newCDPSession(page);
  let emulated=false;

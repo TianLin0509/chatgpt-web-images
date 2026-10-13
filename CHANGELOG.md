@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.42 — 2026-10-14
+
+- Verify the current draft, image mode and enabled send control; activate once and retain request identity until the matching message is acknowledged.
+- Use rendered, enabled controls' native click handlers in background extension tabs, where pointer actions can stall on suspended animations. Support the modern composer without compatibility attributes.
+- Recover already-open or transiently closed image menus within a bounded budget. Expose preparation timings and safe submission-receipt metadata.
+- Close the idle worker's own tab on normal exit and back off repeated browser failures. Preserve drafts altered before send.
+- Keep a bounded list of original image resources before a large gallery fills Chrome's resource timing buffer.
+- Isolate legacy extension lane deadlines, reject late page creation, recycle only owned idle blank pages, and clean owned pages on normal transport release. Mark short interactive steps for the companion shared Hub broker.
+
 ## 0.7.41
 
 - Select the image tool by its actionable button or menuitem, including descriptive label suffixes. Same-named sidebar chat links can no longer shadow the tool; the new button-only composer menu is supported.

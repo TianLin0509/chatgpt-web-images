@@ -67,6 +67,7 @@ class Worker:
         self.browser_released = False
         self.rate_probe = False
         self.page_left = False
+        self.transient_failures = 0
 
     def log(self, event, **fields):
         print(json.dumps({'event': event, 'at':time.time(), 'account_id': self.account_id, **fields}), flush=True)
@@ -99,6 +100,7 @@ class Worker:
                                    (self.account_id,len(ADOPT_BACKOFF),time.time(),self.account_id,group)).fetchone())
 
     def record_result(self, job_id, result, runtime_id=None, *, confirm_recovery=True):
+        self.transient_failures = 0
         previous = self.pool.row(job_id)
         # Nothing reached the website: rather than fail the job, the Codex lane generates it.
         if (result.get('status') == 'preparation_failed' and not result.get('files')
@@ -222,6 +224,21 @@ class Worker:
         # Either way, stop retrying until this lane has work again.
         self.browser_released = True
 
+    def close_idle_page_on_exit(self):
+        """A sleeping worker cannot reach the six-hour release timer anymore."""
+        if self.person_on_page() or (getattr(self.runtime,'human_handoff',None) and self.runtime.human_handoff()):
+            return False
+        with self.pool.connect() as db:
+            if db.execute("SELECT 1 FROM jobs WHERE account_id=? AND status IN ('dispatching','running','needs_attention')",(self.account_id,)).fetchone():
+                return False
+        try:
+            self.runtime.release_browser()
+            self.log('idle_page_closed')
+            return True
+        except Exception as exc:
+            self.log('idle_page_close_failed',error_code=error_value(exc)['code'])
+            return False
+
     def park(self, job):
         """Hand the lane back to the queue while keeping this job's conversation."""
         if job['runtime_id']:
@@ -319,6 +336,9 @@ class Worker:
         self.browser_released = False
         self.page_left = False
         if job['status'] == 'needs_attention' and not job['cancel_requested']:
+            if json.loads(job['error'] or '{}').get('code')=='prompt_changed_before_send':
+                self.delay=5
+                return  # Keep the changed draft on its owned page for inspection.
             # Waiting for a human while holding the lane stalls every queued job behind
             # it. Park instead: same account, same conversation, no prompt resent.
             if time.time() - job['updated'] >= PARK_AFTER_SECONDS:
@@ -372,8 +392,11 @@ class Worker:
                 return
             if error['code']=='rate_limited':error=self.pool.defer_rate_limit(self.account_id)
             else:self.pool.failure(job['id'], error)
-            print(json.dumps({'event': 'job_error', 'job_id': job['id'], 'account_id': self.account_id,
-                              'error_code': error['code']}), flush=True)
+            if error['code'] in {'browser_timeout','browser_operation_failed','browser_not_open','browser_closed','browser_protocol_error'}:
+                self.transient_failures += 1
+                self.delay=min(30,3*2**min(self.transient_failures-1,4))
+            print(json.dumps({'event': 'job_error', 'at':time.time(), 'job_id': job['id'], 'account_id': self.account_id,
+                              'error_code': error['code'], 'retry_seconds':self.delay}), flush=True)
             if error['code'] in human_gate.HUMAN_GATES:
                 self.pool.account_state(self.account_id, error['code'], False, error)
 
@@ -458,6 +481,7 @@ def main():
         finally:
             stop.set()
             thread.join(timeout=5)
+            worker.close_idle_page_on_exit()
             with pool.connect() as db:
                 db.execute('UPDATE accounts SET heartbeat=0,pid=NULL WHERE id=?', (account_id,))
 

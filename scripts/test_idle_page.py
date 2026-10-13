@@ -63,6 +63,28 @@ class IdlePageContracts(unittest.TestCase):
         self.tick(2)
         self.assertEqual(self.runtime.left, 1)
 
+    def test_sleeping_worker_closes_its_idle_page(self):
+        self.assertTrue(self.worker.close_idle_page_on_exit())
+        self.assertEqual(self.runtime.released,1)
+
+    def test_sleeping_worker_preserves_active_and_person_pages(self):
+        self.pool.submit(prompt='Draw a simple square.',output_dir=str(self.output),request_id='active-exit',account_id='auto')
+        self.tick()
+        self.assertFalse(self.worker.close_idle_page_on_exit())
+        self.assertEqual(self.runtime.released,0)
+
+    def test_repeated_browser_errors_back_off_and_success_resets(self):
+        from unittest.mock import patch
+        self.pool.submit(prompt='Draw a simple square.',output_dir=str(self.output),request_id='backoff',account_id='auto')
+        self.runtime.uncertain=False
+        self.tick()
+        with patch.object(self.runtime,'poll',side_effect=w.ImageError('browser_operation_failed','test')):
+            self.tick();self.assertEqual(self.worker.delay,3)
+            self.tick();self.assertEqual(self.worker.delay,6)
+        self.worker.transient_failures=2
+        self.tick()
+        self.assertEqual(self.worker.transient_failures,0)
+
 
 if __name__ == '__main__':
     unittest.main()

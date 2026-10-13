@@ -33,7 +33,8 @@ def test_shared_browser_never_hides_a_persons_window_or_emulates_browser_focus(t
         assert not w.set_visible(False)
         assert not w.set_visible(True)
         source = 'async page => await page.locator("input").fill("hello")'
-        assert w.interactive(source) == source
+        assert w.interactive(source) == '/* @web-images-interactive */\n' + source
+        assert 'newCDPSession' not in w.interactive(source)
 
 
 def test_pairing_failure_is_actionable_without_leaking_the_raw_response(tmp_path):

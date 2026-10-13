@@ -49,6 +49,7 @@ function fixture({initialHumanPage=false}={}) {
     isClosed(){return this.closed;}
     async goto(url){calls.push(['goto',url]);this.location=url;}
     async close(){calls.push(['page-close',this.location]);this.closed=true;}
+    async bringToFront(){calls.push(['focus',this.location]);}
   }
   const selector=new Page(initialHumanPage?'https://chatgpt.com/c/persons-draft':`chrome-extension://${EXTENSION_ID}/connect.html?token=test-pairing`);
   const pages=[selector];
@@ -113,7 +114,7 @@ test('handoff detaches automation, preserves pages, and blocks further navigatio
   await assert.rejects(f.daemon.execute('images-primary',['goto','https://chatgpt.com/']),/Human handoff/);
   assert.equal(f.browser.isConnected(),false);
   assert.equal(owned.closed,false);
-  assert.equal(f.pages[0].closed,false);
+  assert.equal(f.pages[0].closed,true);
   assert.equal(f.calls.some(c=>c[0]==='goto'),false);
 });
 
@@ -203,17 +204,42 @@ test('releasing an idle transport detaches while preserving the ordinary browser
   const result=await f.daemon.execute('images-primary',['transport-release']);
   assert.equal(result.released,true);
   assert.equal(f.browser.isConnected(),false);
-  assert.equal(page.closed,false);
-  assert.equal(f.pages[0].closed,false);
+  assert.equal(page.closed,true);
+  assert.equal(f.pages[0].closed,true);
   assert.equal(process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN,undefined);
 });
 
-test('a timed-out step disconnects instead of letting late code submit',async()=>{
+test('a timed-out step closes only its lane instead of disconnecting every lane',async()=>{
   const f=fixture();
   await f.daemon.execute('images-primary',['open']);
+  await f.daemon.execute('images-other',['open']);
+  const one=await f.daemon.page('images-primary'),other=await f.daemon.page('images-other');
   f.daemon.execute=async()=>new Promise(()=>{});
   await assert.rejects(f.daemon.handle({lane:'images-primary',argv:['run-code'],timeoutMs:20}),/daemon step exceeded/);
-  assert.equal(f.browser.isConnected(),false);
+  assert.equal(f.browser.isConnected(),true);
+  assert.equal(one.closed,true);assert.equal(other.closed,false);
+});
+
+test('a delayed connection cannot create a page after its request expired',async()=>{
+  const f=fixture(),factory=f.daemon.factory;
+  let unblock;
+  f.daemon.factory=async(...args)=>{await new Promise(resolve=>unblock=resolve);return factory(...args);};
+  await assert.rejects(f.daemon.handle({lane:'images-primary',argv:['open'],timeoutMs:20}),/daemon step exceeded/);
+  unblock();
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(f.daemon.extensionPages.size,0);
+  assert.equal(f.pages.at(-1).closed,true);
+  assert.equal(f.browser.isConnected(),true);
+});
+
+test('idle cleanup closes owned blank pages and preserves drafts or busy lanes',async()=>{
+  const f=fixture();
+  for(const lane of ['empty','draft','busy'])await f.daemon.execute(lane,['open']);
+  const empty=await f.daemon.page('empty'),draft=await f.daemon.page('draft'),busy=await f.daemon.page('busy');
+  draft.location='https://chatgpt.com/';
+  f.daemon.now=()=>120001;f.daemon.chains.set('busy',Promise.resolve());
+  assert.equal(await f.daemon.reap(),1);
+  assert.equal(empty.closed,true);assert.equal(draft.closed,false);assert.equal(busy.closed,false);
 });
 
 test('a stale status does not re-block a managed check which already cleared',async()=>{

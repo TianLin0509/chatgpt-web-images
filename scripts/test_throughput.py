@@ -697,7 +697,7 @@ class SourceEncoding(unittest.TestCase):
     instruction block. Byte-level assertions are the only reliable detection.
     """
 
-    SOURCES = ('web_images.py', 'image_pool.py', 'image_worker.py', 'image_service.py', 'chatgpt_account.py')
+    SOURCES = ('web_images.py', 'image_pool.py', 'image_worker.py', 'image_service.py', 'chatgpt_account.py', 'chatgpt_composer.py')
     # Sequences that only appear when UTF-8 has been decoded as ANSI and re-encoded.
     MOJIBAKE = ('Ã§', 'Ã¦', 'Ã¥', 'â', 'Â ')
 
@@ -715,7 +715,7 @@ class SourceEncoding(unittest.TestCase):
                 self.assertNotIn(marker, text, '%s looks double encoded' % name)
 
     def test_the_chinese_browser_selectors_are_still_readable(self):
-        text = self.source('web_images.py').decode('utf-8')
+        text = (self.source('web_images.py')+self.source('chatgpt_composer.py')).decode('utf-8')
         for phrase in ('图片交付数量要求', '生成的图片',
                        '创建图片', '保存', '下载图片',
                        '登录', '无法生成'):
@@ -857,8 +857,8 @@ class ContinuityRuntime(contracts.Contracts):
         _, script, _ = self.run_start(self.CONVERSATION)
         submit = [s for s in script if 'send-button' in s][0]
         self.assertIn('waitForFunction', submit)
-        self.assertIn('> n', submit)
-        self.assertIn('2, {timeout', submit)
+        self.assertIn('users.length>before', submit)
+        self.assertIn('before=2', submit)
 
     def test_a_follow_up_into_a_bad_link_is_refused(self):
         with self.assertRaises(runtime.ImageError) as caught:

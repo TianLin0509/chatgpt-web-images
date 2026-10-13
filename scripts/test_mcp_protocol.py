@@ -20,7 +20,7 @@ def fixture_server():
             return {'job_id':job_id,'status':'complete','requested_count':5,'observed_count':5,
                 'downloaded_count':5,'missing_count':0,'extra_count':0,'count_match':True,'files':[],
                 'prompt_sha256':'a'*64,'provider':'chatgpt-web','image_model_verified':False}
-        with patch.object(w,'poll',side_effect=poll),patch.object(w,'ensure_browser',return_value={'logged_in':True}),patch.object(w,'cli'),patch.object(w,'set_visible',return_value=True),patch.object(w,'run_js',side_effect=lambda source,**kw: {'url':'https://chatgpt.com/c/fixture'} if 'button.click' in source else True):
+        with patch.object(w,'poll',side_effect=poll),patch.object(w,'ensure_browser',return_value={'logged_in':True}),patch.object(w,'cli'),patch.object(w,'set_visible',return_value=True),patch.object(w,'run_js',side_effect=lambda source,**kw: {'submitted':True,'confirmed':True,'url':'https://chatgpt.com/c/fixture'} if 'await activate(button)' in source else True):
             w.serve(legacy=True)
 
 

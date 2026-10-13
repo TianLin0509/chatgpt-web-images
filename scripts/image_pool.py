@@ -49,7 +49,8 @@ ACTIONABLE = {
     'job_state_unreadable': 'human',
     'generation_wait_exceeded': 'retry', 'browser_locator_ambiguous': 'retry',
     'conversation_not_readable': 'retry',
-    'page_not_ready': 'retry',
+    'page_not_ready': 'retry', 'send_button_unavailable': 'retry',
+    'submission_acknowledgement_missing': 'retry', 'prompt_changed_before_send': 'human',
     'rate_limited': 'retry',
     'human_handoff': 'retry',
     'codex_timeout': 'retry', 'codex_no_image': 'agent', 'codex_error': 'retry',
@@ -61,7 +62,7 @@ ACTIONABLE = {
 }
 # A job in one of these states will not change on its own while a caller waits.
 SETTLED = TERMINAL | {'needs_attention', PARKED, 'unknown'}
-VERSION = '0.7.41'
+VERSION = '0.7.42'
 # The Codex fallback lane (codex_lane.py): not a browser account, so it has no row in accounts.
 CODEX_LANE = 'codex'
 # The lane process writes a heartbeat every tick; older than this means it is not running.

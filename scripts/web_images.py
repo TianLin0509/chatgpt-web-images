@@ -23,7 +23,7 @@ from typing import Annotated
 from pydantic import Field
 from chatgpt_account import STATUS_JS as ACCOUNT_STATUS_JS, SETTLE_JS, selection_code, ERROR_MESSAGES
 
-VERSION = '0.7.41'
+VERSION = '0.7.42'
 CONFIG_DIR = Path(os.environ.get('CHATGPT_WEB_IMAGES_CONFIG_DIR', str(Path.home()/'.config'/'chatgpt-web-images')))
 CONFIG_FILE = CONFIG_DIR/'settings.json'
 
@@ -457,7 +457,7 @@ def job_path(job_id):
 def public_job(job):
     keys = ['job_id', 'status', 'conversation_url', 'output_dir', 'files', 'error',
             'provider', 'image_model_verified', 'prompt_sha256', 'created_at', 'updated_at',
-            'reference_count', 'window_hidden', 'requested_count', 'observed_count', 'count_match', 'submitted_prompt_sha256', 'operation_stage', 'timeline', 'timings']
+            'reference_count', 'window_hidden', 'requested_count', 'observed_count', 'count_match', 'submitted_prompt_sha256', 'operation_stage', 'timeline', 'timings', 'submission_receipt']
     result={k:job[k] for k in keys if k in job}
     result['requested_count']=job.get('requested_count',1)
     result['downloaded_count']=len(job.get('files',[]))
@@ -687,22 +687,17 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
             # A follow-up lands after messages that are already in the thread, so waiting
             # for 'a user message exists' would return instantly. Count them while waiting
             # for the composer, which costs no extra browser round trip.
-            before = run_js(r'''async page => {
-              await page.locator('#prompt-textarea').waitFor({state:'visible',timeout:45000});
-              await page.getByTestId('composer-plus-btn').waitFor({state:'visible',timeout:5000});
-              return await page.evaluate(() => document.querySelectorAll(':is([data-message-author-role="user"],[data-user-message-bubble])').length);
-            }''')
+            before = browser_step(job,'wait_composer',r'''async page => {
+              await page.locator('#prompt-textarea,[data-composer-body] [contenteditable="true"][role="textbox"]').and(page.locator(':visible')).waitFor({state:'visible',timeout:45000});
+              await page.locator('[data-testid="composer-plus-btn"],[data-composer-body] button[aria-label="Add files and more"],[data-composer-body] button[aria-label="添加文件和更多"]').waitFor({state:'visible',timeout:5000});
+              await page.evaluate(()=>{__CAPTURE__});
+              return await page.evaluate(() => document.querySelectorAll('[data-message-author-role="user"]').length || document.querySelectorAll('[data-user-message-bubble]').length);
+            }'''.replace('__CAPTURE__',ORIGINAL_CAPTURE_JS))
             before = before if type(before) is int else 0
-            job['operation_stage'] = 'fill_prompt'
-            save_job(job)
-            run_js(interactive(FILL_PROMPT_JS.replace('__PROMPT__',json.dumps(prompt))))
-            job['operation_stage'] = 'select_image_tool'
-            save_job(job)
-            run_js(interactive(SELECT_IMAGE_TOOL_JS))
+            browser_step(job,'fill_prompt',interactive(FILL_PROMPT_JS.replace('__PROMPT__',json.dumps(prompt))))
+            browser_step(job,'select_image_tool',interactive(SELECT_IMAGE_TOOL_JS))
             if refs:
-                job['operation_stage'] = 'upload_references'
-                save_job(job)
-                run_js('''async page => {
+                browser_step(job,'upload_references','''async page => {
                   const input=page.locator('input[type="file"]').first();
                   await input.setInputFiles(''' + json.dumps(refs) + ''');
                   return {uploaded:''' + str(len(refs)) + '''};
@@ -710,26 +705,22 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
             job['status']='submitting'
             job['operation_stage']='submit_prompt'
             save_job(job)
-            result=run_js(interactive(r'''async page => {
-              const composer=page.locator('#prompt-textarea');
-              // Filling here would erase ChatGPT's inline image-tool selection.
-              if(!await composer.locator('[data-inline-selection-pill][data-system-hint-type="picture_v2"]').count())
-                throw new Error('IMAGE_TOOL_UNAVAILABLE');
-              const button=page.getByTestId('send-button');
-              await button.waitFor({state:'visible', timeout:20000});
-              await button.click({timeout:20000});
-              await page.waitForFunction(n => document.querySelectorAll(':is([data-message-author-role="user"],[data-user-message-bubble])').length > n,
-                                         __BEFORE__, {timeout:20000});
-              await page.waitForURL(/^https:\/\/chatgpt\.com\/c\/[a-zA-Z0-9-]+$/, {timeout:20000});
-              return {url:page.url()};
-            }'''.replace('__BEFORE__', str(int(before)))))
+            result=browser_step(job,'submit_prompt',interactive(SUBMIT_PROMPT_JS.replace('__BEFORE__',str(int(before))).replace('__PROMPT__',json.dumps(prompt))))
+            job['submission_receipt']={key:result[key] for key in ('submitted','confirmed','reason','receipt_error') if key in result}
+            if result.get('submitted') is False:
+                job['status']='needs_attention' if result['reason']=='prompt_changed_before_send' else 'preparation_failed'
+                raise ImageError(result['reason'],'The prompt was not sent. The browser preparation step must be repaired before retrying.')
+            if result.get('url'):
+                job['conversation_url']=result['url']
+            if result.get('confirmed') is False:
+                raise ImageError('submission_acknowledgement_missing','Send was attempted but the matching message was not confirmed. Observe this same job; do not resend.')
             job['status']='generating'
             job['operation_stage']='observe_images'
             job['conversation_url']=result['url']
             job['window_hidden']=set_visible(False)
             save_job(job)
         except ImageError as exc:
-            if exc.code == 'human_handoff':
+            if exc.code == 'human_handoff' and job['status'] not in {'submitting','generating'}:
                 # The Hub refuses before any page action, so nothing of this step reached ChatGPT.
                 # Undo this attempt's records; the worker waits the person out and dispatches again.
                 job_path(job_id).unlink(missing_ok=True)
@@ -737,7 +728,8 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
                 if request_id:
                     previous_path.unlink(missing_ok=True)
                 raise
-            job['status']='submission_uncertain' if job['status'] in {'submitting','generating'} else 'preparation_failed'
+            if job['status']!='needs_attention':
+                job['status']='submission_uncertain' if job['status'] in {'submitting','generating'} else 'preparation_failed'
             job['error']={'code':exc.code,'message':str(exc)}
             save_job(job)
             if job['status']=='preparation_failed':
@@ -754,24 +746,25 @@ def start(prompt='', prompt_file='', output_dir='', name='image', reference_imag
 
 
 FILL_PROMPT_JS = r'''async page => {
- const composer=page.locator('#prompt-textarea');
+ const composer=page.locator('#prompt-textarea,[data-composer-body] [contenteditable="true"][role="textbox"]').and(page.locator(':visible'));
  await composer.fill(__PROMPT__);
  return true;
 }'''
 
-SELECT_IMAGE_TOOL_JS = r'''async page => {
- await page.getByTestId('composer-plus-btn').press('Enter',{timeout:10000});
- // Match actionable menu entries. Sidebar chat titles are links inside groups,
- // and the new composer menu uses buttons without a menu/group ancestor.
- const name=/^(Create (?:an? )?images?|创建图片|创建图像|生成图片)(?:\s|$)/;
- const tool=page.getByRole('button',{name}).or(page.getByRole('menuitem',{name})).and(page.locator(':visible'));
- try { await tool.click({timeout:15000}); }
- catch(e) { throw new Error('IMAGE_TOOL_UNAVAILABLE: '+e.name); }
- await page.locator('#prompt-textarea [data-inline-selection-pill][data-system-hint-type="picture_v2"]').waitFor({state:'attached',timeout:10000});
- return true;
-}'''
+from chatgpt_composer import SELECT_IMAGE_TOOL_JS, SUBMIT_PROMPT_JS
 
-from chatgpt_dom import DOM_IMAGES_JS, POLL_JS, MODERN_DOWNLOAD_JS
+
+def browser_step(job, stage, source):
+    job['operation_stage']=stage
+    save_job(job)
+    started=time.perf_counter()
+    try:
+        return run_js(source)
+    finally:
+        job.setdefault('timings',{})[stage]=round(time.perf_counter()-started,3)
+        save_job(job)
+
+from chatgpt_dom import DOM_IMAGES_JS, POLL_JS, MODERN_DOWNLOAD_JS, ORIGINAL_CAPTURE_JS
 from chatgpt_interaction import interactive as _interactive
 
 

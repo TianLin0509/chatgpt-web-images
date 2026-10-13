@@ -5,6 +5,31 @@ No credentials, page mutation, model selection or prompt submission lives here.
 
 USER_SELECTOR = ':is([data-message-author-role="user"],[data-user-message-bubble])'
 
+# A large gallery can fill Chrome's default Resource Timing buffer before the
+# last originals arrive. Keep only bounded original URLs, never image bytes.
+ORIGINAL_CAPTURE_JS = r'''
+function captureOriginalResources() {
+ if(globalThis.__webImagesOriginalCapture)return;
+ const state=globalThis.__webImagesOriginalCapture={urls:[]};
+ const collect=entries=>{
+   for(const entry of entries){
+     try{
+       const u=new URL(entry.name);
+       if(u.origin!=='https://chatgpt.com'||u.pathname!=='/backend-api/estuary/content'||!['fs','fsns'].includes(u.searchParams.get('p'))||!/^file[_-]/.test(u.searchParams.get('id')||''))continue;
+       if(!state.urls.includes(entry.name))state.urls.push(entry.name);
+       if(state.urls.length>128)state.urls.splice(0,state.urls.length-128);
+     }catch{}
+   }
+ };
+ collect(performance.getEntriesByType('resource'));
+ if(typeof PerformanceObserver==='function'){
+   state.observer=new PerformanceObserver(list=>collect(list.getEntries()));
+   state.observer.observe({type:'resource',buffered:true});
+ }
+}
+captureOriginalResources();
+'''
+
 DOM_IMAGES_JS = r'''
 function messageUsers() {
  const old=Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
@@ -47,7 +72,7 @@ function ownedImages() {
 POLL_JS = r'''async page => {
  // Hidden/offscreen Chrome does not load lazy gallery thumbnails after scrolling.
  // Request only this turn's already-present generated assets, without focus changes.
- await page.evaluate(()=>{__DOM__ for(const a of ownedImages())if(!a.ready){a.node.loading='eager';a.node.scrollIntoView({block:'center'});}});
+ await page.evaluate(()=>{__CAPTURE__ __DOM__ for(const a of ownedImages())if(!a.ready){a.node.loading='eager';a.node.scrollIntoView({block:'center'});}});
  return await page.evaluate(()=>{
    __DOM__
    const users=messageUsers(),lastUser=users.at(-1);
@@ -69,7 +94,7 @@ POLL_JS = r'''async page => {
      turn_complete:turnComplete,images:assets.filter(a=>a.ready).map(({node,...a})=>a),pending_images:assets.filter(a=>!a.ready).length,
      text:(response?.innerText||'').slice(-1600),user_count:users.length,user_text:userText};
  });
-}'''.replace('__DOM__',DOM_IMAGES_JS)
+}'''.replace('__DOM__',DOM_IMAGES_JS).replace('__CAPTURE__',ORIGINAL_CAPTURE_JS)
 
 MODERN_DOWNLOAD_JS = r'''
  const modernAsset=await page.evaluate(key=>{__DOM__ const a=ownedImages().find(a=>a.key===key);return a?.modern?{index:a.index}:null;},__KEY__);
@@ -83,7 +108,7 @@ MODERN_DOWNLOAD_JS = r'''
        if(!blob.byteLength||blob.byteLength>50*1024*1024)throw Error('original_size_invalid');
        const hex=b=>Array.from(new Uint8Array(b)).map(n=>n.toString(16).padStart(2,'0')).join('');
        const expected=hex(await crypto.subtle.digest('SHA-256',blob));
-       const urls=[...new Set(performance.getEntriesByType('resource').map(e=>e.name))].filter(raw=>{
+       const urls=[...new Set([...(globalThis.__webImagesOriginalCapture?.urls||[]),...performance.getEntriesByType('resource').map(e=>e.name)])].filter(raw=>{
          try{const u=new URL(raw);return u.origin==='https://chatgpt.com'&&u.pathname==='/backend-api/estuary/content'
            &&['fs','fsns'].includes(u.searchParams.get('p'))&&/^file[_-]/.test(u.searchParams.get('id')||'')
            &&[...u.searchParams.keys()].every(k=>['id','ts','p','cid','sig','v'].includes(k));}catch{return false;}
